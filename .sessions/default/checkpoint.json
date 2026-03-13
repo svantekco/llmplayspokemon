@@ -1,127 +1,132 @@
 {
-  "completed_turns": 295,
+  "completed_turns": 299,
   "memory": {
     "recent_events": [
       {
         "type": "MOVED",
-        "summary": "Moved to (7, 1) on Red's House 1F",
-        "step": 32497,
+        "summary": "Moved to (1, 7) on Red's House 2F",
+        "step": 11815,
         "metadata": {
           "from": {
-            "x": 7,
-            "y": 2
+            "x": 1,
+            "y": 6
           },
           "to": {
-            "x": 7,
-            "y": 1
-          }
-        }
-      },
-      {
-        "type": "GOAL_UPDATED",
-        "summary": "Goals updated for Red's House 1F",
-        "step": 33355,
-        "metadata": {
-          "short_term_goal": "Take the best local step on Red's House 1F",
-          "strategy": "Prefer deterministic local plans, then choose among ranked candidates"
-        }
-      },
-      {
-        "type": "MOVED",
-        "summary": "Moved to (7, 2) on Red's House 1F",
-        "step": 33355,
-        "metadata": {
-          "from": {
-            "x": 7,
-            "y": 1
-          },
-          "to": {
-            "x": 7,
-            "y": 2
+            "x": 1,
+            "y": 7
           }
         }
       },
       {
         "type": "GOAL_UPDATED",
         "summary": "Goals updated for Red's House 2F",
-        "step": 33496,
+        "step": 11815,
         "metadata": {
-          "short_term_goal": "Take the best local step on Red's House 2F",
-          "strategy": "Prefer deterministic local plans, then choose among ranked candidates"
-        }
-      },
-      {
-        "type": "MAP_CHANGED",
-        "summary": "Entered Red's House 2F",
-        "step": 33496,
-        "metadata": {
-          "map_id": 38
+          "short_term_goal": "Move toward Oak's Lab",
+          "strategy": "Leave your bedroom and head downstairs.",
+          "milestone_id": "get_starter"
         }
       },
       {
         "type": "MOVED",
-        "summary": "Moved to (7, 1) on Red's House 2F",
-        "step": 33496,
+        "summary": "Moved to (2, 7) on Red's House 2F",
+        "step": 11971,
         "metadata": {
           "from": {
-            "x": 7,
-            "y": 2
+            "x": 1,
+            "y": 7
           },
           "to": {
-            "x": 7,
-            "y": 1
+            "x": 2,
+            "y": 7
           }
         }
       },
       {
         "type": "GOAL_UPDATED",
         "summary": "Goals updated for Red's House 2F",
-        "step": 33701,
+        "step": 11971,
         "metadata": {
-          "short_term_goal": "Take the best local step on Red's House 2F",
-          "strategy": "Prefer deterministic local plans, then choose among ranked candidates"
+          "short_term_goal": "Move toward Oak's Lab",
+          "strategy": "Leave your bedroom and head downstairs.",
+          "milestone_id": "get_starter"
         }
       },
       {
         "type": "MOVED",
-        "summary": "Moved to (7, 2) on Red's House 2F",
-        "step": 33701,
+        "summary": "Moved to (1, 7) on Red's House 2F",
+        "step": 12217,
         "metadata": {
           "from": {
-            "x": 7,
-            "y": 1
+            "x": 2,
+            "y": 7
           },
           "to": {
-            "x": 7,
-            "y": 2
+            "x": 1,
+            "y": 7
           }
+        }
+      },
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Red's House 2F",
+        "step": 12217,
+        "metadata": {
+          "short_term_goal": "Move toward Oak's Lab",
+          "strategy": "Leave your bedroom and head downstairs.",
+          "milestone_id": "get_starter"
+        }
+      },
+      {
+        "type": "MOVED",
+        "summary": "Moved to (2, 7) on Red's House 2F",
+        "step": 12402,
+        "metadata": {
+          "from": {
+            "x": 1,
+            "y": 7
+          },
+          "to": {
+            "x": 2,
+            "y": 7
+          }
+        }
+      },
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Red's House 2F",
+        "step": 12402,
+        "metadata": {
+          "short_term_goal": "Move toward Oak's Lab",
+          "strategy": "Leave your bedroom and head downstairs.",
+          "milestone_id": "get_starter"
         }
       }
     ],
     "goals": {
-      "long_term_goal": "Advance the early game by reaching new maps and useful interactions",
-      "mid_term_goal": "Find a meaningful interaction or exit on Red's House 2F",
-      "short_term_goal": "Take the best local step on Red's House 2F",
-      "current_strategy": "Prefer deterministic local plans, then choose among ranked candidates",
+      "long_term_goal": "Collect your starter Pokemon from Professor Oak.",
+      "mid_term_goal": "Leave your bedroom and head downstairs.",
+      "short_term_goal": "Move toward Oak's Lab",
+      "current_strategy": "Leave your bedroom and head downstairs.",
       "success_conditions": [
-        "Entered Red's House 2F"
+        "Story flag got_starter is active"
       ],
       "active_objectives": [
         {
-          "id": "long_main_story",
+          "id": "long_get_starter",
           "horizon": "long",
-          "summary": "Advance the early game by reaching new maps and useful interactions",
+          "summary": "Collect your starter Pokemon from Professor Oak.",
           "priority": 30,
           "target": {
             "kind": "story",
             "map_id": null,
-            "map_name": "Red's House 2F",
+            "map_name": "Oak's Lab",
             "x": null,
             "y": null,
-            "detail": null
+            "detail": "get_starter"
           },
           "success_conditions": [
-            "Entered Red's House 2F"
+            "Story flag got_starter is active"
           ],
           "invalidation_conditions": [
             "Story milestone changes"
@@ -130,22 +135,20 @@
           "source": "rule"
         },
         {
-          "id": "mid_local_progress",
+          "id": "mid_get_starter",
           "horizon": "mid",
-          "summary": "Find a meaningful interaction or exit on Red's House 2F",
+          "summary": "Leave your bedroom and head downstairs.",
           "priority": 20,
           "target": {
             "kind": "map",
             "map_id": 38,
-            "map_name": "Red's House 2F",
+            "map_name": "Oak's Lab",
             "x": null,
             "y": null,
             "detail": null
           },
           "success_conditions": [
-            "Map changes",
-            "Dialogue opens",
-            "Item gained"
+            "Story flag got_starter is active"
           ],
           "invalidation_conditions": [
             "Map changes",
@@ -156,16 +159,16 @@
           "source": "rule"
         },
         {
-          "id": "short_immediate_step",
+          "id": "short_get_starter",
           "horizon": "short",
-          "summary": "Take the best local step on Red's House 2F",
+          "summary": "Move toward Oak's Lab",
           "priority": 10,
           "target": {
             "kind": "map",
             "map_id": 38,
             "map_name": "Red's House 2F",
-            "x": 7,
-            "y": 2,
+            "x": 2,
+            "y": 7,
             "detail": null
           },
           "success_conditions": [
@@ -186,8 +189,7 @@
     },
     "long_term": {
       "known_locations": {
-        "38": "Red's House 2F",
-        "37": "Red's House 1F"
+        "38": "Red's House 2F"
       },
       "story_flags": [],
       "navigation_notes": [],
@@ -195,8 +197,7 @@
         "Stuck score is high; prefer a recovery action over repeating the last failed input.",
         "Text is open; prefer PRESS_A to advance dialogue.",
         "A menu is open; use PRESS_B to back out or a single direction to navigate.",
-        "You are oscillating between states; stop repeating the same pattern.",
-        "Movement had no effect; try a different direction or interact with PRESS_A."
+        "You are oscillating between states; stop repeating the same pattern."
       ]
     }
   },
@@ -204,32 +205,10 @@
     "score": 0,
     "recent_signatures": [
       [
-        37,
-        "Red's House 1F",
-        7,
-        1,
-        "LEFT",
-        "OVERWORLD",
-        false,
-        false,
-        null
-      ],
-      [
-        37,
-        "Red's House 1F",
-        7,
-        2,
-        "UP",
-        "OVERWORLD",
-        false,
-        false,
-        null
-      ],
-      [
         38,
         "Red's House 2F",
-        7,
-        1,
+        2,
+        6,
         "LEFT",
         "OVERWORLD",
         false,
@@ -239,30 +218,8 @@
       [
         38,
         "Red's House 2F",
-        7,
         2,
-        "UP",
-        "OVERWORLD",
-        false,
-        false,
-        null
-      ],
-      [
-        37,
-        "Red's House 1F",
         7,
-        1,
-        "LEFT",
-        "OVERWORLD",
-        false,
-        false,
-        null
-      ],
-      [
-        37,
-        "Red's House 1F",
-        7,
-        2,
         "UP",
         "OVERWORLD",
         false,
@@ -272,8 +229,19 @@
       [
         38,
         "Red's House 2F",
-        7,
         1,
+        7,
+        "DOWN",
+        "OVERWORLD",
+        false,
+        false,
+        null
+      ],
+      [
+        38,
+        "Red's House 2F",
+        1,
+        6,
         "LEFT",
         "OVERWORLD",
         false,
@@ -283,9 +251,42 @@
       [
         38,
         "Red's House 2F",
+        1,
         7,
-        2,
         "UP",
+        "OVERWORLD",
+        false,
+        false,
+        null
+      ],
+      [
+        38,
+        "Red's House 2F",
+        2,
+        7,
+        "DOWN",
+        "OVERWORLD",
+        false,
+        false,
+        null
+      ],
+      [
+        38,
+        "Red's House 2F",
+        1,
+        7,
+        "DOWN",
+        "OVERWORLD",
+        false,
+        false,
+        null
+      ],
+      [
+        38,
+        "Red's House 2F",
+        2,
+        7,
+        "DOWN",
         "OVERWORLD",
         false,
         false,
@@ -293,114 +294,116 @@
       ]
     ],
     "recent_failed_actions": [
-      "PRESS_B",
-      "MOVE_UP",
-      "MOVE_DOWN",
+      "PRESS_A",
+      "PRESS_A",
+      "PRESS_A",
       "PRESS_A",
       "PRESS_B"
     ],
-    "loop_signature": "Red's House 1F(7,1)/OVERWORLD -> Red's House 1F(7,2)/OVERWORLD -> Red's House 2F(7,1)/OVERWORLD -> Red's House 2F(7,2)/OVERWORLD",
+    "loop_signature": "Red's House 2F(1,7)/OVERWORLD -> Red's House 2F(2,7)/OVERWORLD -> Red's House 2F(1,7)/OVERWORLD -> Red's House 2F(2,7)/OVERWORLD",
     "recovery_hint": null,
     "repeated_state_count": 2,
     "steps_since_progress": 0,
     "oscillating": false
   },
   "telemetry": {
-    "prompt_chars": 113670,
-    "approx_prompt_tokens": 28405,
-    "llm_prompt_tokens": 30891,
-    "llm_completion_tokens": 1716,
-    "llm_total_tokens": 32607,
-    "turns": 295,
-    "fallback_turns": 9,
+    "prompt_chars": 91061,
+    "approx_prompt_tokens": 22761,
+    "llm_prompt_tokens": 23551,
+    "llm_completion_tokens": 712,
+    "llm_total_tokens": 24263,
+    "turns": 299,
+    "fallback_turns": 0,
     "route_cache_turns": 0,
-    "llm_calls": 16,
-    "auto_selected_turns": 129,
-    "execution_plan_turns": 2,
-    "major_progress_turns": 6,
-    "no_effect_turns": 8,
-    "turns_per_call": 18.44,
-    "calls_per_major_progress": 2.67,
-    "prompt_tokens_per_call": 1930.69,
-    "auto_selected_candidate_ratio": 0.437,
-    "objective_switches": 1,
-    "objective_switch_rate": 0.003,
-    "no_effect_rate": 0.027
+    "llm_calls": 17,
+    "auto_selected_turns": 141,
+    "execution_plan_turns": 0,
+    "major_progress_turns": 1,
+    "no_effect_turns": 137,
+    "turns_per_call": 17.59,
+    "calls_per_major_progress": 17.0,
+    "prompt_tokens_per_call": 1385.35,
+    "auto_selected_candidate_ratio": 0.472,
+    "objective_switches": 9,
+    "objective_switch_rate": 0.03,
+    "no_effect_rate": 0.458
   },
   "context_state": {
     "action_traces": [
       {
-        "turn_index": 292,
-        "action": "MOVE_UP",
-        "repeat": 1,
-        "reason": "Only candidate matches objective",
-        "progress_classification": "major_progress",
-        "map_name": "Red's House 1F",
-        "position": {
-          "x": 7,
-          "y": 1
-        },
-        "event_summaries": [
-          "Entered Red's House 1F",
-          "Moved to (7, 1) on Red's House 1F"
-        ],
-        "stuck_score": 0,
-        "used_fallback": false,
-        "llm_attempted": true,
-        "planner_source": "llm"
-      },
-      {
-        "turn_index": 293,
+        "turn_index": 296,
         "action": "MOVE_DOWN",
         "repeat": 1,
-        "reason": "only candidate and matches active objective",
-        "progress_classification": "movement_success",
-        "map_name": "Red's House 1F",
-        "position": {
-          "x": 7,
-          "y": 2
-        },
-        "event_summaries": [
-          "Moved to (7, 2) on Red's House 1F"
-        ],
-        "stuck_score": 0,
-        "used_fallback": false,
-        "llm_attempted": true,
-        "planner_source": "llm"
-      },
-      {
-        "turn_index": 294,
-        "action": "MOVE_UP",
-        "repeat": 1,
-        "reason": "Only candidate; east exit is closest and aligns with objective",
-        "progress_classification": "major_progress",
-        "map_name": "Red's House 2F",
-        "position": {
-          "x": 7,
-          "y": 1
-        },
-        "event_summaries": [
-          "Entered Red's House 2F",
-          "Moved to (7, 1) on Red's House 2F"
-        ],
-        "stuck_score": 0,
-        "used_fallback": false,
-        "llm_attempted": true,
-        "planner_source": "llm"
-      },
-      {
-        "turn_index": 295,
-        "action": "MOVE_DOWN",
-        "repeat": 1,
-        "reason": "Only candidate step; move east to exit map",
+        "reason": "South exit one step away aligns with mid objective to leave bedroom",
         "progress_classification": "movement_success",
         "map_name": "Red's House 2F",
         "position": {
-          "x": 7,
-          "y": 2
+          "x": 1,
+          "y": 7
         },
         "event_summaries": [
-          "Moved to (7, 2) on Red's House 2F"
+          "Moved to (1, 7) on Red's House 2F",
+          "Goals updated for Red's House 2F"
+        ],
+        "stuck_score": 2,
+        "used_fallback": false,
+        "llm_attempted": true,
+        "planner_source": "llm"
+      },
+      {
+        "turn_index": 297,
+        "action": "MOVE_RIGHT",
+        "repeat": 1,
+        "reason": "East exit is closest to target map and aligns with objective.",
+        "progress_classification": "movement_success",
+        "map_name": "Red's House 2F",
+        "position": {
+          "x": 2,
+          "y": 7
+        },
+        "event_summaries": [
+          "Moved to (2, 7) on Red's House 2F",
+          "Goals updated for Red's House 2F"
+        ],
+        "stuck_score": 1,
+        "used_fallback": false,
+        "llm_attempted": true,
+        "planner_source": "llm"
+      },
+      {
+        "turn_index": 298,
+        "action": "MOVE_LEFT",
+        "repeat": 1,
+        "reason": "South exit is closest and leads toward downstairs",
+        "progress_classification": "movement_success",
+        "map_name": "Red's House 2F",
+        "position": {
+          "x": 1,
+          "y": 7
+        },
+        "event_summaries": [
+          "Moved to (1, 7) on Red's House 2F",
+          "Goals updated for Red's House 2F"
+        ],
+        "stuck_score": 0,
+        "used_fallback": false,
+        "llm_attempted": true,
+        "planner_source": "llm"
+      },
+      {
+        "turn_index": 299,
+        "action": "MOVE_RIGHT",
+        "repeat": 1,
+        "reason": "closest exit at (7,7) leads toward stairs",
+        "progress_classification": "movement_success",
+        "map_name": "Red's House 2F",
+        "position": {
+          "x": 2,
+          "y": 7
+        },
+        "event_summaries": [
+          "Moved to (2, 7) on Red's House 2F",
+          "Goals updated for Red's House 2F"
         ],
         "stuck_score": 0,
         "used_fallback": false,
