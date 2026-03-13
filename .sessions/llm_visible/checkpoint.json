@@ -1,0 +1,79 @@
+{
+  "completed_turns": 2,
+  "memory": {
+    "recent_events": [
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Pallet Town",
+        "step": 146,
+        "metadata": {
+          "short_term_goal": "Resolve the current menu",
+          "strategy": "Use single inputs while the menu is open"
+        }
+      },
+      {
+        "type": "MENU_OPENED",
+        "summary": "Opened menu",
+        "step": 146,
+        "metadata": {}
+      }
+    ],
+    "goals": {
+      "long_term_goal": "Complete Pokemon Red main story",
+      "mid_term_goal": "Leave the starting area and begin reliable overworld progress",
+      "short_term_goal": "Resolve the current menu",
+      "current_strategy": "Use single inputs while the menu is open",
+      "success_conditions": []
+    },
+    "long_term": {
+      "known_locations": {},
+      "story_flags": [],
+      "navigation_notes": [],
+      "heuristics": []
+    }
+  },
+  "stuck_state": {
+    "score": 1,
+    "recent_signatures": [
+      [
+        0,
+        "Pallet Town",
+        0,
+        0,
+        "DOWN",
+        "MENU",
+        true,
+        false,
+        null
+      ],
+      [
+        0,
+        "Pallet Town",
+        0,
+        0,
+        "DOWN",
+        "MENU",
+        true,
+        false,
+        null
+      ]
+    ],
+    "recent_failed_actions": [
+      "PRESS_B"
+    ],
+    "loop_signature": null,
+    "recovery_hint": "A menu is open; use PRESS_B to back out or a single direction to navigate.",
+    "repeated_state_count": 2,
+    "steps_since_progress": 1,
+    "oscillating": false
+  },
+  "telemetry": {
+    "prompt_chars": 3099,
+    "approx_prompt_tokens": 774,
+    "llm_prompt_tokens": 0,
+    "llm_completion_tokens": 0,
+    "llm_total_tokens": 0,
+    "turns": 2,
+    "fallback_turns": 2
+  }
+}

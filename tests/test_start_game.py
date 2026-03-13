@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import json
+import os
+from argparse import Namespace
+from pathlib import Path
+
+from scripts.start_game import apply_runtime_environment, build_main_args, resolve_planner
+
+
+def test_start_game_uses_resume_when_checkpoint_exists(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "checkpoint.json").write_text(json.dumps({"completed_turns": 2}), encoding="utf-8")
+
+    args = Namespace(
+        mode="mock",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="fallback",
+        session_dir=str(session_dir),
+        fresh=False,
+        eval=False,
+        log_mode="compact",
+        window=None,
+        headless=False,
+    )
+
+    main_args = build_main_args(args)
+
+    assert main_args.resume == str(session_dir.resolve())
+    assert main_args.checkpoint_dir == str(session_dir.resolve())
+    assert main_args.continuous is True
+    assert main_args.log_mode == "compact"
+
+
+def test_start_game_clears_session_when_fresh(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "checkpoint.json").write_text("{}", encoding="utf-8")
+
+    args = Namespace(
+        mode="mock",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="fallback",
+        session_dir=str(session_dir),
+        fresh=True,
+        eval=False,
+        log_mode="compact",
+        window=None,
+        headless=False,
+    )
+
+    main_args = build_main_args(args)
+
+    assert main_args.resume is None
+    assert (session_dir / "checkpoint.json").exists() is False
+
+
+def test_start_game_defaults_to_visible_pyboy_window(monkeypatch):
+    monkeypatch.delenv("PYBOY_WINDOW", raising=False)
+    args = Namespace(
+        mode="pyboy",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="fallback",
+        session_dir=".sessions/default",
+        fresh=False,
+        eval=False,
+        window=None,
+        headless=False,
+        log_mode="compact",
+    )
+
+    window = apply_runtime_environment(args)
+
+    assert window == "SDL2"
+    assert os.environ["PYBOY_WINDOW"] == "SDL2"
+
+
+def test_start_game_auto_planner_uses_llm_when_key_exists(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    args = Namespace(
+        mode="pyboy",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="auto",
+        session_dir=".sessions/default",
+        fresh=False,
+        eval=False,
+        window=None,
+        headless=False,
+        log_mode="compact",
+    )
+
+    assert resolve_planner(args) == "llm"

@@ -1,0 +1,125 @@
+{
+  "completed_turns": 4,
+  "memory": {
+    "recent_events": [
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Title Screen",
+        "step": 1466,
+        "metadata": {
+          "short_term_goal": "Reach a controllable gameplay state",
+          "strategy": "Use PRESS_START on the title screen"
+        }
+      },
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Boot Sequence",
+        "step": 1492,
+        "metadata": {
+          "short_term_goal": "Reach a controllable gameplay state",
+          "strategy": "Use single confirm inputs while the startup sequence advances"
+        }
+      },
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Boot Sequence",
+        "step": 1544,
+        "metadata": {
+          "short_term_goal": "Reach a controllable gameplay state",
+          "strategy": "Stuck score is high; prefer a recovery action over repeating the last failed input."
+        }
+      },
+      {
+        "type": "NO_EFFECT",
+        "summary": "PRESS_A had no effect",
+        "step": 1544,
+        "metadata": {
+          "stuck_score": 4
+        }
+      }
+    ],
+    "goals": {
+      "long_term_goal": "Complete Pokemon Red main story",
+      "mid_term_goal": "Finish the intro flow and reach a controllable in-game state",
+      "short_term_goal": "Reach a controllable gameplay state",
+      "current_strategy": "Stuck score is high; prefer a recovery action over repeating the last failed input.",
+      "success_conditions": []
+    },
+    "long_term": {
+      "known_locations": {},
+      "story_flags": [],
+      "navigation_notes": [],
+      "heuristics": [
+        "Stuck score is high; prefer a recovery action over repeating the last failed input."
+      ]
+    }
+  },
+  "stuck_state": {
+    "score": 4,
+    "recent_signatures": [
+      [
+        null,
+        "Title Screen",
+        null,
+        null,
+        null,
+        "CUTSCENE",
+        false,
+        false,
+        null
+      ],
+      [
+        null,
+        "Boot Sequence",
+        null,
+        null,
+        null,
+        "CUTSCENE",
+        false,
+        false,
+        null
+      ],
+      [
+        null,
+        "Boot Sequence",
+        null,
+        null,
+        null,
+        "CUTSCENE",
+        false,
+        false,
+        null
+      ],
+      [
+        null,
+        "Boot Sequence",
+        null,
+        null,
+        null,
+        "CUTSCENE",
+        false,
+        false,
+        null
+      ]
+    ],
+    "recent_failed_actions": [
+      "PRESS_START",
+      "PRESS_A",
+      "PRESS_A"
+    ],
+    "loop_signature": "Title Screen(None,None)/CUTSCENE -> Boot Sequence(None,None)/CUTSCENE -> Boot Sequence(None,None)/CUTSCENE -> Boot Sequence(None,None)/CUTSCENE",
+    "recovery_hint": "Stuck score is high; prefer a recovery action over repeating the last failed input.",
+    "repeated_state_count": 3,
+    "steps_since_progress": 2,
+    "oscillating": false
+  },
+  "telemetry": {
+    "prompt_chars": 0,
+    "approx_prompt_tokens": 0,
+    "llm_prompt_tokens": 0,
+    "llm_completion_tokens": 0,
+    "llm_total_tokens": 0,
+    "turns": 4,
+    "fallback_turns": 0
+  }
+}

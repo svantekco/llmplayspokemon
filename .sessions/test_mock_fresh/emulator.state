@@ -1,0 +1,29 @@
+{
+  "state": {
+    "map_name": "Mock Town",
+    "map_id": "mock_town",
+    "x": 5,
+    "y": 2,
+    "facing": "UP",
+    "mode": "OVERWORLD",
+    "menu_open": false,
+    "text_box_open": false,
+    "battle_state": null,
+    "party": [
+      {
+        "name": "Charmander",
+        "hp": 20,
+        "max_hp": 20,
+        "status": null
+      }
+    ],
+    "inventory": [],
+    "step": 3,
+    "metadata": {
+      "last_button": "MOVE_UP",
+      "script_state": "intro"
+    }
+  },
+  "received_parcel": false,
+  "dialogue_stage": 0
+}

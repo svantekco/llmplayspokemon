@@ -1,0 +1,227 @@
+{
+  "completed_turns": 1,
+  "memory": {
+    "recent_events": [
+      {
+        "type": "MOVED",
+        "summary": "Moved to (6, 5) on Mock Town",
+        "step": 1,
+        "metadata": {
+          "from": {
+            "x": 5,
+            "y": 5
+          },
+          "to": {
+            "x": 6,
+            "y": 5
+          }
+        }
+      },
+      {
+        "type": "GOAL_UPDATED",
+        "summary": "Goals updated for Mock Town",
+        "step": 1,
+        "metadata": {
+          "short_term_goal": "Move toward Oak's Lab",
+          "strategy": "Leave your bedroom and head downstairs.",
+          "milestone_id": "get_starter"
+        }
+      }
+    ],
+    "goals": {
+      "long_term_goal": "Collect your starter Pokemon from Professor Oak.",
+      "mid_term_goal": "Leave your bedroom and head downstairs.",
+      "short_term_goal": "Move toward Oak's Lab",
+      "current_strategy": "Leave your bedroom and head downstairs.",
+      "success_conditions": [
+        "Story flag got_starter is active"
+      ],
+      "active_objectives": [
+        {
+          "id": "long_get_starter",
+          "horizon": "long",
+          "summary": "Collect your starter Pokemon from Professor Oak.",
+          "priority": 30,
+          "target": {
+            "kind": "story",
+            "map_id": null,
+            "map_name": "Oak's Lab",
+            "x": null,
+            "y": null,
+            "detail": "get_starter"
+          },
+          "success_conditions": [
+            "Story flag got_starter is active"
+          ],
+          "invalidation_conditions": [
+            "Story milestone changes"
+          ],
+          "status": "active",
+          "source": "rule"
+        },
+        {
+          "id": "mid_get_starter",
+          "horizon": "mid",
+          "summary": "Leave your bedroom and head downstairs.",
+          "priority": 20,
+          "target": {
+            "kind": "map",
+            "map_id": "mock_town",
+            "map_name": "Oak's Lab",
+            "x": null,
+            "y": null,
+            "detail": null
+          },
+          "success_conditions": [
+            "Story flag got_starter is active"
+          ],
+          "invalidation_conditions": [
+            "Map changes",
+            "Battle starts",
+            "Menu or text blocks progress"
+          ],
+          "status": "active",
+          "source": "rule"
+        },
+        {
+          "id": "short_get_starter",
+          "horizon": "short",
+          "summary": "Move toward Oak's Lab",
+          "priority": 10,
+          "target": {
+            "kind": "map",
+            "map_id": "mock_town",
+            "map_name": "Mock Town",
+            "x": 6,
+            "y": 5,
+            "detail": null
+          },
+          "success_conditions": [
+            "Position changes",
+            "Dialogue opens",
+            "Map changes"
+          ],
+          "invalidation_conditions": [
+            "No effect",
+            "Map changes",
+            "Mode changes",
+            "Collision hash changes"
+          ],
+          "status": "active",
+          "source": "rule"
+        }
+      ]
+    },
+    "long_term": {
+      "known_locations": {},
+      "story_flags": [],
+      "navigation_notes": [],
+      "heuristics": []
+    }
+  },
+  "stuck_state": {
+    "score": 0,
+    "recent_signatures": [
+      [
+        "mock_town",
+        "Mock Town",
+        6,
+        5,
+        "RIGHT",
+        "OVERWORLD",
+        false,
+        false,
+        null
+      ]
+    ],
+    "recent_failed_actions": [],
+    "loop_signature": null,
+    "recovery_hint": null,
+    "repeated_state_count": 1,
+    "steps_since_progress": 0,
+    "oscillating": false
+  },
+  "telemetry": {
+    "prompt_chars": 4720,
+    "approx_prompt_tokens": 1180,
+    "llm_prompt_tokens": 0,
+    "llm_completion_tokens": 0,
+    "llm_total_tokens": 0,
+    "turns": 1,
+    "fallback_turns": 0,
+    "route_cache_turns": 0,
+    "llm_calls": 1,
+    "auto_selected_turns": 0,
+    "execution_plan_turns": 0,
+    "major_progress_turns": 0,
+    "no_effect_turns": 0,
+    "turns_per_call": 1.0,
+    "calls_per_major_progress": null,
+    "prompt_tokens_per_call": 0.0,
+    "auto_selected_candidate_ratio": 0.0,
+    "objective_switches": 0,
+    "objective_switch_rate": 0.0,
+    "no_effect_rate": 0.0
+  },
+  "context_state": {
+    "action_traces": [
+      {
+        "turn_index": 1,
+        "action": "MOVE_RIGHT",
+        "repeat": 1,
+        "reason": "pick candidate",
+        "progress_classification": "movement_success",
+        "map_name": "Mock Town",
+        "position": {
+          "x": 6,
+          "y": 5
+        },
+        "event_summaries": [
+          "Moved to (6, 5) on Mock Town",
+          "Goals updated for Mock Town"
+        ],
+        "stuck_score": 0,
+        "used_fallback": false,
+        "llm_attempted": true,
+        "planner_source": "llm"
+      }
+    ]
+  },
+  "route_cache": {
+    "map_id": "mock_town",
+    "target_x": 8,
+    "target_y": 5,
+    "collision_hash": "{\"blocked\": [[2, 2], [4, 5], [4, 6]], \"npc\": null, \"warp\": [[9, 5]]}",
+    "remaining_actions": [
+      "MOVE_RIGHT",
+      "MOVE_RIGHT"
+    ],
+    "expected_start": {
+      "x": 6,
+      "y": 5
+    }
+  },
+  "execution_plan": {
+    "objective_id": "short_immediate_step",
+    "candidate_id": "approach_interactable_9_5",
+    "plan_type": "MOVE_ADJACENT_TO_INTERACTABLE",
+    "target": {
+      "kind": "interactable",
+      "map_id": "mock_town",
+      "map_name": "Mock Town",
+      "x": 9,
+      "y": 5,
+      "detail": "stand at (8, 5)"
+    },
+    "expected_success_signal": "Reach the adjacent tile, then open text or change state",
+    "step_budget": 5,
+    "button_action": null,
+    "target_x": 8,
+    "target_y": 5,
+    "follow_up_action": "PRESS_A",
+    "map_id": "mock_town",
+    "collision_hash": "{\"blocked\": [[2, 2], [4, 5], [4, 6]], \"npc\": null, \"warp\": [[9, 5]]}",
+    "reason": "pick candidate",
+    "started_step": 0
+  }
+}
