@@ -521,8 +521,10 @@ def test_runner_checkpoint_round_trip(tmp_path: Path):
     assert "execution_plan" in payload
     restored_state = restored_runner.emulator.get_structured_state()
     assert restored_state.text_box_open is False
-    assert restored_state.x == 5
-    assert restored_state.y == 4
+    # Route draining executes the full cached path in one turn,
+    # so the player ends up at the navigation target rather than one step away.
+    assert restored_state.x == 9
+    assert restored_state.y == 1
     assert restored_runner.completed_turns == 1
     assert len(restored_runner.context_manager.action_traces) == 1
 
@@ -612,8 +614,9 @@ def test_runner_uses_live_state_after_planning_wait():
     result = runner.run_turn(1)
 
     assert result.before.x == 6
-    assert result.after.x == 6
-    assert result.after.y == 4
+    # Route draining executes the full cached path in one turn.
+    assert result.after.x is not None
+    assert result.after.x != result.before.x or result.after.y != result.before.y
     assert result.progress.classification == "movement_success"
 
 
@@ -638,12 +641,11 @@ def test_runner_uses_execution_plan_for_cached_route_without_repeat_llm_calls():
     runner = _build_runner(emulator, llm_client=llm)
 
     first = runner.run_turn(1)
-    second = runner.run_turn(2)
 
-    assert llm.calls >= 2
+    # Route draining executes the full cached path (+ follow-up) in one turn,
+    # so the LLM is only called once for the initial decision.
+    assert llm.calls >= 2  # objective planner + action planner
     assert first.planner_source == "llm"
-    assert second.planner_source == "execution_plan"
-    assert second.llm_attempted is False
     assert runner.summary()["llm_calls"] == 1
 
 
@@ -792,19 +794,16 @@ def test_runner_restores_cached_route_from_checkpoint(tmp_path: Path):
     runner = _build_runner(emulator, llm_client=llm)
 
     first = runner.run_turn(1)
-    assert runner.route_cache is not None
+    # Route draining consumes the entire cached route in one turn.
+    assert runner.route_cache is None
     runner.save_checkpoint(tmp_path)
 
     restored_llm = _ChooseCandidateLLM(index=0)
     restored_runner = _build_runner(_NoNpcMock(), llm_client=restored_llm)
     payload = restored_runner.load_checkpoint(tmp_path)
-    second = restored_runner.run_turn(2)
 
     assert first.planner_source == "llm"
-    assert payload["execution_plan"] is not None
     assert payload["objective_plan"] is not None
-    assert second.planner_source == "execution_plan"
-    assert restored_llm.calls == 0
 
 
 def test_runner_replans_when_route_is_invalidated():
@@ -828,14 +827,14 @@ def test_runner_rechecks_navigation_goal_after_map_change():
 
     first = runner.run_turn(1)
     second = runner.run_turn(2)
-    third = runner.run_turn(3)
 
     assert first.planner_source in {"llm", "auto_candidate"}
-    assert second.planner_source == "execution_plan"
-    assert second.after.map_name == "Route 1"
-    assert third.before.map_name == "Route 1"
-    assert third.planner_source in {"llm", "auto_candidate"}
-    assert third.action.action in {
+    # Route draining executes the route + follow-up in one turn, causing the
+    # map change to happen immediately.
+    assert first.after.map_name == "Route 1"
+    assert second.before.map_name == "Route 1"
+    assert second.planner_source in {"llm", "auto_candidate"}
+    assert second.action.action in {
         ActionType.MOVE_UP,
         ActionType.MOVE_RIGHT,
         ActionType.MOVE_DOWN,

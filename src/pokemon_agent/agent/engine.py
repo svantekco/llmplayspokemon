@@ -249,6 +249,15 @@ class ClosedLoopRunner:
         execution_plan_snapshot = copy.deepcopy(self.execution_plan)
         action = self.validator.validate(planning.action, before)
         self.emulator.execute_action(action)
+        # When following a cached route, drain all remaining steps in one turn
+        # so the engine doesn't waste turns re-evaluating candidates per tile.
+        extra_steps = self._drain_cached_route_steps()
+        if extra_steps > 0:
+            action = ActionDecision(
+                action=action.action,
+                repeat=1,
+                reason=f"{action.reason} (+{extra_steps} steps drained)",
+            )
         after = self.emulator.get_structured_state()
         progress_result = self.progress.compare(before, after)
         stuck_state = self.stuck.update(after, action, progress_result.classification, progress_result)
@@ -1561,7 +1570,12 @@ class ClosedLoopRunner:
         if source_x is None or source_y is None:
             return None
         walkable_set = {(coord.x, coord.y) for coord in state.navigation.walkable}
-        best: tuple[tuple[int, str], tuple[int, int, ActionType, int]] | None = None
+        # When the warp tile itself is walkable (e.g. a door mat), the warp
+        # only triggers when walking south onto it.  Strongly penalise any
+        # other approach direction so the engine exits through the door
+        # instead of oscillating between adjacent carpet tiles.
+        source_is_walkable = (source_x, source_y) in walkable_set
+        best: tuple[tuple[int, int, str], tuple[int, int, ActionType, int]] | None = None
         for move_action, dx, dy in (
             (ActionType.MOVE_UP, 0, -1),
             (ActionType.MOVE_RIGHT, 1, 0),
@@ -1575,8 +1589,13 @@ class ClosedLoopRunner:
             route = find_path(state.navigation, state.x, state.y, approach_x, approach_y)
             if route is None:
                 continue
-            payload = (approach_x, approach_y, move_action, len(route))
-            rank = (len(route), move_action.value)
+            distance = len(route)
+            # Penalise non-south approaches for walkable warps (doors).
+            direction_penalty = 0
+            if source_is_walkable and move_action != ActionType.MOVE_DOWN:
+                direction_penalty = 100
+            payload = (approach_x, approach_y, move_action, distance)
+            rank = (distance + direction_penalty, direction_penalty, move_action.value)
             if best is None or rank < best[0]:
                 best = (rank, payload)
         return None if best is None else best[1]
@@ -1893,15 +1912,44 @@ class ClosedLoopRunner:
             return self._continue_button_plan(plan, state, condition=state.menu_open)
         if plan.plan_type == "BATTLE_DEFAULT":
             return self._continue_button_plan(plan, state, condition=state.battle_state is not None)
-        if plan.plan_type in NAVIGATION_CANDIDATE_TYPES and plan.follow_up_action is not None:
-            if (state.x, state.y) == (plan.target_x, plan.target_y):
-                follow_up_action = plan.follow_up_action
-                plan.follow_up_action = None
-                self.execution_plan = plan
-                return ActionDecision(action=follow_up_action, repeat=1, reason=plan.reason or "Trigger connector at target")
         if plan.plan_type in NAVIGATION_CANDIDATE_TYPES and plan.target_x is not None and plan.target_y is not None:
-            if (state.x, state.y) == (plan.target_x, plan.target_y) and plan.follow_up_action is None:
+            if (state.x, state.y) == (plan.target_x, plan.target_y):
+                if plan.follow_up_action is not None:
+                    follow_up_action = plan.follow_up_action
+                    plan.follow_up_action = None
+                    self.execution_plan = plan
+                    return ActionDecision(action=follow_up_action, repeat=1, reason=plan.reason or "Trigger connector at target")
                 self.execution_plan = None
+                return None
+            # Not at target yet – recompute path and continue navigating.
+            if (
+                state.mode == GameMode.OVERWORLD
+                and state.navigation is not None
+                and state.x is not None
+                and state.y is not None
+                and not state.text_box_open
+                and not state.menu_open
+                and state.battle_state is None
+                and plan.map_id == state.map_id
+                and plan.step_budget > 0
+            ):
+                route = self._find_path_with_temporary_blockers(state, plan.target_x, plan.target_y)
+                if route:
+                    plan.step_budget -= 1
+                    first_action = route[0]
+                    remaining = list(route[1:])
+                    if remaining:
+                        self.route_cache = CachedRoute(
+                            map_id=state.map_id,
+                            target_x=plan.target_x,
+                            target_y=plan.target_y,
+                            collision_hash=state.navigation.collision_hash,
+                            remaining_actions=remaining,
+                            expected_start=advance_position(state.x, state.y, first_action),
+                        )
+                    return ActionDecision(action=first_action, repeat=1, reason=plan.reason or "Continue navigation to target")
+            # Path not found or budget exhausted – abandon plan.
+            self.execution_plan = None
         return None
 
     def _continue_button_plan(
@@ -1951,6 +1999,75 @@ class ClosedLoopRunner:
             self.route_cache = None
         target_text = f"({route.target_x}, {route.target_y})"
         return ActionDecision(action=next_action, repeat=1, reason=f"Continue cached route to {target_text}")
+
+    def _drain_cached_route_steps(self) -> int:
+        """Execute all remaining cached-route steps in a tight loop.
+
+        Called immediately after the first step of a cached route (or any
+        navigation action that set up a route cache).  Returns the number
+        of extra emulator actions executed.  Stops early if the game state
+        becomes unsafe (map change, text box, battle, etc.).
+        """
+        extra_steps = 0
+        while self.route_cache is not None and self.route_cache.remaining_actions:
+            state = self.emulator.get_structured_state()
+            if state.mode != GameMode.OVERWORLD:
+                self.route_cache = None
+                break
+            if state.text_box_open or state.menu_open or state.battle_state is not None:
+                self.route_cache = None
+                break
+            route = self.route_cache
+            if state.map_id != route.map_id:
+                self.route_cache = None
+                break
+            if state.x != route.expected_start.x or state.y != route.expected_start.y:
+                self.route_cache = None
+                break
+            next_action = route.remaining_actions.pop(0)
+            if state.navigation is not None:
+                walkable = {(c.x, c.y) for c in state.navigation.walkable}
+                next_pos = advance_position(state.x or 0, state.y or 0, next_action)
+                if (next_pos.x, next_pos.y) not in walkable:
+                    self.route_cache = None
+                    break
+            step = ActionDecision(action=next_action, repeat=1, reason="drain cached route")
+            self.emulator.execute_action(self.validator.validate(step, state))
+            extra_steps += 1
+            if route.remaining_actions:
+                route.expected_start = advance_position(state.x or 0, state.y or 0, next_action)
+            else:
+                self.route_cache = None
+
+        # If we reached the target and the execution plan has a follow-up
+        # action (e.g. walk into a door / stairs), execute it immediately.
+        plan = self.execution_plan
+        if (
+            plan is not None
+            and plan.follow_up_action is not None
+            and plan.plan_type in NAVIGATION_CANDIDATE_TYPES
+            and plan.target_x is not None
+            and plan.target_y is not None
+        ):
+            state = self.emulator.get_structured_state()
+            if (
+                state.mode == GameMode.OVERWORLD
+                and (state.x, state.y) == (plan.target_x, plan.target_y)
+                and not state.text_box_open
+                and not state.menu_open
+                and state.battle_state is None
+            ):
+                follow_up = ActionDecision(
+                    action=plan.follow_up_action,
+                    repeat=1,
+                    reason=plan.reason or "follow-up at target",
+                )
+                self.emulator.execute_action(self.validator.validate(follow_up, state))
+                plan.follow_up_action = None
+                self.execution_plan = plan
+                extra_steps += 1
+
+        return extra_steps
 
     def _find_path_with_temporary_blockers(
         self,
@@ -2075,9 +2192,13 @@ class ClosedLoopRunner:
         if plan.map_id != state.map_id:
             self.execution_plan = None
             return
-        if state.navigation is not None and plan.collision_hash is not None and state.navigation.collision_hash != plan.collision_hash:
-            self.execution_plan = None
-            return
+        # For navigation plans the re-path logic in _plan_from_execution_plan
+        # recomputes using the current collision data, so a hash change is not
+        # fatal.  Only invalidate non-navigation plans on collision changes.
+        if plan.plan_type not in NAVIGATION_CANDIDATE_TYPES:
+            if state.navigation is not None and plan.collision_hash is not None and state.navigation.collision_hash != plan.collision_hash:
+                self.execution_plan = None
+                return
         if plan.target_x is not None and plan.target_y is not None and (state.x, state.y) == (plan.target_x, plan.target_y):
             if plan.follow_up_action is None:
                 self.execution_plan = None
