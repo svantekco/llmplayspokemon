@@ -54,6 +54,17 @@ class DiscoveredMap(BaseModel):
 class NavigationGoal(BaseModel):
     target_map_name: str
     source: str = "objective"
+    objective_kind: str = "reach_boundary_side"
+    engine_mode: str = "progression"
+    current_map_name: str | None = None
+    next_map_name: str | None = None
+    next_hop_kind: str | None = None
+    next_hop_side: str | None = None
+    target_connector_id: str | None = None
+    failed_candidate_ids: list[str] = Field(default_factory=list)
+    failed_connector_ids: list[str] = Field(default_factory=list)
+    failed_sides: list[str] = Field(default_factory=list)
+    last_candidate_id: str | None = None
     started_step: int | None = None
     last_confirmed_step: int | None = None
     confirmation_required_map: str | None = None

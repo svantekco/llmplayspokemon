@@ -20,17 +20,12 @@ from pokemon_agent.models.state import StructuredGameState
 
 RESPONSE_SCHEMA = {
     "candidate_id": "<exact id from candidate_next_steps>",
-    "reason": "<10 words max>",
 }
 PLANNER_SYSTEM_PROMPT = (
-    "You control a Pokémon Red agent. Your only task: select one candidate from candidate_next_steps "
-    "and return its exact id. "
-    "Rules: "
-    "(1) If stuck_warning is present, do not select a candidate listed in stuck_warning.failed_candidate_ids. "
-    "(2) For yes/no prompts, read the dialogue and choose select_yes or select_no. "
-    "(3) Otherwise prefer the candidate whose why best matches the current state and goal. "
-    'Return exactly: {"candidate_id": "<id>", "reason": "<10 words max>"}. '
-    "No markdown. No extra keys. candidate_id must be one of the ids shown."
+    "You control a Pokémon Red agent. Select exactly one id from candidate_next_steps. "
+    "Obey mode and local_objective. Prefer the highest-priority candidate that advances the target. "
+    "Never choose a blacklisted candidate. Use the dialogue only to resolve ambiguous yes/no choices. "
+    'Return exactly {"candidate_id":"<id>"}. No markdown. No extra keys.'
 )
 
 
@@ -196,11 +191,18 @@ class ContextManager:
         candidate_next_steps: list[CandidateNextStep] | None,
         candidate_runtime: dict[str, CandidateRuntime] | None,
     ) -> dict[str, Any]:
-        immediate_state = self._build_immediate_state(state)
+        current_milestone = self._build_current_milestone(state)
+        local_objective = self._build_local_objective(memory_state)
         context: dict[str, Any] = {
-            "immediate_state": immediate_state,
-            "goal": self._build_goal(immediate_state),
+            "mode": self._planner_mode(state, memory_state),
+            "current_map": self._build_current_map(state),
+            "current_milestone": current_milestone,
         }
+        if local_objective is not None:
+            context["local_objective"] = local_objective
+            next_map_hop = self._build_next_map_hop(local_objective)
+            if next_map_hop is not None:
+                context["next_map_hop"] = next_map_hop
         context.update(self._build_mode_context(state, memory_state))
         if candidate_next_steps:
             context["candidate_next_steps"] = [self._serialize_candidate(item) for item in candidate_next_steps[:4]]
@@ -208,12 +210,17 @@ class ContextManager:
         if stuck_warning is not None:
             if candidate_next_steps and stuck_state is not None:
                 failed_actions = set(stuck_state.recent_failed_actions[-3:])
+                goal = memory_state.long_term.navigation_goal
+                failed_ids = list(goal.failed_candidate_ids) if goal is not None else []
                 failed_ids = [
-                    cand.id for cand in candidate_next_steps
+                    *failed_ids,
+                    *[
+                        cand.id for cand in candidate_next_steps
                     if candidate_runtime is not None
                     and cand.id in candidate_runtime
                     and (action := candidate_runtime[cand.id].action) is not None
                     and action.action.value in failed_actions
+                    ],
                 ]
                 # When oscillating/high stuck score, also flag interactable candidates so the
                 # LLM avoids re-selecting them (same sign re-read pattern).
@@ -228,25 +235,33 @@ class ContextManager:
             context["stuck_warning"] = stuck_warning
         last_outcome = self._build_last_outcome()
         if last_outcome is not None:
-            context["last_outcome"] = last_outcome
+            context["last_candidate_result"] = last_outcome
         recent_events = self._build_recent_events(memory_state)
         if recent_events:
             context["recent_events"] = recent_events
         return context
 
-    def _build_goal(self, immediate_state: dict[str, Any]) -> str:
-        milestone = immediate_state.get("current_milestone", {})
-        description = str(milestone.get("description") or "")
-        target_map = str(milestone.get("target_map") or "")
-        if target_map and description:
-            return f"Navigate to {target_map} — {description}"
-        if description:
-            return description
-        return "Follow the walkthrough."
+    def _build_current_map(self, state: StructuredGameState) -> dict[str, Any]:
+        dialogue_text = self._get_dialogue(state)
+        payload: dict[str, Any] = {
+            "name": state.map_name,
+            "id": state.map_id,
+            "position": {"x": state.x, "y": state.y},
+            "facing": state.facing,
+            "step": state.step,
+            "ui_flags": {
+                "menu_open": state.menu_open,
+                "text_box_open": state.text_box_open,
+            },
+        }
+        if state.text_box_open:
+            payload["ui_flags"]["yes_no_prompt"] = bool(state.metadata.get("yes_no_prompt"))
+        if dialogue_text:
+            payload["dialogue_text"] = dialogue_text
+        return payload
 
-    def _build_immediate_state(self, state: StructuredGameState) -> dict[str, Any]:
+    def _build_current_milestone(self, state: StructuredGameState) -> dict[str, Any]:
         battle_payload = self._battle_payload(state)
-        battle_kind = battle_payload.get("kind")
         inventory_names = [item.name for item in state.inventory]
         current_milestone = get_current_milestone(
             state.story_flags,
@@ -254,32 +269,51 @@ class ContextManager:
             current_map_name=state.map_name,
             badges=state.badges,
         )
-        immediate: dict[str, Any] = {
-            "engine_phase": state.metadata.get("engine_phase", "active"),
-            "map": {"name": state.map_name, "id": state.map_id},
-            "position": {"x": state.x, "y": state.y},
-            "facing": state.facing,
-            "mode": state.mode.value,
+        return {
+            "id": current_milestone.id,
+            "description": current_milestone.description,
+            "target_map": current_milestone.target_map_name,
+            "next_hint": current_milestone.route_hints[0] if current_milestone.route_hints else None,
+            "battle_kind": battle_payload.get("kind"),
             "badges": list(state.badges),
-            "current_milestone": {
-                "id": current_milestone.id,
-                "description": current_milestone.description,
-                "target_map": current_milestone.target_map_name,
-                "next_hint": current_milestone.route_hints[0] if current_milestone.route_hints else None,
-            },
-            "ui_flags": {
-                "menu_open": state.menu_open,
-                "text_box_open": state.text_box_open,
-            },
-            "battle_kind": battle_kind,
-            "step": state.step,
         }
-        dialogue_text = self._get_dialogue(state)
-        if isinstance(dialogue_text, str) and dialogue_text.strip():
-            immediate["dialogue_text"] = dialogue_text
-        if state.text_box_open:
-            immediate["ui_flags"]["yes_no_prompt"] = bool(state.metadata.get("yes_no_prompt"))
-        return immediate
+
+    def _build_local_objective(self, memory_state: MemoryState) -> dict[str, Any] | None:
+        goal = memory_state.long_term.navigation_goal
+        if goal is None:
+            return None
+        return {
+            "kind": goal.objective_kind,
+            "target_map": goal.target_map_name,
+            "current_map": goal.current_map_name,
+            "engine_mode": goal.engine_mode,
+            "next_map": goal.next_map_name,
+            "next_hop_kind": goal.next_hop_kind,
+            "next_hop_side": goal.next_hop_side,
+            "target_connector_id": goal.target_connector_id,
+            "failed_candidate_ids": goal.failed_candidate_ids[-4:],
+        }
+
+    def _build_next_map_hop(self, local_objective: dict[str, Any]) -> dict[str, Any] | None:
+        if not local_objective.get("next_map") and not local_objective.get("next_hop_kind"):
+            return None
+        return {
+            "next_map": local_objective.get("next_map"),
+            "kind": local_objective.get("next_hop_kind"),
+            "side": local_objective.get("next_hop_side"),
+        }
+
+    def _planner_mode(self, state: StructuredGameState, memory_state: MemoryState) -> str:
+        if state.battle_state or state.mode == GameMode.BATTLE:
+            return "battle"
+        if state.menu_open or state.mode == GameMode.MENU:
+            return "menu"
+        if state.text_box_open or state.mode == GameMode.TEXT:
+            return "text"
+        goal = memory_state.long_term.navigation_goal
+        if goal is None:
+            return "exploration"
+        return goal.engine_mode
 
     def _build_mode_context(self, state: StructuredGameState, memory_state: MemoryState) -> dict[str, Any]:
         if state.battle_state or state.mode == GameMode.BATTLE:
@@ -503,11 +537,11 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        # 4. Reduce last_outcome
-        last_outcome = context.get("last_outcome")
+        # 4. Reduce last candidate result
+        last_outcome = context.get("last_candidate_result")
         if isinstance(last_outcome, dict) and "event_summaries" in last_outcome:
             last_outcome["event_summaries"] = last_outcome.get("event_summaries", [])[:1]
-            dropped_sections.append("last_outcome_reduced")
+            dropped_sections.append("last_candidate_result_reduced")
         if self._within_budget(payload, system_prompt):
             return
 

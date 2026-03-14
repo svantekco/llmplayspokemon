@@ -14,6 +14,8 @@ from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import NavigationSnapshot
 from pokemon_agent.models.state import StructuredGameState
 from pokemon_agent.models.state import WorldCoordinate
+from pokemon_agent.agent.navigation import is_real_map_edge
+from pokemon_agent.agent.navigation import visible_boundary_side
 
 MOVE_TO_SIDE: dict[ActionType, str] = {
     ActionType.MOVE_UP: "north",
@@ -177,7 +179,19 @@ def summarize_navigation_goal(
 ) -> dict[str, object]:
     if goal is None:
         return {}
-    summary: dict[str, object] = {"navigation_goal": goal.target_map_name}
+    summary: dict[str, object] = {
+        "target_map": goal.target_map_name,
+        "kind": goal.objective_kind,
+        "engine_mode": goal.engine_mode,
+    }
+    if goal.next_map_name is not None:
+        summary["next_map"] = goal.next_map_name
+    if goal.next_hop_kind is not None:
+        summary["next_hop_kind"] = goal.next_hop_kind
+    if goal.next_hop_side is not None:
+        summary["next_hop_side"] = goal.next_hop_side
+    if goal.target_connector_id is not None:
+        summary["target_connector_id"] = goal.target_connector_id
     route = shortest_confirmed_path(world_map, current_map, goal.target_map_name)
     if route is None:
         summary["discovered_route_available"] = False
@@ -257,6 +271,8 @@ def _detect_connectors(
     blocked = {(coord.x, coord.y) for coord in navigation.blocked}
 
     for side, coordinate in _boundary_connectors(navigation):
+        if not is_real_map_edge(navigation, side):
+            continue
         connector = _create_connector(
             source_map=discovered_map.map_name,
             side=side,
@@ -270,7 +286,7 @@ def _detect_connectors(
     for blocked_x, blocked_y in blocked:
         side = _boundary_side(navigation, blocked_x, blocked_y)
         walkable_neighbors = _adjacent_walkable_count(blocked_x, blocked_y, walkable)
-        if side is not None and walkable_neighbors > 0:
+        if side is not None and is_real_map_edge(navigation, side) and walkable_neighbors > 0:
             connector = _create_connector(
                 source_map=discovered_map.map_name,
                 side=side,
@@ -280,13 +296,13 @@ def _detect_connectors(
                 step=step,
             )
             _register_connector(world_map, discovered_map, connector)
-        elif walkable_neighbors > 0 and _blocked_neighbor_count(blocked_x, blocked_y, blocked) == 0:
+        elif walkable_neighbors > 0 and _blocked_neighbor_count(blocked_x, blocked_y, blocked) <= 1:
             connector = _create_connector(
                 source_map=discovered_map.map_name,
                 side=None,
                 source_x=blocked_x,
                 source_y=blocked_y,
-                kind="unknown",
+                kind="warp",
                 step=step,
             )
             _register_connector(world_map, discovered_map, connector)
@@ -421,15 +437,7 @@ def _merge_coordinates(
 
 
 def _boundary_side(navigation: NavigationSnapshot, x: int, y: int) -> str | None:
-    if y == navigation.min_y:
-        return "north"
-    if x == navigation.max_x:
-        return "east"
-    if y == navigation.max_y:
-        return "south"
-    if x == navigation.min_x:
-        return "west"
-    return None
+    return visible_boundary_side(navigation, x, y)
 
 
 def _adjacent_walkable_count(x: int, y: int, walkable: set[tuple[int, int]]) -> int:

@@ -46,6 +46,10 @@ class CandidateNextStep(BaseModel):
     priority: int = 0
     expected_success_signal: str
     objective_id: str | None = None
+    distance: int | None = None
+    advances_target: bool = False
+    backtrack: bool = False
+    blacklisted: bool = False
 
 
 class PlannerDecision(BaseModel):

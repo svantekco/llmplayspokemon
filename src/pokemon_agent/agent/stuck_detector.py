@@ -41,7 +41,6 @@ class StuckDetector:
             "major_progress",
             "movement_success",
             "interaction_success",
-            "partial_progress",
         }
 
         if effective_classification == "no_effect":

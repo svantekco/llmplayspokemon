@@ -70,6 +70,16 @@ def build_navigation_snapshot_from_collision(
 
     max_x = max(coord.x for coord in [*walkable, *blocked])
     max_y = max(coord.y for coord in [*walkable, *blocked])
+    visible_world_edges: list[str] = []
+    if origin_y == 0:
+        visible_world_edges.append("north")
+    if max_x == map_width_tiles - 1:
+        visible_world_edges.append("east")
+    if max_y == map_height_tiles - 1:
+        visible_world_edges.append("south")
+    if origin_x == 0:
+        visible_world_edges.append("west")
+
     return NavigationSnapshot(
         min_x=origin_x,
         min_y=origin_y,
@@ -79,6 +89,10 @@ def build_navigation_snapshot_from_collision(
         walkable=walkable,
         blocked=blocked,
         collision_hash=collision_hash,
+        coverage="local_window",
+        map_width=map_width_tiles,
+        map_height=map_height_tiles,
+        visible_world_edges=visible_world_edges,
     )
 
 
@@ -116,6 +130,10 @@ def build_navigation_snapshot_from_tiles(
         walkable=walkable,
         blocked=blocked,
         collision_hash=collision_hash,
+        coverage="full_map",
+        map_width=width,
+        map_height=height,
+        visible_world_edges=["north", "east", "south", "west"],
     )
 
 
@@ -168,3 +186,21 @@ def advance_position(x: int, y: int, action: ActionType) -> WorldCoordinate:
         if action == candidate:
             return WorldCoordinate(x=x + dx, y=y + dy)
     return WorldCoordinate(x=x, y=y)
+
+
+def visible_boundary_side(navigation: NavigationSnapshot, x: int, y: int) -> str | None:
+    if y == navigation.min_y:
+        return "north"
+    if x == navigation.max_x:
+        return "east"
+    if y == navigation.max_y:
+        return "south"
+    if x == navigation.min_x:
+        return "west"
+    return None
+
+
+def is_real_map_edge(navigation: NavigationSnapshot, side: str) -> bool:
+    if navigation.coverage == "full_map" and not navigation.visible_world_edges:
+        return True
+    return side in navigation.visible_world_edges

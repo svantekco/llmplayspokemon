@@ -73,6 +73,10 @@ class NavigationSnapshot(BaseModel):
     walkable: list[WorldCoordinate] = Field(default_factory=list)
     blocked: list[WorldCoordinate] = Field(default_factory=list)
     collision_hash: str | None = None
+    coverage: str = "full_map"
+    map_width: int | None = None
+    map_height: int | None = None
+    visible_world_edges: list[str] = Field(default_factory=list)
 
 
 class StructuredGameState(BaseModel):

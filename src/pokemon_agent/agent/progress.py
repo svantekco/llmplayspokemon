@@ -84,6 +84,8 @@ class ProgressDetector:
 
         if not changed:
             return ProgressResult("no_effect", [], [], ["No meaningful state change detected"])
+        if set(changed) == {"facing"}:
+            return ProgressResult("no_effect", changed, completed, ["Facing changed without movement or UI change"])
         if previous.battle_state and not current.battle_state:
             return ProgressResult("major_progress", changed, completed, notes or ["Battle ended"])
         if "map_id" in changed or "inventory" in changed:

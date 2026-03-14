@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,13 +16,20 @@ from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.navigation import CachedRoute
 from pokemon_agent.agent.navigation import advance_position
 from pokemon_agent.agent.navigation import find_path
+from pokemon_agent.agent.navigation import is_real_map_edge
+from pokemon_agent.agent.navigation import visible_boundary_side
 from pokemon_agent.agent.progress import ProgressDetector, ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckDetector, StuckState
 from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.agent.world_map import connectors_from_map
 from pokemon_agent.agent.world_map import describe_connector
+from pokemon_agent.agent.world_map import observe_state
 from pokemon_agent.agent.world_map import shortest_confirmed_path
 from pokemon_agent.agent.world_map import world_map_stats
+from pokemon_agent.data.map_connections import exits_from
+from pokemon_agent.data.map_connections import map_matches
+from pokemon_agent.data.map_connections import next_hop_toward
+from pokemon_agent.data.walkthrough import get_current_milestone
 from pokemon_agent.emulator.base import EmulatorAdapter
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
@@ -40,10 +48,10 @@ from pokemon_agent.models.state import StructuredGameState
 
 DIRECTION_DELTAS: tuple[tuple[int, int], ...] = ((0, -1), (1, 0), (0, 1), (-1, 0))
 NAVIGATION_CANDIDATE_TYPES = {
-    "GO_TO_MAP_EXIT",
-    "EXPLORE_NEAREST_FRONTIER",
-    "MOVE_ADJACENT_TO_INTERACTABLE",
-    "FOLLOW_DISCOVERED_CONNECTOR",
+    "ADVANCE_TOWARD_BOUNDARY",
+    "ENTER_CONNECTOR",
+    "EXPLORE_CONNECTOR",
+    "EXPLORE_WINDOW",
 }
 YES_NO_CANDIDATE_TYPES = {"SELECT_YES", "SELECT_NO"}
 
@@ -191,7 +199,7 @@ class ClosedLoopRunner:
         self.execution_plan: ExecutionPlan | None = None
         self._candidate_runtime: dict[str, CandidateRuntime] = {}
         self.menu_manager = MenuManager()
-        self._last_entry_direction: str | None = None  # direction we entered current map from
+        self._last_entry_direction: str | None = None
         self._previous_map_name: str | None = None
         # Tracks (map_id, player_x, player_y) → turn_index of last text-box interaction.
         # Used to suppress re-interacting with the same sign/object within a cooldown window.
@@ -219,9 +227,6 @@ class ClosedLoopRunner:
             self._previous_map_name = before.map_name
             entered_via = self._side_for_action(action.action)
             self._last_entry_direction = self._OPPOSITE_DIRECTION.get(entered_via) if entered_via else None
-            goal = self.memory.memory.long_term.navigation_goal
-            if goal is not None and goal.target_map_name != after.map_name:
-                goal.confirmation_required_map = after.map_name
             self._interacted_tiles.clear()
         # Record player position when a text box opens (sign/NPC interaction detected).
         if (
@@ -235,6 +240,7 @@ class ClosedLoopRunner:
             self._interacted_tiles[key] = turn_index
         self._refresh_route_cache_after_turn(after, progress_result)
         self._refresh_execution_plan_after_turn(after, progress_result)
+        self._update_navigation_goal_after_turn(after, progress_result, planning)
         events = self.memory.update_from_transition(before, after, action, progress_result, stuck_state)
         self.context_manager.record_turn(
             turn_index=turn_index,
@@ -279,6 +285,8 @@ class ClosedLoopRunner:
             self.execution_plan = None
             action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
             return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
+
+        observe_state(self.memory.memory.long_term.world_map, state)
 
         cached_action = self._plan_from_cached_route(state)
         if cached_action is not None:
@@ -544,11 +552,14 @@ class ClosedLoopRunner:
     def _build_candidate_steps(self, state: StructuredGameState) -> list[CandidateNextStep]:
         self._candidate_runtime = {}
         short_objective_id = self._objective_id(ObjectiveHorizon.SHORT_TERM, "short_immediate_step")
-        mid_objective_id = self._objective_id(ObjectiveHorizon.MID_TERM, "mid_local_progress")
         navigation_goal = self._sync_navigation_goal(state)
+        objective_id = self._objective_id_for_goal(navigation_goal, short_objective_id)
         candidates: list[CandidateNextStep] = []
 
         if state.text_box_open:
+            deterministic_choice = self._deterministic_yes_no_candidate(state, objective_id)
+            if deterministic_choice is not None:
+                return [deterministic_choice]
             dialogue_text = state.metadata.get("dialogue_text")
             yes_no_prompt = bool(state.metadata.get("yes_no_prompt"))
             if yes_no_prompt:
@@ -561,7 +572,7 @@ class ClosedLoopRunner:
                     why=why,
                     priority=90,
                     expected_success_signal="Prompt closes or dialogue changes after choosing yes",
-                    objective_id=short_objective_id,
+                    objective_id=objective_id,
                 )
                 self._candidate_runtime[select_yes.id] = CandidateRuntime(
                     action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="select yes"),
@@ -573,7 +584,7 @@ class ClosedLoopRunner:
                     why=why,
                     priority=90,
                     expected_success_signal="Prompt closes or dialogue changes after choosing no",
-                    objective_id=short_objective_id,
+                    objective_id=objective_id,
                 )
                 self._candidate_runtime[select_no.id] = CandidateRuntime(
                     action=ActionDecision(action=ActionType.MOVE_DOWN, repeat=1, reason="move to no"),
@@ -590,7 +601,7 @@ class ClosedLoopRunner:
                 why=why,
                 priority=100,
                 expected_success_signal="Dialogue changes or the text box closes",
-                objective_id=short_objective_id,
+                objective_id=objective_id,
             )
             self._candidate_runtime[candidate.id] = CandidateRuntime(
                 action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance text"),
@@ -598,17 +609,17 @@ class ClosedLoopRunner:
             )
             return [candidate]
         if state.menu_open:
-            menu_candidates = self.menu_manager.build_candidates(state, short_objective_id)
+            menu_candidates = self.menu_manager.build_candidates(state, objective_id)
             self._candidate_runtime.update(self.menu_manager.runtime_map())
             menu_candidates = self._dedupe_candidates(menu_candidates)
             menu_candidates.sort(key=lambda item: (-item.priority, item.id))
             return self._trim_candidate_runtime(menu_candidates[:4])
         if state.battle_state:
-            battle_candidates = self.battle_manager.build_candidates(state, short_objective_id)
+            battle_candidates = self.battle_manager.build_candidates(state, objective_id)
             self._candidate_runtime.update(self.battle_manager.runtime_map())
             return self._trim_candidate_runtime(battle_candidates)
 
-        candidates.extend(self.menu_manager.build_candidates(state, short_objective_id))
+        candidates.extend(self.menu_manager.build_candidates(state, objective_id))
         self._candidate_runtime.update(self.menu_manager.runtime_map())
 
         if self.stuck.state.score >= self.stuck.threshold:
@@ -617,30 +628,18 @@ class ClosedLoopRunner:
                 id=f"recover_{recovery_action.action.value.lower()}",
                 type="RECOVER_FROM_STUCK",
                 why=self.stuck.state.recovery_hint or "Recent actions failed without progress.",
-                priority=95,
+                priority=99,
                 expected_success_signal="A different local state appears",
-                objective_id=short_objective_id,
+                objective_id=objective_id,
+                blacklisted=False,
             )
             self._candidate_runtime[candidate.id] = CandidateRuntime(action=recovery_action, step_budget=1)
             candidates.append(candidate)
 
-        adjacent_interaction = self._candidate_for_adjacent_interactable(state, short_objective_id)
-        if adjacent_interaction is not None:
-            candidates.append(adjacent_interaction)
-
-        move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, short_objective_id)
-        if move_to_interaction is not None:
-            candidates.append(move_to_interaction)
-
-        connector_route = self._build_discovered_route_candidate(state, mid_objective_id, navigation_goal)
-        if connector_route is not None:
-            candidates.append(connector_route)
-
-        candidates.extend(self._build_exit_candidates(state, mid_objective_id))
-
-        frontier = self._build_frontier_candidate(state, mid_objective_id, candidates)
-        if frontier is not None:
-            candidates.append(frontier)
+        if navigation_goal is not None and navigation_goal.engine_mode == "progression":
+            candidates.extend(self._build_progression_candidates(state, objective_id, navigation_goal))
+        else:
+            candidates.extend(self._build_exploration_candidates(state, objective_id, navigation_goal))
 
         if not candidates:
             probe_action = self.validator.fallback(state, self.stuck.state, "probe nearby state")
@@ -650,7 +649,7 @@ class ClosedLoopRunner:
                 why="Probe a safe nearby step while no stronger target is available.",
                 priority=25,
                 expected_success_signal="Position changes or UI opens",
-                objective_id=short_objective_id,
+                objective_id=objective_id,
             )
             self._candidate_runtime[candidate.id] = CandidateRuntime(action=probe_action, step_budget=1)
             candidates.append(candidate)
@@ -665,10 +664,404 @@ class ClosedLoopRunner:
                 return objective.id
         return default
 
+    def _objective_id_for_goal(self, goal: NavigationGoal | None, fallback: str) -> str:
+        if goal is None or not goal.objective_kind:
+            return fallback
+        return f"local_{goal.objective_kind}"
+
+    def _deterministic_yes_no_candidate(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+    ) -> CandidateNextStep | None:
+        if not bool(state.metadata.get("yes_no_prompt")):
+            return None
+        dialogue = str(state.metadata.get("dialogue_text") or "").lower()
+        if not dialogue:
+            return None
+        choose_yes = any(keyword in dialogue for keyword in ("heal", "take", "want", "accept", "board", "teach", "use", "buy", "give"))
+        choose_no = any(keyword in dialogue for keyword in ("save", "quit", "cancel", "stop"))
+        if choose_yes == choose_no:
+            return None
+        candidate_id = "select_yes" if choose_yes else "select_no"
+        candidate = CandidateNextStep(
+            id=candidate_id,
+            type="SELECT_YES" if choose_yes else "SELECT_NO",
+            why="Deterministic yes/no rule matched the visible prompt.",
+            priority=100,
+            expected_success_signal="Prompt closes or dialogue changes",
+            objective_id=objective_id,
+            advances_target=True,
+        )
+        if choose_yes:
+            self._candidate_runtime[candidate.id] = CandidateRuntime(
+                action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="deterministic yes"),
+                step_budget=1,
+            )
+        else:
+            self._candidate_runtime[candidate.id] = CandidateRuntime(
+                action=ActionDecision(action=ActionType.MOVE_DOWN, repeat=1, reason="deterministic no"),
+                follow_up_action=ActionType.PRESS_A,
+                step_budget=2,
+            )
+        return candidate
+
+    def _build_progression_candidates(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal,
+    ) -> list[CandidateNextStep]:
+        candidates: list[CandidateNextStep] = []
+        if goal.objective_kind == "talk_to_required_npc":
+            interaction = self._candidate_for_adjacent_interactable(state, objective_id, priority_boost=14)
+            if interaction is not None:
+                candidates.append(interaction)
+            move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, objective_id, priority_boost=14)
+            if move_to_interaction is not None:
+                candidates.append(move_to_interaction)
+            return candidates
+
+        if goal.next_hop_kind == "boundary" and goal.next_hop_side:
+            boundary = self._build_boundary_progress_candidate(state, objective_id, goal)
+            if boundary is not None:
+                candidates.append(boundary)
+                return candidates
+
+        connector_candidates = self._build_connector_candidates(state, objective_id, goal, prefer_story_matches=False)
+        if connector_candidates:
+            return connector_candidates
+
+        exploration = self._build_window_candidate(state, objective_id, goal)
+        if exploration is not None:
+            candidates.append(exploration)
+        return candidates
+
+    def _build_exploration_candidates(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal | None,
+    ) -> list[CandidateNextStep]:
+        candidates: list[CandidateNextStep] = []
+        candidates.extend(self._build_connector_candidates(state, objective_id, goal, prefer_story_matches=True))
+
+        interaction_priority = 0
+        if goal is None or goal.objective_kind == "talk_to_required_npc" or map_matches(state.map_name, goal.target_map_name):
+            interaction_priority = 10
+
+        adjacent_interaction = self._candidate_for_adjacent_interactable(state, objective_id, priority_boost=interaction_priority)
+        if adjacent_interaction is not None:
+            candidates.append(adjacent_interaction)
+
+        move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, objective_id, priority_boost=interaction_priority)
+        if move_to_interaction is not None:
+            candidates.append(move_to_interaction)
+
+        frontier = self._build_window_candidate(state, objective_id, goal)
+        if frontier is not None:
+            candidates.append(frontier)
+        return candidates
+
+    def _build_boundary_progress_candidate(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal,
+    ) -> CandidateNextStep | None:
+        if state.navigation is None or state.x is None or state.y is None or goal.next_hop_side is None:
+            return None
+        target = self._best_directional_target(state, goal.next_hop_side)
+        if target is None:
+            return None
+        target_x, target_y, distance, at_real_edge = target
+        move_action = self._action_for_side(goal.next_hop_side)
+        if move_action is None:
+            return None
+        backtrack = goal.next_hop_side == self._last_entry_direction
+        blacklisted = goal.next_hop_side in goal.failed_sides
+        priority = 94 if at_real_edge else 82
+        if backtrack:
+            priority -= 18
+        if blacklisted:
+            priority -= 35
+        candidate = CandidateNextStep(
+            id=f"boundary_{goal.next_hop_side}_{target_x}_{target_y}",
+            type="ADVANCE_TOWARD_BOUNDARY",
+            target=ObjectiveTarget(
+                kind="exit",
+                map_id=state.map_id,
+                map_name=state.map_name,
+                x=target_x,
+                y=target_y,
+                detail=goal.next_hop_side,
+            ),
+            why=(
+                f"Advance {goal.next_hop_side} toward {goal.next_map_name}."
+                if at_real_edge
+                else f"Move {goal.next_hop_side} to reveal the real map edge."
+            ),
+            priority=priority,
+            expected_success_signal="The visible window expands or the map changes",
+            objective_id=objective_id,
+            distance=distance,
+            advances_target=True,
+            backtrack=backtrack,
+            blacklisted=blacklisted,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
+            target_x=target_x,
+            target_y=target_y,
+            follow_up_action=move_action,
+            step_budget=distance + 2,
+        )
+        return candidate
+
+    def _build_connector_candidates(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal | None,
+        *,
+        prefer_story_matches: bool,
+    ) -> list[CandidateNextStep]:
+        if state.navigation is None or state.x is None or state.y is None:
+            return []
+        world_map = self.memory.memory.long_term.world_map
+        story_text = self._milestone_story_text(state)
+        preferred_destination = goal.next_map_name if goal is not None else self._preferred_destination_from_milestone(state)
+        ranked: list[tuple[tuple[int, int, int, int, str], CandidateNextStep, CandidateRuntime]] = []
+        for connector in connectors_from_map(world_map, state.map_name, confirmed_only=False):
+            approach = self._approach_for_connector(state, connector)
+            if approach is None:
+                continue
+            approach_x, approach_y, follow_up_action, distance = approach
+            destination_matches = bool(
+                preferred_destination
+                and connector.destination_map
+                and map_matches(connector.destination_map, preferred_destination)
+            )
+            story_score = self._map_text_score(connector.destination_map or "", story_text)
+            backtrack = bool(self._last_entry_direction and connector.source_side == self._last_entry_direction)
+            blacklisted = bool(goal and connector.id in goal.failed_connector_ids)
+            if goal and goal.next_hop_kind == "warp" and preferred_destination and connector.destination_map and not destination_matches:
+                if not prefer_story_matches or story_score == 0:
+                    continue
+            priority = 90 if destination_matches else 82 if connector.status.value == "confirmed" else 74
+            if connector.source_side is not None:
+                priority += 8
+            if connector.kind in {"boundary", "door"}:
+                priority += 4
+            elif connector.kind == "warp" and connector.destination_map is None:
+                priority -= 8
+            if story_score > 0:
+                priority += min(10, story_score * 2)
+            if connector.id == (goal.target_connector_id if goal else None):
+                priority += 8
+            if backtrack:
+                priority -= 14
+            if blacklisted:
+                priority -= 35
+            slug = self._slugify(connector.id)
+            candidate = CandidateNextStep(
+                id=f"connector_{slug}",
+                type="ENTER_CONNECTOR" if connector.status.value == "confirmed" else "EXPLORE_CONNECTOR",
+                target=ObjectiveTarget(
+                    kind="connector",
+                    map_id=state.map_id,
+                    map_name=state.map_name,
+                    x=approach_x,
+                    y=approach_y,
+                    detail=describe_connector(connector),
+                ),
+                why=(
+                    f"Use the confirmed connector toward {connector.destination_map}."
+                    if connector.status.value == "confirmed"
+                    else "Test a suspected connector by walking into it."
+                ),
+                priority=priority,
+                expected_success_signal="The map changes or a new local affordance appears",
+                objective_id=objective_id,
+                distance=distance,
+                advances_target=destination_matches or story_score > 0,
+                backtrack=backtrack,
+                blacklisted=blacklisted,
+            )
+            runtime = CandidateRuntime(
+                target_x=approach_x,
+                target_y=approach_y,
+                follow_up_action=follow_up_action,
+                step_budget=distance + 2,
+            )
+            ranked.append(
+                (
+                    (
+                        1 if blacklisted else 0,
+                        -priority,
+                        distance,
+                        0 if destination_matches else 1,
+                        candidate.id,
+                    ),
+                    candidate,
+                    runtime,
+                )
+            )
+        ranked.sort(key=lambda item: item[0])
+        results: list[CandidateNextStep] = []
+        for _sort_key, candidate, runtime in ranked[:3]:
+            self._candidate_runtime[candidate.id] = runtime
+            results.append(candidate)
+        return results
+
+    def _build_window_candidate(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal | None,
+    ) -> CandidateNextStep | None:
+        if state.navigation is None or state.x is None or state.y is None:
+            return None
+        preferred_side = goal.next_hop_side if goal is not None else None
+        target = self._best_directional_target(state, preferred_side, require_real_edge=False)
+        if target is None:
+            return None
+        target_x, target_y, distance, _at_real_edge = target
+        move_action = self._action_for_side(preferred_side) if preferred_side else None
+        candidate = CandidateNextStep(
+            id=f"window_{preferred_side or 'scan'}_{target_x}_{target_y}",
+            type="EXPLORE_WINDOW",
+            target=ObjectiveTarget(
+                kind="frontier",
+                map_id=state.map_id,
+                map_name=state.map_name,
+                x=target_x,
+                y=target_y,
+                detail=preferred_side or "nearest frontier",
+            ),
+            why=(
+                f"Move toward the {preferred_side} edge to reveal more of the map."
+                if preferred_side
+                else "Move to a nearby frontier tile to reveal better options."
+            ),
+            priority=56 - min(distance, 8),
+            expected_success_signal="New connectors or boundary tiles become visible",
+            objective_id=objective_id,
+            distance=distance,
+            advances_target=preferred_side is not None,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
+            target_x=target_x,
+            target_y=target_y,
+            follow_up_action=move_action,
+            step_budget=distance + (2 if move_action is not None else 1),
+        )
+        return candidate
+
+    def _best_directional_target(
+        self,
+        state: StructuredGameState,
+        side: str | None,
+        *,
+        require_real_edge: bool = False,
+    ) -> tuple[int, int, int, bool] | None:
+        assert state.navigation is not None and state.x is not None and state.y is not None
+        best: tuple[tuple[int, int, int], tuple[int, int, int, bool]] | None = None
+        for coordinate in state.navigation.walkable:
+            if (coordinate.x, coordinate.y) == (state.x, state.y):
+                continue
+            visible_side = visible_boundary_side(state.navigation, coordinate.x, coordinate.y)
+            if visible_side is None:
+                continue
+            if side is not None and visible_side != side:
+                if not require_real_edge:
+                    if not self._moves_toward_side(state, coordinate.x, coordinate.y, side):
+                        continue
+                else:
+                    continue
+            route = find_path(state.navigation, state.x, state.y, coordinate.x, coordinate.y)
+            if route is None:
+                continue
+            distance = len(route)
+            if distance == 0 and side is None:
+                continue
+            at_real_edge = bool(visible_side and is_real_map_edge(state.navigation, visible_side))
+            if require_real_edge and side is not None and (visible_side != side or not at_real_edge):
+                continue
+            rank = self._directional_rank(side, coordinate.x, coordinate.y, distance, at_real_edge)
+            payload = (coordinate.x, coordinate.y, distance, at_real_edge)
+            if best is None or rank < best[0]:
+                best = (rank, payload)
+        return None if best is None else best[1]
+
+    def _directional_rank(
+        self,
+        side: str | None,
+        x: int,
+        y: int,
+        distance: int,
+        at_real_edge: bool,
+    ) -> tuple[int, int, int]:
+        if side == "north":
+            return (0 if at_real_edge else 1, y, distance)
+        if side == "east":
+            return (0 if at_real_edge else 1, -x, distance)
+        if side == "south":
+            return (0 if at_real_edge else 1, -y, distance)
+        if side == "west":
+            return (0 if at_real_edge else 1, x, distance)
+        return (0, distance, x + y)
+
+    def _moves_toward_side(self, state: StructuredGameState, x: int, y: int, side: str) -> bool:
+        if side == "north":
+            return y <= (state.y or 0)
+        if side == "east":
+            return x >= (state.x or 0)
+        if side == "south":
+            return y >= (state.y or 0)
+        if side == "west":
+            return x <= (state.x or 0)
+        return True
+
+    def _approach_for_connector(
+        self,
+        state: StructuredGameState,
+        connector,
+    ) -> tuple[int, int, ActionType, int] | None:
+        if state.navigation is None or state.x is None or state.y is None:
+            return None
+        if connector.approach_x is not None and connector.approach_y is not None and connector.transition_action is not None:
+            route = find_path(state.navigation, state.x, state.y, connector.approach_x, connector.approach_y)
+            if route is not None:
+                return connector.approach_x, connector.approach_y, connector.transition_action, len(route)
+        if connector.source_x is None or connector.source_y is None:
+            return None
+        walkable_set = {(coord.x, coord.y) for coord in state.navigation.walkable}
+        best: tuple[tuple[int, int, str], tuple[int, int, ActionType, int]] | None = None
+        for move_action, dx, dy in (
+            (ActionType.MOVE_UP, 0, -1),
+            (ActionType.MOVE_RIGHT, 1, 0),
+            (ActionType.MOVE_DOWN, 0, 1),
+            (ActionType.MOVE_LEFT, -1, 0),
+        ):
+            approach_x = connector.source_x - dx
+            approach_y = connector.source_y - dy
+            if (approach_x, approach_y) not in walkable_set:
+                continue
+            route = find_path(state.navigation, state.x, state.y, approach_x, approach_y)
+            if route is None:
+                continue
+            payload = (approach_x, approach_y, move_action, len(route))
+            rank = (len(route), 0 if connector.destination_map else 1, move_action.value)
+            if best is None or rank < best[0]:
+                best = (rank, payload)
+        return None if best is None else best[1]
+
     def _candidate_for_adjacent_interactable(
         self,
         state: StructuredGameState,
         objective_id: str,
+        *,
+        priority_boost: int = 0,
     ) -> CandidateNextStep | None:
         blocked_set = self._blocked_coordinates(state.navigation)
         if state.x is None or state.y is None or not blocked_set:
@@ -697,7 +1090,7 @@ class ClosedLoopRunner:
             type="MOVE_ADJACENT_TO_INTERACTABLE",
             target=ObjectiveTarget(kind="interactable", map_id=state.map_id, map_name=state.map_name, x=best_x, y=best_y),
             why="An adjacent isolated blocker may be an NPC or doorway.",
-            priority=82 - min(neighbor_count, 2) * 4,
+            priority=46 + priority_boost - min(neighbor_count, 2) * 4,
             expected_success_signal="Text opens or the local state changes",
             objective_id=objective_id,
         )
@@ -711,6 +1104,8 @@ class ClosedLoopRunner:
         self,
         state: StructuredGameState,
         objective_id: str,
+        *,
+        priority_boost: int = 0,
     ) -> CandidateNextStep | None:
         if state.navigation is None or state.x is None or state.y is None:
             return None
@@ -757,171 +1152,16 @@ class ClosedLoopRunner:
                 detail=f"stand at ({target_x}, {target_y})",
             ),
             why=f"A nearby interactable-looking blocker is reachable in {distance} steps.",
-            priority=72 - min(distance, 6),
+            priority=34 + priority_boost - min(distance, 6),
             expected_success_signal="Reach the adjacent tile, then open text or change state",
             objective_id=objective_id,
+            distance=distance,
         )
         self._candidate_runtime[candidate.id] = CandidateRuntime(
             target_x=target_x,
             target_y=target_y,
             follow_up_action=ActionType.PRESS_A,
             step_budget=distance + 2,
-        )
-        return candidate
-
-    def _build_exit_candidates(
-        self,
-        state: StructuredGameState,
-        objective_id: str,
-    ) -> list[CandidateNextStep]:
-        if state.navigation is None or state.x is None or state.y is None:
-            return []
-        side_targets: dict[str, tuple[int, int, int]] = {}
-        for coordinate in state.navigation.walkable:
-            side = self._boundary_side(state.navigation, coordinate.x, coordinate.y)
-            if side is None or (coordinate.x, coordinate.y) == (state.x, state.y):
-                continue
-            route = find_path(state.navigation, state.x, state.y, coordinate.x, coordinate.y)
-            if route is None or len(route) == 0:
-                continue
-            distance = len(route)
-            current = side_targets.get(side)
-            choice = (distance, coordinate.x, coordinate.y)
-            if current is None or choice < current:
-                side_targets[side] = choice
-
-        candidates: list[CandidateNextStep] = []
-        world_map = self.memory.memory.long_term.world_map
-        known_connectors = connectors_from_map(world_map, state.map_name, confirmed_only=False)
-        for side, (distance, target_x, target_y) in sorted(side_targets.items()):
-            side_matches = [connector for connector in known_connectors if connector.source_side == side]
-            destinations = sorted({connector.destination_map for connector in side_matches if connector.destination_map})
-            if destinations:
-                destination_text = ", ".join(destinations[:2])
-                why = f"Exit {side} matches a discovered connector to {destination_text} ({distance} steps)."
-                detail = f"{side} → {destination_text}"
-            else:
-                why = f"Exit {side} ({distance} steps), destination still unknown."
-                detail = side
-
-            priority = 60 - min(distance, 10)
-            if side_matches and not destinations:
-                priority += 8
-                why = f"{why} This connector has been seen but not confirmed yet."
-
-            if self._last_entry_direction and side == self._last_entry_direction:
-                priority -= 25
-                why += " (backtrack — we just came from this direction)"
-
-            candidate = CandidateNextStep(
-                id=f"exit_{side}_{target_x}_{target_y}",
-                type="GO_TO_MAP_EXIT",
-                target=ObjectiveTarget(kind="exit", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y, detail=detail),
-                why=why,
-                priority=priority,
-                expected_success_signal="Map changes or a new local affordance appears",
-                objective_id=objective_id,
-            )
-            self._candidate_runtime[candidate.id] = CandidateRuntime(
-                target_x=target_x,
-                target_y=target_y,
-                step_budget=distance + 1,
-            )
-            candidates.append(candidate)
-        return candidates[:4]
-
-    def _build_discovered_route_candidate(
-        self,
-        state: StructuredGameState,
-        objective_id: str,
-        goal: NavigationGoal | None,
-    ) -> CandidateNextStep | None:
-        if goal is None or state.navigation is None or state.x is None or state.y is None:
-            return None
-        route = shortest_confirmed_path(self.memory.memory.long_term.world_map, state.map_name, goal.target_map_name)
-        if route is None or not route:
-            return None
-        connector = route[0]
-        if connector.source_map != state.map_name:
-            return None
-        if connector.approach_x is None or connector.approach_y is None or connector.transition_action is None:
-            return None
-        local_route = find_path(state.navigation, state.x, state.y, connector.approach_x, connector.approach_y)
-        if local_route is None:
-            return None
-        distance = len(local_route)
-        candidate = CandidateNextStep(
-            id=f"follow_connector_{connector.id}",
-            type="FOLLOW_DISCOVERED_CONNECTOR",
-            target=ObjectiveTarget(
-                kind="connector",
-                map_id=state.map_id,
-                map_name=state.map_name,
-                x=connector.approach_x,
-                y=connector.approach_y,
-                detail=describe_connector(connector),
-            ),
-            why=(
-                f"Follow the discovered connector toward {goal.target_map_name}: "
-                f"{describe_connector(connector)}."
-            ),
-            priority=92 - min(distance, 10),
-            expected_success_signal=f"Transition toward {goal.target_map_name}",
-            objective_id=objective_id,
-        )
-        self._candidate_runtime[candidate.id] = CandidateRuntime(
-            target_x=connector.approach_x,
-            target_y=connector.approach_y,
-            follow_up_action=connector.transition_action,
-            step_budget=max(1, distance + 1),
-        )
-        return candidate
-
-    def _build_frontier_candidate(
-        self,
-        state: StructuredGameState,
-        objective_id: str,
-        existing: list[CandidateNextStep],
-    ) -> CandidateNextStep | None:
-        if state.navigation is None or state.x is None or state.y is None:
-            return None
-        reserved_targets = {
-            (runtime.target_x, runtime.target_y)
-            for candidate in existing
-            if (runtime := self._candidate_runtime_for(candidate)).target_x is not None
-            and runtime.target_y is not None
-        }
-        best: tuple[int, int, int] | None = None
-        for coordinate in state.navigation.walkable:
-            if (coordinate.x, coordinate.y) == (state.x, state.y):
-                continue
-            if (coordinate.x, coordinate.y) in reserved_targets:
-                continue
-            if self._boundary_side(state.navigation, coordinate.x, coordinate.y) is None:
-                continue
-            route = find_path(state.navigation, state.x, state.y, coordinate.x, coordinate.y)
-            if route is None or len(route) == 0:
-                continue
-            distance = len(route)
-            choice = (distance, coordinate.x, coordinate.y)
-            if best is None or choice < best:
-                best = choice
-        if best is None:
-            return None
-        distance, target_x, target_y = best
-        candidate = CandidateNextStep(
-            id=f"frontier_{target_x}_{target_y}",
-            type="EXPLORE_NEAREST_FRONTIER",
-            target=ObjectiveTarget(kind="frontier", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y),
-            why=f"The nearest frontier tile is {distance} steps away and may unlock a better option.",
-            priority=42 - min(distance, 8),
-            expected_success_signal="Position changes or new ranked candidates appear",
-            objective_id=objective_id,
-        )
-        self._candidate_runtime[candidate.id] = CandidateRuntime(
-            target_x=target_x,
-            target_y=target_y,
-            step_budget=distance + 1,
         )
         return candidate
 
@@ -949,13 +1189,7 @@ class ClosedLoopRunner:
         current_state = self.emulator.get_structured_state()
         if current_state.menu_open:
             return True
-        goal = self.memory.memory.long_term.navigation_goal
-        if (
-            goal is not None
-            and goal.confirmation_required_map
-            and candidates[0].type == "FOLLOW_DISCOVERED_CONNECTOR"
-            and goal.confirmation_required_map == current_state.map_name
-        ):
+        if candidates[0].blacklisted:
             return False
         if len(candidates) == 1:
             return True
@@ -971,11 +1205,15 @@ class ClosedLoopRunner:
             "SELECT_HM_ITEM",
             "SELECT_PARTY_POKEMON",
             "USE_FIELD_MOVE",
+            "ADVANCE_TOWARD_BOUNDARY",
+            "ENTER_CONNECTOR",
         }:
             return True
         if candidates[0].type == "MOVE_ADJACENT_TO_INTERACTABLE" and self._candidate_runtime_for(candidates[0]).action is not None:
             return True
-        return (candidates[0].priority - candidates[1].priority) >= 15
+        if candidates[0].advances_target and not candidates[1].advances_target:
+            return True
+        return (candidates[0].priority - candidates[1].priority) >= 12
 
     def _compile_candidate(
         self,
@@ -1240,15 +1478,7 @@ class ClosedLoopRunner:
         return sum((x + dx, y + dy) in blocked_set for dx, dy in DIRECTION_DELTAS)
 
     def _boundary_side(self, navigation: NavigationSnapshot, x: int, y: int) -> str | None:
-        if y == navigation.min_y:
-            return "north"
-        if x == navigation.max_x:
-            return "east"
-        if y == navigation.max_y:
-            return "south"
-        if x == navigation.min_x:
-            return "west"
-        return None
+        return visible_boundary_side(navigation, x, y)
 
     def _short_reason(self, candidate: CandidateNextStep) -> str:
         reason = candidate.why.strip()
@@ -1267,47 +1497,233 @@ class ClosedLoopRunner:
         return mapping.get(action)
 
     def _sync_navigation_goal(self, state: StructuredGameState) -> NavigationGoal | None:
-        target_map = None
-        for objective in self.memory.memory.goals.active_objectives:
-            if objective.target and objective.target.map_name and objective.horizon in {ObjectiveHorizon.MID_TERM, ObjectiveHorizon.LONG_TERM}:
-                target_map = objective.target.map_name
-                break
-
-        goal = self.memory.memory.long_term.navigation_goal
         if state.is_bootstrap():
             self.memory.memory.long_term.navigation_goal = None
             return None
+        milestone = get_current_milestone(
+            state.story_flags,
+            [item.name for item in state.inventory],
+            current_map_name=state.map_name,
+            badges=state.badges,
+        )
+        goal = self.memory.memory.long_term.navigation_goal
+        if goal is not None and goal.source != "objective":
+            target_map = goal.target_map_name
+        else:
+            target_map = self._current_story_target(state, milestone)
+        if target_map is None:
+            if goal is not None:
+                goal.target_map_name = milestone.target_map_name
+                goal.current_map_name = state.map_name
+                should_interact = self._should_story_interact_here(state, milestone, milestone.target_map_name)
+                goal.engine_mode = "progression" if should_interact else "exploration"
+                goal.objective_kind = "talk_to_required_npc" if should_interact else "explore_for_matching_connector"
+                goal.next_map_name = None
+                goal.next_hop_kind = None
+                goal.next_hop_side = None
+                goal.target_connector_id = None
+                goal.last_confirmed_step = state.step
+            else:
+                should_interact = self._should_story_interact_here(state, milestone, milestone.target_map_name)
+                goal = NavigationGoal(
+                    target_map_name=milestone.target_map_name,
+                    source="objective",
+                    objective_kind="talk_to_required_npc" if should_interact else "explore_for_matching_connector",
+                    engine_mode="progression" if should_interact else "exploration",
+                    current_map_name=state.map_name,
+                    started_step=state.step,
+                    last_confirmed_step=state.step,
+                )
+                self.memory.memory.long_term.navigation_goal = goal
+            return goal
 
-        if goal is not None:
-            if goal.target_map_name == state.map_name:
-                self.memory.memory.long_term.navigation_goal = None
-                return None
-            if goal.confirmation_required_map == state.map_name:
-                return goal
-            if target_map is None:
-                return goal
-            if goal.target_map_name != target_map:
-                self.memory.memory.long_term.navigation_goal = None
-                goal = None
+        hop = None if map_matches(state.map_name, target_map) else next_hop_toward(state.map_name, target_map)
+        objective_kind = "explore_for_matching_connector"
+        engine_mode = "exploration"
+        next_map_name = None
+        next_hop_kind = None
+        next_hop_side = None
+        if hop is not None:
+            next_map_name = hop.to_map
+            next_hop_kind = "warp" if hop.direction == "warp" else "boundary"
+            next_hop_side = None if hop.direction == "warp" else hop.direction
+            engine_mode = "progression"
+            objective_kind = "reach_boundary_side" if next_hop_kind == "boundary" else "explore_for_matching_connector"
+        elif self._should_story_interact_here(state, milestone, target_map):
+            objective_kind = "talk_to_required_npc"
+            engine_mode = "progression"
 
-        if not target_map or target_map == state.map_name:
-            self.memory.memory.long_term.navigation_goal = None
-            return None
-
-        if goal is None or goal.target_map_name != target_map:
+        if goal is None or (goal.source == "objective" and goal.target_map_name != milestone.target_map_name):
             goal = NavigationGoal(
-                target_map_name=target_map,
+                target_map_name=milestone.target_map_name,
                 source="objective",
                 started_step=state.step,
-                last_confirmed_step=state.step,
             )
             self.memory.memory.long_term.navigation_goal = goal
+        goal.current_map_name = state.map_name
+        goal.objective_kind = objective_kind
+        goal.engine_mode = engine_mode
+        goal.next_map_name = next_map_name
+        goal.next_hop_kind = next_hop_kind
+        goal.next_hop_side = next_hop_side
+        goal.last_confirmed_step = state.step
+        if goal.target_connector_id and goal.next_map_name is not None:
+            connector = self.memory.memory.long_term.world_map.connectors.get(goal.target_connector_id)
+            if connector is None or (connector.destination_map and not map_matches(connector.destination_map, goal.next_map_name)):
+                goal.target_connector_id = None
+        if goal.target_connector_id is None and goal.next_hop_kind == "warp":
+            for connector in connectors_from_map(self.memory.memory.long_term.world_map, state.map_name, confirmed_only=True):
+                if connector.destination_map and goal.next_map_name and map_matches(connector.destination_map, goal.next_map_name):
+                    goal.target_connector_id = connector.id
+                    goal.objective_kind = "enter_selected_connector"
+                    break
+        if goal.target_connector_id is not None:
+            goal.objective_kind = "enter_selected_connector"
         return goal
 
     def _clear_navigation_confirmation(self, map_name: str) -> None:
+        del map_name
+        return None
+
+    def _update_navigation_goal_after_turn(
+        self,
+        state: StructuredGameState,
+        progress: ProgressResult,
+        planning: PlanningResult,
+    ) -> None:
         goal = self.memory.memory.long_term.navigation_goal
         if goal is None:
             return
-        if goal.confirmation_required_map == map_name:
-            goal.confirmation_required_map = None
-            goal.last_confirmed_step = self.emulator.get_structured_state().step
+        if progress.classification == "major_progress" and "map_id" in progress.changed_fields:
+            goal.failed_candidate_ids.clear()
+            goal.failed_connector_ids.clear()
+            goal.failed_sides.clear()
+            goal.target_connector_id = None
+            goal.last_confirmed_step = state.step
+            return
+        if planning.candidate_id is not None:
+            goal.last_candidate_id = planning.candidate_id
+        if progress.classification == "no_effect" and planning.candidate_id is not None:
+            goal.failed_candidate_ids = [item for item in [*goal.failed_candidate_ids, planning.candidate_id] if item][-4:]
+            if goal.target_connector_id is not None:
+                goal.failed_connector_ids = [item for item in [*goal.failed_connector_ids, goal.target_connector_id] if item][-4:]
+            if goal.next_hop_side is not None:
+                goal.failed_sides = [item for item in [*goal.failed_sides, goal.next_hop_side] if item][-3:]
+        elif progress.classification in {"movement_success", "interaction_success", "major_progress"}:
+            if planning.candidate_id in goal.failed_candidate_ids:
+                goal.failed_candidate_ids = [item for item in goal.failed_candidate_ids if item != planning.candidate_id]
+            if goal.target_connector_id is not None and goal.target_connector_id in goal.failed_connector_ids:
+                goal.failed_connector_ids = [item for item in goal.failed_connector_ids if item != goal.target_connector_id]
+            if goal.next_hop_side is not None and goal.next_hop_side in goal.failed_sides:
+                goal.failed_sides = [item for item in goal.failed_sides if item != goal.next_hop_side]
+
+    def _current_story_target(self, state: StructuredGameState, milestone) -> str | None:
+        if self._is_story_relevant_interior(state):
+            return state.map_name
+        preferred_destination = self._preferred_destination_from_milestone(state)
+        if preferred_destination and not map_matches(state.map_name, preferred_destination):
+            return preferred_destination
+        if map_matches(state.map_name, milestone.target_map_name):
+            return preferred_destination
+        return milestone.target_map_name
+
+    def _preferred_destination_from_milestone(self, state: StructuredGameState) -> str | None:
+        story_text = self._milestone_story_text(state)
+        best: tuple[int, str] | None = None
+        for connection in exits_from(state.map_name):
+            if connection.to_map == state.map_name:
+                continue
+            if self._previous_map_name is not None and connection.to_map == self._previous_map_name:
+                continue
+            score = self._map_text_score(connection.to_map, story_text)
+            if score <= 0:
+                continue
+            candidate = (score, connection.to_map)
+            if best is None or candidate > best:
+                best = candidate
+        if best is None and self._previous_map_name is not None:
+            for connection in exits_from(state.map_name):
+                if connection.to_map == state.map_name:
+                    continue
+                score = self._map_text_score(connection.to_map, story_text)
+                if score <= 0:
+                    continue
+                candidate = (score, connection.to_map)
+                if best is None or candidate > best:
+                    best = candidate
+        return None if best is None else best[1]
+
+    def _milestone_story_text(self, state: StructuredGameState) -> str:
+        milestone = get_current_milestone(
+            state.story_flags,
+            [item.name for item in state.inventory],
+            current_map_name=state.map_name,
+            badges=state.badges,
+        )
+        return " ".join([milestone.description, *milestone.route_hints, *milestone.sub_steps]).lower()
+
+    def _map_text_score(self, map_name: str, story_text: str) -> int:
+        if not map_name or not story_text:
+            return 0
+        if map_name.lower() in story_text:
+            return 5
+        tokens = [token for token in re.findall(r"[a-z0-9]+", map_name.lower()) if token and token not in {"city", "town", "route", "road", "gym", "house", "gate", "lab", "forest", "cave", "center", "pokecenter", "mart"}]
+        return sum(1 for token in tokens if token in story_text)
+
+    def _has_nearby_interactable(self, state: StructuredGameState) -> bool:
+        if state.navigation is None or state.x is None or state.y is None:
+            return False
+        blocked_set = self._blocked_coordinates(state.navigation)
+        walkable_set = {(coord.x, coord.y) for coord in state.navigation.walkable}
+        for dx, dy in DIRECTION_DELTAS:
+            blocked_coordinate = (state.x + dx, state.y + dy)
+            if blocked_coordinate in blocked_set and self._blocked_neighbor_count(blocked_coordinate, blocked_set) == 0:
+                return True
+        for blocked_x, blocked_y in blocked_set:
+            if abs(blocked_x - state.x) + abs(blocked_y - state.y) > 4:
+                continue
+            if self._blocked_neighbor_count((blocked_x, blocked_y), blocked_set) != 0:
+                continue
+            for dx, dy in DIRECTION_DELTAS:
+                if (blocked_x + dx, blocked_y + dy) in walkable_set:
+                    return True
+        return False
+
+    def _should_story_interact_here(
+        self,
+        state: StructuredGameState,
+        milestone,
+        target_map: str | None,
+    ) -> bool:
+        if not self._has_nearby_interactable(state):
+            return False
+        if target_map and map_matches(state.map_name, target_map):
+            return True
+        if map_matches(state.map_name, milestone.target_map_name):
+            return True
+        return self._is_story_relevant_interior(state)
+
+    def _is_story_relevant_interior(self, state: StructuredGameState) -> bool:
+        if not state.map_name or not self._has_nearby_interactable(state):
+            return False
+        connections = exits_from(state.map_name)
+        if not connections or any(connection.direction != "warp" for connection in connections):
+            return False
+        return self._map_text_score(state.map_name, self._milestone_story_text(state)) > 0
+
+    @staticmethod
+    def _action_for_side(side: str | None) -> ActionType | None:
+        if side == "north":
+            return ActionType.MOVE_UP
+        if side == "east":
+            return ActionType.MOVE_RIGHT
+        if side == "south":
+            return ActionType.MOVE_DOWN
+        if side == "west":
+            return ActionType.MOVE_LEFT
+        return None
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        slug = "_".join(re.findall(r"[a-z0-9]+", value.lower()))
+        return slug or "candidate"

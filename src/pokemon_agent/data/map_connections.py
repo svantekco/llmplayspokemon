@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import re
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +361,33 @@ _ADJACENCY: dict[str, list[tuple[str, str]]] = {}
 for _conn in MAP_CONNECTIONS + WARP_CONNECTIONS:
     _ADJACENCY.setdefault(_conn.from_map, []).append((_conn.direction, _conn.to_map))
 
+_GENERIC_MAP_TOKENS = {
+    "city",
+    "town",
+    "route",
+    "road",
+    "house",
+    "gym",
+    "lab",
+    "forest",
+    "cave",
+    "tower",
+    "dock",
+    "center",
+    "pokecenter",
+    "room",
+    "rooms",
+    "island",
+    "plateau",
+    "gate",
+    "hideout",
+    "mansion",
+    "building",
+    "co",
+    "lobby",
+    "floor",
+}
+
 
 def exits_from(map_name: str) -> list[MapConnection]:
     """Return all known connections leaving the given map."""
@@ -397,9 +425,13 @@ def shortest_map_path(from_map: str, to_map: str) -> list[str] | None:
 
     Returns None if no path found or if from_map == to_map.
     """
-    if from_map == to_map:
+    if _map_matches(from_map, to_map):
         return []
     if from_map not in _ADJACENCY:
+        return None
+
+    target_candidates = _resolve_target_candidates(to_map)
+    if not target_candidates:
         return None
 
     visited: set[str] = {from_map}
@@ -411,7 +443,7 @@ def shortest_map_path(from_map: str, to_map: str) -> list[str] | None:
 
     while queue:
         current, path = queue.popleft()
-        if current == to_map:
+        if current in target_candidates:
             return path
         for _direction, neighbor in _ADJACENCY.get(current, []):
             if neighbor not in visited:
@@ -435,3 +467,46 @@ def direction_toward(from_map: str, to_map: str) -> str | None:
         if dest == next_map:
             return conn_direction
     return None
+
+
+def next_hop_toward(from_map: str, to_map: str) -> MapConnection | None:
+    path = shortest_map_path(from_map, to_map)
+    if not path:
+        return None
+    next_map = path[0]
+    for conn_direction, dest in _ADJACENCY.get(from_map, []):
+        if dest == next_map:
+            return MapConnection(from_map=from_map, direction=conn_direction, to_map=dest)
+    return None
+
+
+def map_matches(current_map_name: str, target_map_name: str) -> bool:
+    return _map_matches(current_map_name, target_map_name)
+
+
+def _resolve_target_candidates(target_map_name: str) -> set[str]:
+    if target_map_name in _ADJACENCY:
+        return {target_map_name}
+    candidates = {map_name for map_name in _ADJACENCY if _map_matches(map_name, target_map_name)}
+    if candidates:
+        return candidates
+    return {target_map_name} if target_map_name in _ADJACENCY else set()
+
+
+def _map_matches(current_map_name: str, target_map_name: str) -> bool:
+    current_tokens = _tokenize_name(current_map_name)
+    target_tokens = _tokenize_name(target_map_name)
+    if not current_tokens or not target_tokens:
+        return False
+    if target_tokens.issubset(current_tokens) or current_tokens.issubset(target_tokens):
+        return True
+
+    current_core = current_tokens - _GENERIC_MAP_TOKENS
+    target_core = target_tokens - _GENERIC_MAP_TOKENS
+    if not current_core or not target_core:
+        return False
+    return current_core.issubset(target_core) or target_core.issubset(current_core)
+
+
+def _tokenize_name(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if token}
