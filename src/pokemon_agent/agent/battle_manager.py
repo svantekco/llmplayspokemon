@@ -9,6 +9,7 @@ from pokemon_agent.data.pokemon_red_battle_data import TYPE_EFFECTIVENESS
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.planner import CandidateNextStep
+from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.state import BattleContext
 from pokemon_agent.models.state import MoveInfo
 from pokemon_agent.models.state import StructuredGameState
@@ -52,11 +53,14 @@ class BattleTracker:
 class BattleManager:
     def __init__(self) -> None:
         self._tracker = BattleTracker()
+        self._runtime: dict[str, CandidateRuntime] = {}
 
     def reset(self) -> None:
         self._tracker = BattleTracker()
+        self._runtime = {}
 
     def build_candidates(self, state: StructuredGameState, objective_id: str | None) -> list[CandidateNextStep]:
+        self._runtime = {}
         battle = state.battle_state
         if battle is None:
             self.reset()
@@ -102,18 +106,19 @@ class BattleManager:
             if move.pp <= 0:
                 continue
             priority = self._move_priority(state, battle, move, index, strongest_move_index, important_trainer, catch_decision)
-            candidates.append(
-                CandidateNextStep(
-                    id=f"battle_fight_move_{index}",
-                    type=f"FIGHT_MOVE_{index}",
-                    why=f"Use {move.name} ({move.pp} PP).",
-                    priority=priority,
-                    expected_success_signal="Battle text advances or the enemy HP changes",
-                    objective_id=objective_id,
-                    action=self._action_for_move_selection(battle, index),
-                    step_budget=1,
-                )
+            candidate = CandidateNextStep(
+                id=f"battle_fight_move_{index}",
+                type=f"FIGHT_MOVE_{index}",
+                why=f"Use {move.name} ({move.pp} PP).",
+                priority=priority,
+                expected_success_signal="Battle text advances or the enemy HP changes",
+                objective_id=objective_id,
             )
+            self._runtime[candidate.id] = CandidateRuntime(
+                action=self._action_for_move_selection(battle, index),
+                step_budget=1,
+            )
+            candidates.append(candidate)
 
         if battle.kind == "WILD" and pokeballs:
             ball_index, ball_name = pokeballs[0]
@@ -132,18 +137,19 @@ class BattleManager:
                 candidates.append(throw_ball)
 
         if battle.kind == "WILD" and self._should_run(state, battle):
-            candidates.append(
-                CandidateNextStep(
-                    id="battle_run",
-                    type="RUN",
-                    why="This wild encounter looks low-value.",
-                    priority=58,
-                    expected_success_signal="The battle ends or the escape text appears",
-                    objective_id=objective_id,
-                    action=self._action_for_main_menu_target(battle, MAIN_MENU_POSITIONS["RUN"], "RUN"),
-                    step_budget=1,
-                )
+            candidate = CandidateNextStep(
+                id="battle_run",
+                type="RUN",
+                why="This wild encounter looks low-value.",
+                priority=58,
+                expected_success_signal="The battle ends or the escape text appears",
+                objective_id=objective_id,
             )
+            self._runtime[candidate.id] = CandidateRuntime(
+                action=self._action_for_main_menu_target(battle, MAIN_MENU_POSITIONS["RUN"], "RUN"),
+                step_budget=1,
+            )
+            candidates.append(candidate)
 
         if not candidates:
             return [self._fallback_candidate(objective_id, "Battle is active and needs a safe input to continue.")]
@@ -151,6 +157,9 @@ class BattleManager:
         deduped = self._dedupe(candidates)
         deduped.sort(key=lambda item: (-item.priority, item.id))
         return deduped[:4]
+
+    def runtime_map(self) -> dict[str, CandidateRuntime]:
+        return dict(self._runtime)
 
     def record_choice(self, candidate: CandidateNextStep) -> None:
         if candidate.type.startswith("FIGHT_MOVE_"):
@@ -210,16 +219,16 @@ class BattleManager:
         action = self._action_for_item_selection(battle, item_index, submenu="BAG")
         if action is None:
             return None
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=candidate_id,
             type=candidate_type,
             why=why,
             priority=priority,
             expected_success_signal=f"{item_name} is used or the bag cursor changes",
             objective_id=objective_id,
-            action=action,
-            step_budget=1,
         )
+        self._runtime[candidate.id] = CandidateRuntime(action=action, step_budget=1)
+        return candidate
 
     def _build_switch_candidate(
         self,
@@ -234,28 +243,31 @@ class BattleManager:
             return None
         target_index, target_name = switch_target
         action = self._action_for_party_selection(battle, target_index)
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id="battle_switch_pokemon",
             type="SWITCH_POKEMON",
             why=f"Switch to {target_name}.",
             priority=priority,
             expected_success_signal="The active Pokemon changes or the party cursor advances",
             objective_id=objective_id,
-            action=action,
-            step_budget=1,
         )
+        self._runtime[candidate.id] = CandidateRuntime(action=action, step_budget=1)
+        return candidate
 
     def _fallback_candidate(self, objective_id: str | None, why: str) -> CandidateNextStep:
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id="battle_default",
             type="BATTLE_DEFAULT",
             why=why,
             priority=40,
             expected_success_signal="Battle state changes or ends",
             objective_id=objective_id,
+        )
+        self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance battle"),
             step_budget=6,
         )
+        return candidate
 
     def _dedupe(self, candidates: list[CandidateNextStep]) -> list[CandidateNextStep]:
         seen: set[str] = set()

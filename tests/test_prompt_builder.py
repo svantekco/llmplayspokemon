@@ -1,9 +1,8 @@
 import json
 
-from pokemon_agent.agent.ascii_map import build_ascii_map
-from pokemon_agent.agent.context_manager import ContextManager
+from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.memory_manager import MemoryManager
-from pokemon_agent.agent.prompt_builder import PromptBuilder
+from pokemon_agent.emulator.screen_renderer import build_ascii_map
 from pokemon_agent.models.planner import CandidateNextStep, Objective, ObjectiveHorizon, ObjectiveTarget
 from pokemon_agent.models.state import GameMode, NavigationSnapshot, StructuredGameState, WorldCoordinate
 
@@ -11,36 +10,34 @@ from pokemon_agent.models.state import GameMode, NavigationSnapshot, StructuredG
 def test_prompt_builder_returns_two_messages():
     memory = MemoryManager()
     memory.memory.goals.active_objectives = [
-        Objective(id="long", horizon=ObjectiveHorizon.LONG_TERM, summary="Advance the main story", priority=30),
-        Objective(id="mid", horizon=ObjectiveHorizon.MID_TERM, summary="Find the next exit", priority=20),
-        Objective(id="short", horizon=ObjectiveHorizon.SHORT_TERM, summary="Take the best local step", priority=10),
+        Objective(id="long", horizon=ObjectiveHorizon.LONG_TERM),
+        Objective(id="mid", horizon=ObjectiveHorizon.MID_TERM),
+        Objective(id="short", horizon=ObjectiveHorizon.SHORT_TERM),
     ]
     context_manager = ContextManager()
-    builder = PromptBuilder()
     snapshot = context_manager.build_snapshot(StructuredGameState(), memory.memory)
-    messages = builder.build(snapshot)
+    messages = build_messages(snapshot)
     assert len(messages) == 2
     payload = json.loads(messages[1]["content"])
     assert "context" in payload
     assert "response_schema" in payload
     assert "allowed_actions" not in payload
-    metrics = builder.measure(messages, snapshot)
-    assert metrics.chars > 0
-    assert metrics.approx_tokens > 0
-    assert metrics.budget_tokens == snapshot.budget_tokens
-    assert metrics.used_tokens == snapshot.used_tokens
-    assert isinstance(metrics.section_tokens, dict)
+    metrics = measure_prompt(messages, snapshot)
+    assert metrics["chars"] > 0
+    assert metrics["approx_tokens"] > 0
+    assert metrics["budget_tokens"] == snapshot.budget_tokens
+    assert metrics["used_tokens"] == snapshot.used_tokens
+    assert isinstance(metrics["section_tokens"], dict)
 
 
 def test_prompt_builder_uses_candidate_based_context():
     memory = MemoryManager()
     memory.memory.goals.active_objectives = [
-        Objective(id="long", horizon=ObjectiveHorizon.LONG_TERM, summary="Advance the main story", priority=30),
-        Objective(id="mid", horizon=ObjectiveHorizon.MID_TERM, summary="Exit the current map", priority=20),
-        Objective(id="short", horizon=ObjectiveHorizon.SHORT_TERM, summary="Choose the best exit", priority=10),
+        Objective(id="long", horizon=ObjectiveHorizon.LONG_TERM),
+        Objective(id="mid", horizon=ObjectiveHorizon.MID_TERM),
+        Objective(id="short", horizon=ObjectiveHorizon.SHORT_TERM),
     ]
     context_manager = ContextManager()
-    builder = PromptBuilder()
     state = StructuredGameState(
         map_name="Mock Town",
         x=5,
@@ -67,8 +64,8 @@ def test_prompt_builder_uses_candidate_based_context():
         )
     ]
 
-    snapshot = context_manager.build_snapshot(state, memory.memory, candidate_next_steps=candidates, recommended_step=candidates[0])
-    messages = builder.build(snapshot)
+    snapshot = context_manager.build_snapshot(state, memory.memory, candidate_next_steps=candidates)
+    messages = build_messages(snapshot)
     payload = json.loads(messages[1]["content"])
     text = messages[1]["content"]
 
@@ -84,7 +81,6 @@ def test_prompt_builder_uses_candidate_based_context():
 
 def test_prompt_builder_serializes_current_game_area_ascii_map():
     memory = MemoryManager()
-    builder = PromptBuilder()
     context_manager = ContextManager()
     game_area = [[0 for _ in range(20)] for _ in range(18)]
     collision_area = [[0 for _ in range(20)] for _ in range(18)]
@@ -115,7 +111,7 @@ def test_prompt_builder_serializes_current_game_area_ascii_map():
     )
 
     snapshot = context_manager.build_snapshot(state, memory.memory)
-    messages = builder.build(snapshot)
+    messages = build_messages(snapshot)
     payload = json.loads(messages[1]["content"])
 
     assert payload["context"]["overworld_context"]["visual_map"] == build_ascii_map(state)

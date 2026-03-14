@@ -7,9 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pokemon_agent.agent.context_manager import ContextManager
 from pokemon_agent.agent.battle_manager import BattleManager
-from pokemon_agent.agent.executor import Executor
+from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRouterClient
 from pokemon_agent.agent.menu_manager import MenuManager
 from pokemon_agent.agent.memory_manager import MemoryManager
@@ -17,19 +16,20 @@ from pokemon_agent.agent.navigation import CachedRoute
 from pokemon_agent.agent.navigation import advance_position
 from pokemon_agent.agent.navigation import find_path
 from pokemon_agent.agent.progress import ProgressDetector, ProgressResult
-from pokemon_agent.agent.prompt_builder import PromptBuilder, PromptMetrics
 from pokemon_agent.agent.stuck_detector import StuckDetector, StuckState
 from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.agent.world_map import connectors_from_map
 from pokemon_agent.agent.world_map import describe_connector
 from pokemon_agent.agent.world_map import shortest_confirmed_path
 from pokemon_agent.agent.world_map import world_map_stats
+from pokemon_agent.emulator.base import EmulatorAdapter
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.memory import NavigationGoal
 from pokemon_agent.models.planner import CandidateNextStep
+from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.planner import ExecutionPlan
 from pokemon_agent.models.planner import ObjectiveHorizon
 from pokemon_agent.models.planner import ObjectiveTarget
@@ -60,7 +60,7 @@ class TurnResult:
     used_fallback: bool = False
     raw_model_response: str | None = None
     prompt_messages: list[dict] = field(default_factory=list)
-    prompt_metrics: PromptMetrics | None = None
+    prompt_metrics: dict[str, Any] | None = None
     llm_usage: LLMUsage | None = None
     llm_attempted: bool = False
     llm_model: str | None = None
@@ -76,7 +76,7 @@ class PlanningResult:
     used_fallback: bool = False
     planner_source: str = "fallback"
     messages: list[dict] = field(default_factory=list)
-    prompt_metrics: PromptMetrics | None = None
+    prompt_metrics: dict[str, Any] | None = None
     llm_usage: LLMUsage | None = None
     llm_attempted: bool = False
     llm_model: str | None = None
@@ -124,8 +124,8 @@ class RunTelemetry:
         if turn.progress.classification == "no_effect":
             self.no_effect_turns += 1
         if turn.prompt_metrics:
-            self.prompt_chars += turn.prompt_metrics.chars
-            self.approx_prompt_tokens += turn.prompt_metrics.approx_tokens
+            self.prompt_chars += int(turn.prompt_metrics.get("chars", 0))
+            self.approx_prompt_tokens += int(turn.prompt_metrics.get("approx_tokens", 0))
         if turn.llm_usage:
             self.llm_prompt_tokens += turn.llm_usage.prompt_tokens or 0
             self.llm_completion_tokens += turn.llm_usage.completion_tokens or 0
@@ -169,20 +169,18 @@ class RunTelemetry:
 class ClosedLoopRunner:
     def __init__(
         self,
-        executor: Executor,
+        emulator: EmulatorAdapter,
         memory: MemoryManager,
         progress: ProgressDetector,
         stuck: StuckDetector,
-        prompts: PromptBuilder,
         validator: ActionValidator,
         llm_client: OpenRouterClient | None = None,
         context_manager: ContextManager | None = None,
     ) -> None:
-        self.executor = executor
+        self.emulator = emulator
         self.memory = memory
         self.progress = progress
         self.stuck = stuck
-        self.prompts = prompts
         self.validator = validator
         self.llm_client = llm_client
         self.context_manager = context_manager or ContextManager()
@@ -191,12 +189,13 @@ class ClosedLoopRunner:
         self.completed_turns = 0
         self.route_cache: CachedRoute | None = None
         self.execution_plan: ExecutionPlan | None = None
+        self._candidate_runtime: dict[str, CandidateRuntime] = {}
         self.menu_manager = MenuManager()
         self._last_entry_direction: str | None = None  # direction we entered current map from
         self._previous_map_name: str | None = None
         # Tracks (map_id, player_x, player_y) → turn_index of last text-box interaction.
         # Used to suppress re-interacting with the same sign/object within a cooldown window.
-        self._interacted_tiles: dict[tuple[int, int, int], int] = {}
+        self._interacted_tiles: dict[tuple[str | int, int, int], int] = {}
         self._interaction_cooldown: int = 20
 
     _OPPOSITE_DIRECTION: dict[str, str] = {
@@ -207,12 +206,12 @@ class ClosedLoopRunner:
     }
 
     def run_turn(self, turn_index: int) -> TurnResult:
-        planning_state = self.executor.emulator.get_structured_state()
+        planning_state = self.emulator.get_structured_state()
         planning = self._plan_action(planning_state)
-        before = self.executor.emulator.get_structured_state()
+        before = self.emulator.get_structured_state()
         action = self.validator.validate(planning.action, before)
-        self.executor.run(action)
-        after = self.executor.emulator.get_structured_state()
+        self.emulator.execute_action(action)
+        after = self.emulator.get_structured_state()
         progress_result = self.progress.compare(before, after)
         stuck_state = self.stuck.update(after, action, progress_result.classification, progress_result)
         # Track entry direction on map change, and clear interaction cooldown on new map.
@@ -324,10 +323,10 @@ class ClosedLoopRunner:
             self.memory.memory,
             self.stuck.state,
             candidate_next_steps=candidates,
-            recommended_step=recommended,
+            candidate_runtime=self._candidate_runtime,
         )
-        messages = self.prompts.build(snapshot)
-        prompt_metrics = self.prompts.measure(messages, snapshot)
+        messages = build_messages(snapshot)
+        prompt_metrics = measure_prompt(messages, snapshot)
 
         if self.llm_client is None:
             result = self._fallback_from_candidates(
@@ -344,7 +343,7 @@ class ClosedLoopRunner:
             raw_response = self._complete_with_window_pump(messages)
             decision = self._parse_planner_decision(raw_response.content)
             chosen = self._resolve_candidate(decision, candidates) or recommended
-            live_state = self.executor.emulator.get_structured_state()
+            live_state = self.emulator.get_structured_state()
             compiled = self._compile_candidate(chosen, live_state, decision.reason or self._short_reason(chosen))
             if compiled is None:
                 result = self._fallback_from_candidates(
@@ -376,7 +375,7 @@ class ClosedLoopRunner:
             return result
         except Exception as exc:
             result = self._fallback_from_candidates(
-                self.executor.emulator.get_structured_state(),
+                self.emulator.get_structured_state(),
                 recommended,
                 messages=messages,
                 prompt_metrics=prompt_metrics,
@@ -393,7 +392,7 @@ class ClosedLoopRunner:
         recommended: CandidateNextStep,
         *,
         messages: list[dict],
-        prompt_metrics: PromptMetrics,
+        prompt_metrics: dict[str, Any],
         raw_response: str | None = None,
         llm_usage: LLMUsage | None = None,
         llm_model: str | None = None,
@@ -424,7 +423,8 @@ class ClosedLoopRunner:
         )
 
     def _complete_with_window_pump(self, messages: list[dict]) -> CompletionResponse:
-        emulator = self.executor.emulator
+        emulator = self.emulator
+        assert self.llm_client is not None
         emulator.begin_planning_wait()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -440,7 +440,7 @@ class ClosedLoopRunner:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         emulator_state_path = checkpoint_dir / "emulator.state"
         metadata_path = checkpoint_dir / "checkpoint.json"
-        self.executor.emulator.save_state(emulator_state_path)
+        self.emulator.save_state(emulator_state_path)
         payload = {
             "completed_turns": self.completed_turns,
             "memory": self.memory.memory.model_dump(),
@@ -470,7 +470,7 @@ class ClosedLoopRunner:
         metadata_path = checkpoint_dir / "checkpoint.json"
         emulator_state_path = checkpoint_dir / "emulator.state"
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        self.executor.emulator.load_state(emulator_state_path)
+        self.emulator.load_state(emulator_state_path)
         self.memory.memory = MemoryState.model_validate(payload["memory"])
         stuck_payload = payload["stuck_state"]
         restored = StuckState(
@@ -537,14 +537,12 @@ class ClosedLoopRunner:
         candidates: list[CandidateNextStep],
     ) -> CandidateNextStep | None:
         for candidate in candidates:
-            if decision.candidate_id and candidate.id == decision.candidate_id:
-                return candidate
-        for candidate in candidates:
-            if decision.intent and candidate.type == decision.intent:
+            if candidate.id == decision.candidate_id:
                 return candidate
         return None
 
     def _build_candidate_steps(self, state: StructuredGameState) -> list[CandidateNextStep]:
+        self._candidate_runtime = {}
         short_objective_id = self._objective_id(ObjectiveHorizon.SHORT_TERM, "short_immediate_step")
         mid_objective_id = self._objective_id(ObjectiveHorizon.MID_TERM, "mid_local_progress")
         navigation_goal = self._sync_navigation_goal(state)
@@ -557,67 +555,74 @@ class ClosedLoopRunner:
                 why = "A yes/no prompt is open and requires an explicit choice."
                 if isinstance(dialogue_text, str) and dialogue_text.strip():
                     why = f"Dialogue asks for a yes/no choice: {dialogue_text.splitlines()[0][:80]}"
-                return [
-                    CandidateNextStep(
-                        id="select_yes",
-                        type="SELECT_YES",
-                        why=why,
-                        priority=90,
-                        expected_success_signal="Prompt closes or dialogue changes after choosing yes",
-                        objective_id=short_objective_id,
-                        action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="select yes"),
-                        step_budget=1,
-                    ),
-                    CandidateNextStep(
-                        id="select_no",
-                        type="SELECT_NO",
-                        why=why,
-                        priority=90,
-                        expected_success_signal="Prompt closes or dialogue changes after choosing no",
-                        objective_id=short_objective_id,
-                        action=ActionDecision(action=ActionType.MOVE_DOWN, repeat=1, reason="move to no"),
-                        follow_up_action=ActionType.PRESS_A,
-                        step_budget=2,
-                    ),
-                ]
+                select_yes = CandidateNextStep(
+                    id="select_yes",
+                    type="SELECT_YES",
+                    why=why,
+                    priority=90,
+                    expected_success_signal="Prompt closes or dialogue changes after choosing yes",
+                    objective_id=short_objective_id,
+                )
+                self._candidate_runtime[select_yes.id] = CandidateRuntime(
+                    action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="select yes"),
+                    step_budget=1,
+                )
+                select_no = CandidateNextStep(
+                    id="select_no",
+                    type="SELECT_NO",
+                    why=why,
+                    priority=90,
+                    expected_success_signal="Prompt closes or dialogue changes after choosing no",
+                    objective_id=short_objective_id,
+                )
+                self._candidate_runtime[select_no.id] = CandidateRuntime(
+                    action=ActionDecision(action=ActionType.MOVE_DOWN, repeat=1, reason="move to no"),
+                    follow_up_action=ActionType.PRESS_A,
+                    step_budget=2,
+                )
+                return [select_yes, select_no]
             why = "Text is already open."
             if isinstance(dialogue_text, str) and dialogue_text.strip():
                 why = f"Dialogue is open: {dialogue_text.splitlines()[0][:80]}"
-            return [
-                CandidateNextStep(
-                    id="advance_text",
-                    type="ADVANCE_TEXT_UNTIL_CHANGE",
-                    why=why,
-                    priority=100,
-                    expected_success_signal="Dialogue changes or the text box closes",
-                    objective_id=short_objective_id,
-                    action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance text"),
-                    step_budget=6,
-                )
-            ]
+            candidate = CandidateNextStep(
+                id="advance_text",
+                type="ADVANCE_TEXT_UNTIL_CHANGE",
+                why=why,
+                priority=100,
+                expected_success_signal="Dialogue changes or the text box closes",
+                objective_id=short_objective_id,
+            )
+            self._candidate_runtime[candidate.id] = CandidateRuntime(
+                action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance text"),
+                step_budget=6,
+            )
+            return [candidate]
         if state.menu_open:
-            menu_candidates = self._dedupe_candidates(self.menu_manager.build_candidates(state, short_objective_id))
+            menu_candidates = self.menu_manager.build_candidates(state, short_objective_id)
+            self._candidate_runtime.update(self.menu_manager.runtime_map())
+            menu_candidates = self._dedupe_candidates(menu_candidates)
             menu_candidates.sort(key=lambda item: (-item.priority, item.id))
-            return menu_candidates[:4]
+            return self._trim_candidate_runtime(menu_candidates[:4])
         if state.battle_state:
-            return self.battle_manager.build_candidates(state, short_objective_id)
+            battle_candidates = self.battle_manager.build_candidates(state, short_objective_id)
+            self._candidate_runtime.update(self.battle_manager.runtime_map())
+            return self._trim_candidate_runtime(battle_candidates)
 
         candidates.extend(self.menu_manager.build_candidates(state, short_objective_id))
+        self._candidate_runtime.update(self.menu_manager.runtime_map())
 
         if self.stuck.state.score >= self.stuck.threshold:
             recovery_action = self.validator.fallback(state, self.stuck.state, "stuck recovery")
-            candidates.append(
-                CandidateNextStep(
-                    id=f"recover_{recovery_action.action.value.lower()}",
-                    type="RECOVER_FROM_STUCK",
-                    why=self.stuck.state.recovery_hint or "Recent actions failed without progress.",
-                    priority=95,
-                    expected_success_signal="A different local state appears",
-                    objective_id=short_objective_id,
-                    action=recovery_action,
-                    step_budget=1,
-                )
+            candidate = CandidateNextStep(
+                id=f"recover_{recovery_action.action.value.lower()}",
+                type="RECOVER_FROM_STUCK",
+                why=self.stuck.state.recovery_hint or "Recent actions failed without progress.",
+                priority=95,
+                expected_success_signal="A different local state appears",
+                objective_id=short_objective_id,
             )
+            self._candidate_runtime[candidate.id] = CandidateRuntime(action=recovery_action, step_budget=1)
+            candidates.append(candidate)
 
         adjacent_interaction = self._candidate_for_adjacent_interactable(state, short_objective_id)
         if adjacent_interaction is not None:
@@ -639,22 +644,20 @@ class ClosedLoopRunner:
 
         if not candidates:
             probe_action = self.validator.fallback(state, self.stuck.state, "probe nearby state")
-            candidates.append(
-                CandidateNextStep(
-                    id=f"probe_{probe_action.action.value.lower()}",
-                    type="SAFE_STEP",
-                    why="Probe a safe nearby step while no stronger target is available.",
-                    priority=25,
-                    expected_success_signal="Position changes or UI opens",
-                    objective_id=short_objective_id,
-                    action=probe_action,
-                    step_budget=1,
-                )
+            candidate = CandidateNextStep(
+                id=f"probe_{probe_action.action.value.lower()}",
+                type="SAFE_STEP",
+                why="Probe a safe nearby step while no stronger target is available.",
+                priority=25,
+                expected_success_signal="Position changes or UI opens",
+                objective_id=short_objective_id,
             )
+            self._candidate_runtime[candidate.id] = CandidateRuntime(action=probe_action, step_budget=1)
+            candidates.append(candidate)
 
         deduped = self._dedupe_candidates(candidates)
         deduped.sort(key=lambda item: (-item.priority, item.id))
-        return deduped[:4]
+        return self._trim_candidate_runtime(deduped[:4])
 
     def _objective_id(self, horizon: ObjectiveHorizon, default: str) -> str:
         for objective in self.memory.memory.goals.active_objectives:
@@ -672,11 +675,11 @@ class ClosedLoopRunner:
             return None
         adjacent: list[tuple[int, int, int]] = []
         for dx, dy in DIRECTION_DELTAS:
-            candidate = (state.x + dx, state.y + dy)
-            if candidate not in blocked_set:
+            blocked_coordinate = (state.x + dx, state.y + dy)
+            if blocked_coordinate not in blocked_set:
                 continue
-            blocked_neighbors = self._blocked_neighbor_count(candidate, blocked_set)
-            adjacent.append((candidate[0], candidate[1], blocked_neighbors))
+            blocked_neighbors = self._blocked_neighbor_count(blocked_coordinate, blocked_set)
+            adjacent.append((blocked_coordinate[0], blocked_coordinate[1], blocked_neighbors))
         if not adjacent:
             return None
         best_x, best_y, neighbor_count = sorted(adjacent, key=lambda item: (item[2], item[0], item[1]))[0]
@@ -689,7 +692,7 @@ class ClosedLoopRunner:
             last_turn = self._interacted_tiles.get(key)
             if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
                 return None
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=f"interact_adjacent_{best_x}_{best_y}",
             type="MOVE_ADJACENT_TO_INTERACTABLE",
             target=ObjectiveTarget(kind="interactable", map_id=state.map_id, map_name=state.map_name, x=best_x, y=best_y),
@@ -697,9 +700,12 @@ class ClosedLoopRunner:
             priority=82 - min(neighbor_count, 2) * 4,
             expected_success_signal="Text opens or the local state changes",
             objective_id=objective_id,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="interact nearby"),
             step_budget=1,
         )
+        return candidate
 
     def _candidate_to_move_adjacent_to_interactable(
         self,
@@ -731,15 +737,15 @@ class ClosedLoopRunner:
                 if route is None or len(route) == 0:
                     continue
                 distance = len(route)
-                candidate = (distance, target_x, target_y, blocked_x * 1000 + blocked_y)
-                if best_choice is None or candidate < best_choice:
-                    best_choice = candidate
+                choice = (distance, target_x, target_y, blocked_x * 1000 + blocked_y)
+                if best_choice is None or choice < best_choice:
+                    best_choice = choice
         if best_choice is None:
             return None
         distance, target_x, target_y, encoded = best_choice
         blocked_x = encoded // 1000
         blocked_y = encoded % 1000
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=f"approach_interactable_{blocked_x}_{blocked_y}",
             type="MOVE_ADJACENT_TO_INTERACTABLE",
             target=ObjectiveTarget(
@@ -754,11 +760,14 @@ class ClosedLoopRunner:
             priority=72 - min(distance, 6),
             expected_success_signal="Reach the adjacent tile, then open text or change state",
             objective_id=objective_id,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
             target_x=target_x,
             target_y=target_y,
             follow_up_action=ActionType.PRESS_A,
             step_budget=distance + 2,
         )
+        return candidate
 
     def _build_exit_candidates(
         self,
@@ -804,20 +813,21 @@ class ClosedLoopRunner:
                 priority -= 25
                 why += " (backtrack — we just came from this direction)"
 
-            candidates.append(
-                CandidateNextStep(
-                    id=f"exit_{side}_{target_x}_{target_y}",
-                    type="GO_TO_MAP_EXIT",
-                    target=ObjectiveTarget(kind="exit", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y, detail=detail),
-                    why=why,
-                    priority=priority,
-                    expected_success_signal="Map changes or a new local affordance appears",
-                    objective_id=objective_id,
-                    target_x=target_x,
-                    target_y=target_y,
-                    step_budget=distance + 1,
-                )
+            candidate = CandidateNextStep(
+                id=f"exit_{side}_{target_x}_{target_y}",
+                type="GO_TO_MAP_EXIT",
+                target=ObjectiveTarget(kind="exit", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y, detail=detail),
+                why=why,
+                priority=priority,
+                expected_success_signal="Map changes or a new local affordance appears",
+                objective_id=objective_id,
             )
+            self._candidate_runtime[candidate.id] = CandidateRuntime(
+                target_x=target_x,
+                target_y=target_y,
+                step_budget=distance + 1,
+            )
+            candidates.append(candidate)
         return candidates[:4]
 
     def _build_discovered_route_candidate(
@@ -840,7 +850,7 @@ class ClosedLoopRunner:
         if local_route is None:
             return None
         distance = len(local_route)
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=f"follow_connector_{connector.id}",
             type="FOLLOW_DISCOVERED_CONNECTOR",
             target=ObjectiveTarget(
@@ -858,11 +868,14 @@ class ClosedLoopRunner:
             priority=92 - min(distance, 10),
             expected_success_signal=f"Transition toward {goal.target_map_name}",
             objective_id=objective_id,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
             target_x=connector.approach_x,
             target_y=connector.approach_y,
             follow_up_action=connector.transition_action,
             step_budget=max(1, distance + 1),
         )
+        return candidate
 
     def _build_frontier_candidate(
         self,
@@ -873,9 +886,10 @@ class ClosedLoopRunner:
         if state.navigation is None or state.x is None or state.y is None:
             return None
         reserved_targets = {
-            (candidate.target_x, candidate.target_y)
+            (runtime.target_x, runtime.target_y)
             for candidate in existing
-            if candidate.target_x is not None and candidate.target_y is not None
+            if (runtime := self._candidate_runtime_for(candidate)).target_x is not None
+            and runtime.target_y is not None
         }
         best: tuple[int, int, int] | None = None
         for coordinate in state.navigation.walkable:
@@ -889,13 +903,13 @@ class ClosedLoopRunner:
             if route is None or len(route) == 0:
                 continue
             distance = len(route)
-            candidate = (distance, coordinate.x, coordinate.y)
-            if best is None or candidate < best:
-                best = candidate
+            choice = (distance, coordinate.x, coordinate.y)
+            if best is None or choice < best:
+                best = choice
         if best is None:
             return None
         distance, target_x, target_y = best
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=f"frontier_{target_x}_{target_y}",
             type="EXPLORE_NEAREST_FRONTIER",
             target=ObjectiveTarget(kind="frontier", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y),
@@ -903,20 +917,24 @@ class ClosedLoopRunner:
             priority=42 - min(distance, 8),
             expected_success_signal="Position changes or new ranked candidates appear",
             objective_id=objective_id,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
             target_x=target_x,
             target_y=target_y,
             step_budget=distance + 1,
         )
+        return candidate
 
     def _dedupe_candidates(self, candidates: list[CandidateNextStep]) -> list[CandidateNextStep]:
         seen: set[tuple[str, int | None, int | None, str | None, str | None]] = set()
         deduped: list[CandidateNextStep] = []
         for candidate in candidates:
+            runtime = self._candidate_runtime_for(candidate)
             key = (
                 candidate.type,
-                candidate.target_x,
-                candidate.target_y,
-                candidate.action.action.value if candidate.action else None,
+                runtime.target_x,
+                runtime.target_y,
+                runtime.action.action.value if runtime.action else None,
                 candidate.target.detail if candidate.target else None,
             )
             if key in seen:
@@ -928,7 +946,7 @@ class ClosedLoopRunner:
     def _should_auto_select(self, candidates: list[CandidateNextStep]) -> bool:
         if not candidates:
             return False
-        current_state = self.executor.emulator.get_structured_state()
+        current_state = self.emulator.get_structured_state()
         if current_state.menu_open:
             return True
         goal = self.memory.memory.long_term.navigation_goal
@@ -955,7 +973,7 @@ class ClosedLoopRunner:
             "USE_FIELD_MOVE",
         }:
             return True
-        if candidates[0].type == "MOVE_ADJACENT_TO_INTERACTABLE" and candidates[0].action is not None:
+        if candidates[0].type == "MOVE_ADJACENT_TO_INTERACTABLE" and self._candidate_runtime_for(candidates[0]).action is not None:
             return True
         return (candidates[0].priority - candidates[1].priority) >= 15
 
@@ -968,8 +986,9 @@ class ClosedLoopRunner:
         self.execution_plan = None
         if state.battle_state is not None:
             self.battle_manager.record_choice(candidate)
-        if candidate.action is not None:
-            action = candidate.action.model_copy(deep=True)
+        runtime = self._candidate_runtime_for(candidate)
+        if runtime.action is not None:
+            action = runtime.action.model_copy(deep=True)
             action.reason = reason
             if candidate.type in {"ADVANCE_TEXT_UNTIL_CHANGE", "CLOSE_MENU", "BATTLE_DEFAULT"}:
                 self.execution_plan = ExecutionPlan(
@@ -977,25 +996,25 @@ class ClosedLoopRunner:
                     candidate_id=candidate.id,
                     plan_type=candidate.type,
                     expected_success_signal=candidate.expected_success_signal,
-                    step_budget=candidate.step_budget,
+                    step_budget=runtime.step_budget,
                     button_action=action.action,
                     reason=reason,
                     started_step=state.step,
                 )
-            elif candidate.follow_up_action is not None:
+            elif runtime.follow_up_action is not None:
                 self.execution_plan = ExecutionPlan(
                     objective_id=candidate.objective_id,
                     candidate_id=candidate.id,
                     plan_type=candidate.type,
                     expected_success_signal=candidate.expected_success_signal,
                     step_budget=1,
-                    button_action=candidate.follow_up_action,
+                    button_action=runtime.follow_up_action,
                     reason=reason,
                     started_step=state.step,
                 )
             return self.validator.validate(action, state)
 
-        if candidate.target_x is None or candidate.target_y is None:
+        if runtime.target_x is None or runtime.target_y is None:
             return None
         return self._compile_navigation_candidate(candidate, state, reason)
 
@@ -1009,13 +1028,15 @@ class ClosedLoopRunner:
             self.route_cache = None
             self.execution_plan = None
             return None
-        route = find_path(state.navigation, state.x, state.y, candidate.target_x, candidate.target_y)
+        runtime = self._candidate_runtime_for(candidate)
+        assert runtime.target_x is not None and runtime.target_y is not None
+        route = find_path(state.navigation, state.x, state.y, runtime.target_x, runtime.target_y)
         if route is None:
             self.route_cache = None
             self.execution_plan = None
             return None
         if len(route) == 0:
-            if candidate.follow_up_action is None:
+            if runtime.follow_up_action is None:
                 self.route_cache = None
                 self.execution_plan = None
                 return None
@@ -1025,25 +1046,25 @@ class ClosedLoopRunner:
                 plan_type=candidate.type,
                 target=candidate.target,
                 expected_success_signal=candidate.expected_success_signal,
-                step_budget=max(1, candidate.step_budget - 1),
-                button_action=candidate.follow_up_action,
-                target_x=candidate.target_x,
-                target_y=candidate.target_y,
+                step_budget=max(1, runtime.step_budget - 1),
+                button_action=runtime.follow_up_action,
+                target_x=runtime.target_x,
+                target_y=runtime.target_y,
                 follow_up_action=None,
                 map_id=state.map_id,
                 collision_hash=state.navigation.collision_hash,
                 reason=reason,
                 started_step=state.step,
             )
-            return ActionDecision(action=candidate.follow_up_action, repeat=1, reason=reason)
+            return ActionDecision(action=runtime.follow_up_action, repeat=1, reason=reason)
 
         first_action = route[0]
         remaining = list(route[1:])
         if remaining:
             self.route_cache = CachedRoute(
                 map_id=state.map_id,
-                target_x=candidate.target_x,
-                target_y=candidate.target_y,
+                target_x=runtime.target_x,
+                target_y=runtime.target_y,
                 collision_hash=state.navigation.collision_hash,
                 remaining_actions=remaining,
                 expected_start=advance_position(state.x, state.y, first_action),
@@ -1056,17 +1077,27 @@ class ClosedLoopRunner:
             plan_type=candidate.type,
             target=candidate.target,
             expected_success_signal=candidate.expected_success_signal,
-            step_budget=max(candidate.step_budget, len(route)),
+            step_budget=max(runtime.step_budget, len(route)),
             button_action=None,
-            target_x=candidate.target_x,
-            target_y=candidate.target_y,
-            follow_up_action=candidate.follow_up_action,
+            target_x=runtime.target_x,
+            target_y=runtime.target_y,
+            follow_up_action=runtime.follow_up_action,
             map_id=state.map_id,
             collision_hash=state.navigation.collision_hash,
             reason=reason,
             started_step=state.step,
         )
         return ActionDecision(action=first_action, repeat=1, reason=reason)
+
+    def _candidate_runtime_for(self, candidate: CandidateNextStep) -> CandidateRuntime:
+        return self._candidate_runtime.get(candidate.id, CandidateRuntime())
+
+    def _trim_candidate_runtime(self, candidates: list[CandidateNextStep]) -> list[CandidateNextStep]:
+        keep_ids = {candidate.id for candidate in candidates}
+        self._candidate_runtime = {
+            candidate_id: runtime for candidate_id, runtime in self._candidate_runtime.items() if candidate_id in keep_ids
+        }
+        return candidates
 
     def _plan_from_execution_plan(self, state: StructuredGameState) -> ActionDecision | None:
         plan = self.execution_plan
@@ -1279,4 +1310,4 @@ class ClosedLoopRunner:
             return
         if goal.confirmation_required_map == map_name:
             goal.confirmation_required_map = None
-            goal.last_confirmed_step = self.executor.emulator.get_structured_state().step
+            goal.last_confirmed_step = self.emulator.get_structured_state().step

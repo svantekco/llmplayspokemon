@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import os
 import signal
+import shutil
+from pathlib import Path
 from typing import Any
 
 try:
-    from rich import print
+    from rich import print as rich_print
 except Exception:  # pragma: no cover
-    print = builtins.print
+    rich_print = builtins.print
 
-from pokemon_agent.agent.evaluator import ScenarioEvaluator
+print = rich_print
+
 from pokemon_agent.agent.context_manager import ContextManager
 from pokemon_agent.agent.engine import ClosedLoopRunner
-from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.llm_client import OpenRouterClient
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.progress import ProgressDetector
-from pokemon_agent.agent.prompt_builder import PromptBuilder
 from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.config import AppConfig
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.emulator.pyboy_adapter import PyBoyAdapter
 from pokemon_agent.ui.terminal_dashboard import TerminalDashboard
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _InterruptController:
@@ -53,12 +57,66 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rom", default=None)
     parser.add_argument("--turns", type=int, default=None)
     parser.add_argument("--continuous", action="store_true")
-    parser.add_argument("--planner", choices=["llm", "fallback"], default="fallback")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--planner", choices=["auto", "llm", "fallback"], default="fallback")
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--session-dir", default=None)
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--window", choices=["SDL2", "OpenGL", "GLFW", "null"], default=None)
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument("--log-mode", choices=["dashboard", "verbose", "compact", "quiet"], default="dashboard")
-    parser.add_argument("--eval", action="store_true")
     return parser
+
+
+def session_is_resumable(session_dir: Path) -> bool:
+    return (session_dir / "checkpoint.json").exists() and (session_dir / "emulator.state").exists()
+
+
+def resolve_planner(args: argparse.Namespace) -> str:
+    if args.planner != "auto":
+        return args.planner
+    return "llm" if os.getenv("OPENROUTER_API_KEY") else "fallback"
+
+
+def apply_runtime_environment(args: argparse.Namespace) -> str | None:
+    if args.mode != "pyboy":
+        return None
+    if args.headless:
+        window = "null"
+    else:
+        window = args.window or "SDL2"
+    os.environ["PYBOY_WINDOW"] = window
+    return window
+
+
+def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
+    session_dir = None if not args.session_dir else (REPO_ROOT / args.session_dir).resolve()
+    if args.fresh and session_dir and session_dir.exists():
+        shutil.rmtree(session_dir)
+    if session_dir is not None:
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+    mode = args.mode
+    rom = args.rom
+    if mode == "pyboy" and rom is not None:
+        rom = str((REPO_ROOT / rom).resolve())
+    continuous = args.continuous or (session_dir is not None and not args.once)
+    checkpoint_dir = str(session_dir) if session_dir is not None else args.checkpoint_dir
+    resume = args.resume
+    if session_dir is not None:
+        resume = str(session_dir) if session_is_resumable(session_dir) else None
+
+    return argparse.Namespace(
+        mode=mode,
+        rom=rom,
+        turns=args.turns,
+        continuous=continuous,
+        planner=resolve_planner(args),
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+        log_mode=args.log_mode,
+    )
 
 
 def _print_turn(result, log_mode: str) -> None:
@@ -100,9 +158,9 @@ def _print_turn(result, log_mode: str) -> None:
         print(
             "  prompt",
             {
-                "chars": result.prompt_metrics.chars,
-                "approx_tokens": result.prompt_metrics.approx_tokens,
-                "warning": result.prompt_metrics.warning,
+                "chars": result.prompt_metrics.get("chars"),
+                "approx_tokens": result.prompt_metrics.get("approx_tokens"),
+                "warning": result.prompt_metrics.get("warning"),
             },
         )
     print("  before", result.before.prompt_summary())
@@ -114,22 +172,8 @@ def _print_turn(result, log_mode: str) -> None:
 
 
 def run_args(args: argparse.Namespace) -> None:
-    if args.eval:
-        results = ScenarioEvaluator().run()
-        for result in results:
-            print(
-                f"[bold]{result.name}[/bold] passed={result.passed} "
-                f"turns={result.turns} move={result.movement_success} "
-                f"interaction={result.interaction_success} major={result.major_progress} "
-                f"max_stuck={result.max_stuck}"
-            )
-            if result.notes:
-                print("  notes", result.notes)
-        return
-
     config = AppConfig()
     emulator = build_emulator(args.mode, args.rom, config)
-    executor = Executor(emulator)
     memory = MemoryManager(window=config.short_term_window)
     progress = ProgressDetector()
     stuck = StuckDetector(threshold=config.stuck_threshold)
@@ -138,17 +182,15 @@ def run_args(args: argparse.Namespace) -> None:
         action_window=config.context_action_window,
         event_window=config.context_event_window,
     )
-    prompts = PromptBuilder()
     validator = ActionValidator(max_repeat=config.max_repeat)
     if args.planner == "llm" and not config.openrouter.api_key:
         raise SystemExit("Planner is set to 'llm' but OPENROUTER_API_KEY is missing.")
     llm_client = OpenRouterClient(config.openrouter) if args.planner == "llm" else None
     runner = ClosedLoopRunner(
-        executor=executor,
+        emulator=emulator,
         memory=memory,
         progress=progress,
         stuck=stuck,
-        prompts=prompts,
         validator=validator,
         llm_client=llm_client,
         context_manager=context_manager,
@@ -233,7 +275,19 @@ def run_args(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = create_parser()
     args = parser.parse_args(argv)
-    run_args(args)
+    window = apply_runtime_environment(args)
+    main_args = build_main_args(args)
+    if args.session_dir:
+        if main_args.resume:
+            print(f"Resuming session from {main_args.resume}")
+        else:
+            print(f"Starting new session in {main_args.checkpoint_dir}")
+        print(f"Planner mode: {main_args.planner}")
+        if window:
+            print(f"PyBoy window mode: {window}")
+        if main_args.continuous:
+            print("Watch mode is active. Press Ctrl+C once to stop after the current turn, or twice to save and exit immediately.")
+    run_args(main_args)
 
 
 if __name__ == "__main__":

@@ -90,10 +90,11 @@ def test_menu_manager_opens_start_menu_for_required_hm() -> None:
     )
 
     candidates = manager.build_candidates(state, "short_gym3_surge")
+    runtime = manager.runtime_map()
 
     assert len(candidates) == 1
     assert candidates[0].type == "OPEN_START_MENU_FOR_HM"
-    assert candidates[0].action.action == ActionType.PRESS_START
+    assert runtime[candidates[0].id].action.action == ActionType.PRESS_START
 
 
 def test_menu_manager_prioritizes_item_in_start_menu_for_hm_teaching() -> None:
@@ -107,11 +108,12 @@ def test_menu_manager_prioritizes_item_in_start_menu_for_hm_teaching() -> None:
 
     candidates = manager.build_candidates(state, "short_gym3_surge")
     best = max(candidates, key=lambda candidate: (candidate.priority, candidate.id))
+    runtime = manager.runtime_map()
 
     assert best.target is not None
     assert best.target.detail == "ITEM"
     assert best.type == "SELECT_START_MENU_OPTION_FOR_HM"
-    assert best.action.action == ActionType.MOVE_DOWN
+    assert runtime[best.id].action.action == ActionType.MOVE_DOWN
 
 
 def test_menu_manager_selects_hm_item_from_item_menu() -> None:
@@ -131,11 +133,12 @@ def test_menu_manager_selects_hm_item_from_item_menu() -> None:
 
     candidates = manager.build_candidates(state, "short_gym3_surge")
     best = max(candidates, key=lambda candidate: (candidate.priority, candidate.id))
+    runtime = manager.runtime_map()
 
     assert best.type == "SELECT_HM_ITEM"
     assert best.target is not None
     assert best.target.detail == "HM Cut"
-    assert best.action.action == ActionType.MOVE_DOWN
+    assert runtime[best.id].action.action == ActionType.MOVE_DOWN
 
 
 def test_menu_manager_uses_field_move_when_visible_in_pokemon_submenu() -> None:
@@ -151,8 +154,9 @@ def test_menu_manager_uses_field_move_when_visible_in_pokemon_submenu() -> None:
 
     candidates = manager.build_candidates(state, "short_gym3_surge")
     best = max(candidates, key=lambda candidate: (candidate.priority, candidate.id))
+    runtime = manager.runtime_map()
 
     assert best.type == "USE_FIELD_MOVE"
     assert best.target is not None
     assert best.target.detail == "Cut"
-    assert best.action.action == ActionType.MOVE_UP
+    assert runtime[best.id].action.action == ActionType.MOVE_UP

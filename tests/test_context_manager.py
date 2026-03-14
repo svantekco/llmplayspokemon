@@ -33,27 +33,16 @@ def _memory_state() -> MemoryState:
         Objective(
             id="long",
             horizon=ObjectiveHorizon.LONG_TERM,
-            summary="Advance the main story",
-            priority=30,
-            success_conditions=["Reach a new map"],
         ),
         Objective(
             id="mid",
             horizon=ObjectiveHorizon.MID_TERM,
-            summary="Find a route exit",
-            priority=20,
             target=ObjectiveTarget(kind="exit", map_name="Viridian City"),
-            success_conditions=["Map changes"],
-            invalidation_conditions=["Battle starts"],
         ),
         Objective(
             id="short",
             horizon=ObjectiveHorizon.SHORT_TERM,
-            summary="Choose the best local step",
-            priority=10,
             target=ObjectiveTarget(kind="map", map_name="Viridian City", x=7, y=8),
-            success_conditions=["Position changes"],
-            invalidation_conditions=["No effect"],
         ),
     ]
     return memory_state
@@ -116,7 +105,6 @@ def test_context_manager_builds_tight_overworld_payload():
         _state(),
         _memory_state(),
         candidate_next_steps=_candidates(),
-        recommended_step=_candidates()[0],
     )
 
     context = snapshot.payload["context"]
@@ -240,7 +228,6 @@ def test_context_manager_includes_stuck_warning_and_last_outcome():
         _memory_state(),
         stuck_state=StuckState(score=4, recovery_hint="Try a new local interaction"),
         candidate_next_steps=_candidates(),
-        recommended_step=_candidates()[0],
     )
 
     context = snapshot.payload["context"]
@@ -260,7 +247,6 @@ def test_context_manager_prunes_recent_events_before_objectives_and_candidates()
         memory_state,
         stuck_state=StuckState(score=4, recovery_hint="Try a new local interaction"),
         candidate_next_steps=_candidates(),
-        recommended_step=_candidates()[0],
     )
 
     assert "recent_events" in snapshot.dropped_sections

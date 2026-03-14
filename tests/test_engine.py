@@ -3,15 +3,13 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from pokemon_agent.agent.engine import ClosedLoopRunner
-from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.progress import ProgressDetector
-from pokemon_agent.agent.prompt_builder import PromptBuilder
 from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.agent.validator import ActionValidator
-from pokemon_agent.agent.evaluator import ScenarioEvaluator
 import pokemon_agent.agent.menu_manager as menu_manager_module
 from pokemon_agent.data.walkthrough import Milestone
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
@@ -287,14 +285,34 @@ class _BadLLM:
 
 def _build_runner(emulator, llm_client=None):
     return ClosedLoopRunner(
-        executor=Executor(emulator),
+        emulator=emulator,
         memory=MemoryManager(),
         progress=ProgressDetector(),
         stuck=StuckDetector(),
-        prompts=PromptBuilder(),
         validator=ActionValidator(max_repeat=4),
         llm_client=llm_client,
     )
+
+
+def _setup_overworld_walk(emulator: MockEmulatorAdapter) -> None:
+    emulator.maps["Mock Town"]["npc"] = None
+    emulator._sync_navigation()
+
+
+def _setup_menu_recovery(emulator: MockEmulatorAdapter) -> None:
+    emulator.state.menu_open = True
+    emulator.state.mode = GameMode.MENU
+
+
+def _setup_dialogue_recovery(emulator: MockEmulatorAdapter) -> None:
+    emulator.state.text_box_open = True
+    emulator.state.mode = GameMode.TEXT
+    emulator.state.metadata["dialogue"] = "Testing dialogue"
+
+
+def _setup_battle_recovery(emulator: MockEmulatorAdapter) -> None:
+    emulator.state.battle_state = {"kind": "WILD", "opponent": "RATTATA", "enemy_species": "RATTATA"}
+    emulator.state.mode = GameMode.BATTLE
 
 
 def _seed_discovered_route(runner: ClosedLoopRunner) -> None:
@@ -302,22 +320,16 @@ def _seed_discovered_route(runner: ClosedLoopRunner) -> None:
         Objective(
             id="long_route2",
             horizon=ObjectiveHorizon.LONG_TERM,
-            summary="Reach Route 2",
-            priority=30,
             target=ObjectiveTarget(kind="map", map_name="Route 2"),
         ),
         Objective(
             id="mid_route2",
             horizon=ObjectiveHorizon.MID_TERM,
-            summary="Travel toward Route 2",
-            priority=20,
             target=ObjectiveTarget(kind="map", map_name="Route 2"),
         ),
         Objective(
             id="short_here",
             horizon=ObjectiveHorizon.SHORT_TERM,
-            summary="Take the best connector step",
-            priority=10,
             target=ObjectiveTarget(kind="map", map_name="Mock Town", x=7, y=5),
         ),
     ]
@@ -378,16 +390,31 @@ def test_runner_checkpoint_round_trip(tmp_path: Path):
     assert payload["completed_turns"] == 1
     assert "context_state" in payload
     assert "execution_plan" in payload
-    restored_state = restored_runner.executor.emulator.get_structured_state()
+    restored_state = restored_runner.emulator.get_structured_state()
     assert restored_state.text_box_open is True
     assert restored_runner.completed_turns == 1
     assert len(restored_runner.context_manager.action_traces) == 1
 
 
-def test_scenario_evaluator_runs_mock_scenarios():
-    results = ScenarioEvaluator().run()
+@pytest.mark.parametrize(
+    ("setup", "turns", "expected_action", "expected_classification"),
+    [
+        (_setup_overworld_walk, 4, "MOVE_RIGHT", "movement_success"),
+        (_setup_menu_recovery, 2, "PRESS_B", "interaction_success"),
+        (_setup_dialogue_recovery, 2, "PRESS_A", "interaction_success"),
+        (_setup_battle_recovery, 2, "PRESS_A", "major_progress"),
+    ],
+)
+def test_mock_recovery_scenarios(setup, turns, expected_action, expected_classification):
+    emulator = MockEmulatorAdapter()
+    setup(emulator)
+    runner = _build_runner(emulator)
+
+    results = runner.run(turns)
+
     assert results
-    assert all(result.passed for result in results)
+    assert results[0].action.action.value == expected_action
+    assert expected_classification in [turn.progress.classification for turn in results]
 
 
 def test_runner_pumps_emulator_while_waiting_for_llm():

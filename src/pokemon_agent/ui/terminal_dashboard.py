@@ -13,8 +13,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from pokemon_agent.agent.ascii_map import build_ascii_map
 from pokemon_agent.agent.engine import TurnResult
+from pokemon_agent.emulator.screen_renderer import build_ascii_map
 from pokemon_agent.models.state import StructuredGameState
 
 
@@ -252,9 +252,9 @@ class TerminalDashboard:
         if turn.prompt_metrics is not None:
             summary.add_row(
                 "Prompt",
-                f"{turn.prompt_metrics.chars} chars | ~{turn.prompt_metrics.approx_tokens} tokens",
+                f"{turn.prompt_metrics.get('chars')} chars | ~{turn.prompt_metrics.get('approx_tokens')} tokens",
                 "Compact",
-                self._yes_no(turn.prompt_metrics.compact),
+                self._yes_no(bool(turn.prompt_metrics.get("compact"))),
             )
         if turn.llm_usage is not None:
             usage = (
@@ -273,10 +273,10 @@ class TerminalDashboard:
         request_table = Table(expand=True, box=box.SIMPLE, show_header=True, header_style="bold yellow")
         request_table.add_column("Role", width=10, no_wrap=True)
         request_table.add_column("Content", ratio=1)
-        for message in turn.prompt_messages:
+        for prompt_message in turn.prompt_messages:
             request_table.add_row(
-                str(message.get("role", "unknown")),
-                self._truncate_block(self._format_json_like(message.get("content", ""))),
+                str(prompt_message.get("role", "unknown")),
+                self._truncate_block(self._format_json_like(prompt_message.get("content", ""))),
             )
 
         if turn.llm_attempted and turn.used_fallback and turn.raw_model_response:

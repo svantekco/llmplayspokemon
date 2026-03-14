@@ -2,9 +2,37 @@ from __future__ import annotations
 
 from collections import deque
 
+from pokemon_agent.models.state import StructuredGameState
+
 SCREEN_HEIGHT = 18
 SCREEN_WIDTH = 20
 ORTHOGONAL_DELTAS: tuple[tuple[int, int], ...] = ((0, -1), (1, 0), (0, 1), (-1, 0))
+
+
+def build_ascii_map(state: StructuredGameState) -> str | None:
+    if state.x is not None and state.y is not None and state.game_area is not None and state.collision_area is not None:
+        return render_ascii_map(state.game_area, state.collision_area, state.x, state.y)
+
+    navigation = state.navigation
+    if navigation is None or state.x is None or state.y is None:
+        return None
+
+    walkable = {(coord.x, coord.y) for coord in navigation.walkable}
+    blocked = {(coord.x, coord.y) for coord in navigation.blocked}
+    lines: list[str] = []
+    for y in range(navigation.min_y, navigation.max_y + 1):
+        chars: list[str] = []
+        for x in range(navigation.min_x, navigation.max_x + 1):
+            if (x, y) == (state.x, state.y):
+                chars.append("P")
+            elif (x, y) in blocked:
+                chars.append("#")
+            elif (x, y) in walkable:
+                chars.append(".")
+            else:
+                chars.append(" ")
+        lines.append("".join(chars).rstrip())
+    return "\n".join(line for line in lines if line)
 
 
 def render_ascii_map(game_area, collision_area, player_x, player_y) -> str:

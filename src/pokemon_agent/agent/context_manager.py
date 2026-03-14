@@ -5,15 +5,16 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from pokemon_agent.agent.ascii_map import build_ascii_map
 from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckState
 from pokemon_agent.agent.world_map import summarize_navigation_goal
 from pokemon_agent.data.walkthrough import get_current_milestone
+from pokemon_agent.emulator.screen_renderer import build_ascii_map
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.planner import CandidateNextStep
+from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import StructuredGameState
 
@@ -82,6 +83,35 @@ class ContextSnapshot:
     dropped_sections: list[str] = field(default_factory=list)
 
 
+def build_messages(snapshot: ContextSnapshot) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": snapshot.system_prompt},
+        {"role": "user", "content": json.dumps(snapshot.payload, separators=(",", ":"), sort_keys=True)},
+    ]
+
+
+def measure_prompt(messages: list[dict[str, str]], snapshot: ContextSnapshot | None = None) -> dict[str, Any]:
+    chars = sum(len(message.get("content", "")) for message in messages)
+    approx_tokens = max(1, chars // 4)
+    if snapshot is None:
+        compact = chars <= 2400
+        warning = None if compact else "Prompt is growing large; consider pruning memory or metadata."
+        return {"chars": chars, "approx_tokens": approx_tokens, "compact": compact, "warning": warning}
+
+    compact = snapshot.used_tokens <= snapshot.budget_tokens
+    warning = None if compact else "Prompt remains above budget after pruning mandatory context."
+    return {
+        "chars": chars,
+        "approx_tokens": approx_tokens,
+        "compact": compact,
+        "budget_tokens": snapshot.budget_tokens,
+        "used_tokens": snapshot.used_tokens,
+        "section_tokens": dict(snapshot.section_tokens),
+        "dropped_sections": list(snapshot.dropped_sections),
+        "warning": warning,
+    }
+
+
 class ContextManager:
     def __init__(
         self,
@@ -100,10 +130,10 @@ class ContextManager:
         memory_state: MemoryState,
         stuck_state: StuckState | None = None,
         candidate_next_steps: list[CandidateNextStep] | None = None,
-        recommended_step: CandidateNextStep | None = None,
+        candidate_runtime: dict[str, CandidateRuntime] | None = None,
     ) -> ContextSnapshot:
-        context = self._build_context(state, memory_state, stuck_state, candidate_next_steps, recommended_step)
-        system_prompt = self._build_system_prompt(state, context)
+        context = self._build_context(state, memory_state, stuck_state, candidate_next_steps, candidate_runtime)
+        system_prompt = PLANNER_SYSTEM_PROMPT
         payload = {
             "context": context,
             "response_schema": copy.deepcopy(RESPONSE_SCHEMA),
@@ -164,7 +194,7 @@ class ContextManager:
         memory_state: MemoryState,
         stuck_state: StuckState | None,
         candidate_next_steps: list[CandidateNextStep] | None,
-        recommended_step: CandidateNextStep | None,  # kept for API compat, not used
+        candidate_runtime: dict[str, CandidateRuntime] | None,
     ) -> dict[str, Any]:
         immediate_state = self._build_immediate_state(state)
         context: dict[str, Any] = {
@@ -180,7 +210,10 @@ class ContextManager:
                 failed_actions = set(stuck_state.recent_failed_actions[-3:])
                 failed_ids = [
                     cand.id for cand in candidate_next_steps
-                    if cand.action and cand.action.action.value in failed_actions
+                    if candidate_runtime is not None
+                    and cand.id in candidate_runtime
+                    and (action := candidate_runtime[cand.id].action) is not None
+                    and action.action.value in failed_actions
                 ]
                 # When oscillating/high stuck score, also flag interactable candidates so the
                 # LLM avoids re-selecting them (same sign re-read pattern).
@@ -200,9 +233,6 @@ class ContextManager:
         if recent_events:
             context["recent_events"] = recent_events
         return context
-
-    def _build_system_prompt(self, state: StructuredGameState, context: dict[str, Any]) -> str:
-        return PLANNER_SYSTEM_PROMPT
 
     def _build_goal(self, immediate_state: dict[str, Any]) -> str:
         milestone = immediate_state.get("current_milestone", {})
@@ -244,9 +274,7 @@ class ContextManager:
             "battle_kind": battle_kind,
             "step": state.step,
         }
-        dialogue_text = state.metadata.get("dialogue")
-        if not isinstance(dialogue_text, str) or not dialogue_text.strip():
-            dialogue_text = state.metadata.get("dialogue_text")
+        dialogue_text = self._get_dialogue(state)
         if isinstance(dialogue_text, str) and dialogue_text.strip():
             immediate["dialogue_text"] = dialogue_text
         if state.text_box_open:
@@ -291,14 +319,33 @@ class ContextManager:
             or battle_state.get("kind")
             or "UNKNOWN"
         )
-        enemy_level = self._coalesce(battle_state.get("opponent_level"), battle_state.get("enemy_level"))
+        enemy_level = next(
+            (value for value in (battle_state.get("opponent_level"), battle_state.get("enemy_level")) if value is not None),
+            None,
+        )
         lead = state.party[0] if state.party else None
         moves = self._battle_moves(state)
         lead_payload: dict[str, Any] = {
-            "name": self._coalesce(battle_state.get("player_active_species"), lead.name if lead else None, "UNKNOWN"),
-            "level": self._coalesce(battle_state.get("player_active_level"), lead.level if lead else None),
-            "hp": self._coalesce(battle_state.get("player_active_hp"), lead.hp if lead else None),
-            "max_hp": self._coalesce(battle_state.get("player_active_max_hp"), lead.max_hp if lead else None),
+            "name": next(
+                (
+                    value
+                    for value in (battle_state.get("player_active_species"), lead.name if lead else None, "UNKNOWN")
+                    if value is not None
+                ),
+                None,
+            ),
+            "level": next(
+                (value for value in (battle_state.get("player_active_level"), lead.level if lead else None) if value is not None),
+                None,
+            ),
+            "hp": next(
+                (value for value in (battle_state.get("player_active_hp"), lead.hp if lead else None) if value is not None),
+                None,
+            ),
+            "max_hp": next(
+                (value for value in (battle_state.get("player_active_max_hp"), lead.max_hp if lead else None) if value is not None),
+                None,
+            ),
             "status": lead.status if lead else None,
         }
         return {
@@ -322,12 +369,19 @@ class ContextManager:
         }
 
     @staticmethod
-    def _dialogue_text(state: StructuredGameState) -> str:
+    def _get_dialogue(state: StructuredGameState) -> str | None:
         text = state.metadata.get("dialogue")
         if not isinstance(text, str) or not text.strip():
             text = state.metadata.get("dialogue_text")
         if isinstance(text, str) and text.strip():
             return text.strip()
+        return None
+
+    @staticmethod
+    def _dialogue_text(state: StructuredGameState) -> str:
+        text = ContextManager._get_dialogue(state)
+        if text is not None:
+            return text
         return "dialogue text unavailable"
 
     @staticmethod
@@ -357,27 +411,10 @@ class ContextManager:
         return ("yes" in lowered and "no" in lowered) or "would you like" in lowered or "(y/n)" in lowered
 
     @staticmethod
-    def _hp_text(hp: Any, max_hp: Any) -> str:
-        if hp is None and max_hp is None:
-            return "unknown HP"
-        if hp is None:
-            return f"?/{max_hp} HP"
-        if max_hp is None:
-            return f"{hp} HP"
-        return f"{hp}/{max_hp} HP"
-
-    @staticmethod
     def _is_overworld_mode(state: StructuredGameState) -> bool:
         if state.battle_state or state.text_box_open or state.menu_open:
             return False
         return state.mode == GameMode.OVERWORLD or (state.mode == GameMode.UNKNOWN and state.navigation is not None)
-
-    @staticmethod
-    def _coalesce(*values: Any) -> Any:
-        for value in values:
-            if value is not None:
-                return value
-        return None
 
     @staticmethod
     def _battle_payload(state: StructuredGameState) -> dict[str, Any]:

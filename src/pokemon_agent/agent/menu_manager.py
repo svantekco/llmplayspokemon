@@ -9,6 +9,7 @@ from pokemon_agent.emulator.text_reader import POKEMON_RED_CHAR_MAP
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.planner import CandidateNextStep
+from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.planner import ObjectiveTarget
 from pokemon_agent.models.state import StructuredGameState
 
@@ -51,12 +52,14 @@ class MenuSnapshot:
 class MenuManager:
     def __init__(self) -> None:
         self._last_menu_type: str | None = None
+        self._runtime: dict[str, CandidateRuntime] = {}
 
     def build_candidates(
         self,
         state: StructuredGameState,
         objective_id: str,
     ) -> list[CandidateNextStep]:
+        self._runtime = {}
         if state.menu_open:
             intent = self._menu_intent(state)
             snapshot = self._detect_menu(state)
@@ -72,19 +75,23 @@ class MenuManager:
             return []
 
         hm_label = intent.required_hm or "menu target"
-        return [
-            CandidateNextStep(
-                id=f"open_start_menu_for_{self._slugify(hm_label)}",
-                type="OPEN_START_MENU_FOR_HM",
-                target=ObjectiveTarget(kind="menu", map_id=state.map_id, map_name=state.map_name, detail=hm_label),
-                why=f"{hm_label} is required on {intent.milestone.target_map_name}, so open the start menu now.",
-                priority=97,
-                expected_success_signal="The start menu opens",
-                objective_id=objective_id,
-                action=ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=f"open start menu for {hm_label}"),
-                step_budget=2,
-            )
-        ]
+        candidate = CandidateNextStep(
+            id=f"open_start_menu_for_{self._slugify(hm_label)}",
+            type="OPEN_START_MENU_FOR_HM",
+            target=ObjectiveTarget(kind="menu", map_id=state.map_id, map_name=state.map_name, detail=hm_label),
+            why=f"{hm_label} is required on {intent.milestone.target_map_name}, so open the start menu now.",
+            priority=97,
+            expected_success_signal="The start menu opens",
+            objective_id=objective_id,
+        )
+        self._runtime[candidate.id] = CandidateRuntime(
+            action=ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=f"open start menu for {hm_label}"),
+            step_budget=2,
+        )
+        return [candidate]
+
+    def runtime_map(self) -> dict[str, CandidateRuntime]:
+        return dict(self._runtime)
 
     def _build_open_menu_candidates(
         self,
@@ -395,7 +402,7 @@ class MenuManager:
     ) -> CandidateNextStep:
         action, step_budget = self._menu_action(snapshot.cursor_index, target_index)
         slug = self._slugify(label) or f"item_{target_index}"
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id=f"{candidate_type.lower()}_{slug}",
             type=candidate_type,
             target=ObjectiveTarget(kind="menu", map_id=state.map_id, map_name=state.map_name, detail=label),
@@ -403,9 +410,12 @@ class MenuManager:
             priority=priority,
             expected_success_signal=success_signal or f"The cursor moves toward {label} or {label} is confirmed",
             objective_id=objective_id,
+        )
+        self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=action, repeat=1, reason=why),
             step_budget=step_budget,
         )
+        return candidate
 
     def _close_menu_candidate(
         self,
@@ -415,7 +425,7 @@ class MenuManager:
         priority: int,
         why: str,
     ) -> CandidateNextStep:
-        return CandidateNextStep(
+        candidate = CandidateNextStep(
             id="close_menu",
             type="CLOSE_MENU",
             target=ObjectiveTarget(kind="menu", map_id=state.map_id, map_name=state.map_name, detail="close"),
@@ -423,9 +433,12 @@ class MenuManager:
             priority=priority,
             expected_success_signal="The menu closes or backs out one level",
             objective_id=objective_id,
+        )
+        self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_B, repeat=1, reason="close menu"),
             step_budget=3,
         )
+        return candidate
 
     def _detect_menu(self, state: StructuredGameState) -> MenuSnapshot:
         ui = self._ui_context(state)

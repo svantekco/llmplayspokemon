@@ -260,32 +260,17 @@ class MemoryManager:
         long_term = Objective(
             id=f"long_{milestone.id}",
             horizon=ObjectiveHorizon.LONG_TERM,
-            summary=self.memory.goals.long_term_goal,
-            priority=30,
             target=ObjectiveTarget(kind="story", map_name=milestone.target_map_name, detail=milestone.id),
-            success_conditions=self.memory.goals.success_conditions[-2:] or ["Reach a new map or story interaction"],
-            invalidation_conditions=["Story milestone changes"],
-            source="rule",
         )
         mid_term = Objective(
             id=f"mid_{milestone.id}",
             horizon=ObjectiveHorizon.MID_TERM,
-            summary=self.memory.goals.mid_term_goal,
-            priority=20,
             target=ObjectiveTarget(kind="map", map_id=state.map_id, map_name=milestone.target_map_name),
-            success_conditions=self._mid_term_success_conditions(state, progress, milestone),
-            invalidation_conditions=["Map changes", "Battle starts", "Menu or text blocks progress"],
-            source="rule",
         )
         short_term = Objective(
             id=f"short_{milestone.id}",
             horizon=ObjectiveHorizon.SHORT_TERM,
-            summary=self.memory.goals.short_term_goal,
-            priority=10,
             target=self._short_term_target(state),
-            success_conditions=self._short_term_success_conditions(state),
-            invalidation_conditions=self._short_term_invalidation_conditions(state, stuck_state),
-            source="rule",
         )
         return [long_term, mid_term, short_term]
 

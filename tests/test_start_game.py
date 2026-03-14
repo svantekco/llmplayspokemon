@@ -5,7 +5,7 @@ import os
 from argparse import Namespace
 from pathlib import Path
 
-from scripts.start_game import apply_runtime_environment, build_main_args, resolve_planner, session_is_resumable
+from pokemon_agent.main import apply_runtime_environment, build_main_args, resolve_planner, session_is_resumable
 
 
 def test_start_game_uses_resume_when_checkpoint_exists(tmp_path: Path):
@@ -22,10 +22,12 @@ def test_start_game_uses_resume_when_checkpoint_exists(tmp_path: Path):
         planner="fallback",
         session_dir=str(session_dir),
         fresh=False,
-        eval=False,
         log_mode="compact",
         window=None,
         headless=False,
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
     )
 
     main_args = build_main_args(args)
@@ -49,10 +51,12 @@ def test_start_game_does_not_resume_without_emulator_state(tmp_path: Path):
         planner="fallback",
         session_dir=str(session_dir),
         fresh=False,
-        eval=False,
         log_mode="compact",
         window=None,
         headless=False,
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
     )
 
     main_args = build_main_args(args)
@@ -86,10 +90,12 @@ def test_start_game_clears_session_when_fresh(tmp_path: Path):
         planner="fallback",
         session_dir=str(session_dir),
         fresh=True,
-        eval=False,
         log_mode="compact",
         window=None,
         headless=False,
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
     )
 
     main_args = build_main_args(args)
@@ -108,10 +114,12 @@ def test_start_game_defaults_to_visible_pyboy_window(monkeypatch):
         planner="fallback",
         session_dir=".sessions/default",
         fresh=False,
-        eval=False,
         window=None,
         headless=False,
         log_mode="compact",
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
     )
 
     window = apply_runtime_environment(args)
@@ -130,10 +138,12 @@ def test_start_game_auto_planner_uses_llm_when_key_exists(monkeypatch):
         planner="auto",
         session_dir=".sessions/default",
         fresh=False,
-        eval=False,
         window=None,
         headless=False,
         log_mode="compact",
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
     )
 
     assert resolve_planner(args) == "llm"

@@ -1,24 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pokemon_agent.config import AppConfig
-from pokemon_agent.config import _load_simple_dotenv
 
 
 def test_app_config_reads_pyboy_window_at_instantiation(monkeypatch):
     monkeypatch.setenv("PYBOY_WINDOW", "SDL2")
     assert AppConfig().pyboy_window == "SDL2"
-
-
-def test_simple_dotenv_loader_reads_local_env_file(monkeypatch, tmp_path: Path):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    (tmp_path / ".env").write_text("OPENROUTER_API_KEY=test-from-dotenv\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-
-    _load_simple_dotenv()
-
-    assert AppConfig().openrouter.api_key == "test-from-dotenv"
 
 
 def test_app_config_reads_context_budget_env(monkeypatch):

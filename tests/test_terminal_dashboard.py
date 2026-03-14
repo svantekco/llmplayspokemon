@@ -5,13 +5,10 @@ from rich.console import Console
 from pokemon_agent.agent.engine import TurnResult
 from pokemon_agent.agent.llm_client import LLMUsage
 from pokemon_agent.agent.progress import ProgressResult
-from pokemon_agent.agent.prompt_builder import PromptMetrics
 from pokemon_agent.agent.stuck_detector import StuckState
 from pokemon_agent.agent.validator import ActionValidator
-from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.progress import ProgressDetector
-from pokemon_agent.agent.prompt_builder import PromptBuilder
 from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionDecision, ActionType
@@ -64,7 +61,7 @@ def test_dashboard_renders_state_turns_and_llm_details():
                 ),
             },
         ],
-        prompt_metrics=PromptMetrics(chars=120, approx_tokens=30, compact=True),
+        prompt_metrics={"chars": 120, "approx_tokens": 30, "compact": True},
         llm_usage=LLMUsage(prompt_tokens=20, completion_tokens=10, total_tokens=30),
         llm_attempted=True,
         llm_model="openai/gpt-5-mini",
@@ -136,11 +133,10 @@ def _build_runner(emulator: MockEmulatorAdapter):
     from pokemon_agent.agent.engine import ClosedLoopRunner
 
     return ClosedLoopRunner(
-        executor=Executor(emulator),
+        emulator=emulator,
         memory=MemoryManager(),
         progress=ProgressDetector(),
         stuck=StuckDetector(),
-        prompts=PromptBuilder(),
         validator=ActionValidator(max_repeat=4),
         llm_client=None,
     )
