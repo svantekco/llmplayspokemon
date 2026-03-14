@@ -131,3 +131,7 @@ class PyBoyAdapter(EmulatorAdapter):
 
     def end_planning_wait(self) -> None:
         return None
+
+    def capture_screen_image(self):
+        image = self.pyboy.screen.image
+        return image.copy() if image is not None else None

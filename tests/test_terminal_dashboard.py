@@ -88,6 +88,10 @@ def test_dashboard_renders_state_turns_and_llm_details():
         "llm_calls": 1,
         "turns_per_call": 3.0,
         "objective_switch_rate": 0.0,
+        "short_term_goal": "Step onto the north exit tile.",
+        "mid_term_goal": "Leave Pallet Town and head toward Route 1.",
+        "long_term_goal": "Reach Viridian City and continue the opening route.",
+        "current_strategy": "Use the nearest safe path and confirm map transitions.",
     }
     dashboard.status = "Running"
 
@@ -102,9 +106,12 @@ def test_dashboard_renders_state_turns_and_llm_details():
     assert "MOVE_UP x1" in rendered
     assert "openai/gpt-5-mini" in rendered
     assert "Walk north to progress." in rendered
-    assert "ASCII Map" in rendered
-    assert "Planner Payload" in rendered
-    assert "Map Match" in rendered
+    assert "Objectives" in rendered
+    assert "Step onto the north exit tile." in rendered
+    assert "Leave Pallet Town and head toward Route 1." in rendered
+    assert "Reach Viridian City and continue the opening route." in rendered
+    assert "Planner Payload" not in rendered
+    assert "Planning State" not in rendered
 
 
 def test_dashboard_shows_fallback_note_when_no_llm_call():

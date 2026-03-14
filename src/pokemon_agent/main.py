@@ -5,6 +5,7 @@ import builtins
 import os
 import signal
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.config import AppConfig
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.emulator.pyboy_adapter import PyBoyAdapter
+from pokemon_agent.ui.debug_overlay import DebugOverlayWriter
 from pokemon_agent.ui.terminal_dashboard import TerminalDashboard
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -66,7 +68,18 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", choices=["SDL2", "OpenGL", "GLFW", "null"], default=None)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--log-mode", choices=["dashboard", "verbose", "compact", "quiet"], default="dashboard")
+    parser.add_argument("--debug-overlay", action="store_true")
+    parser.add_argument("--debug-overlay-dir", default=None)
     return parser
+
+
+def apply_default_mode(argv: list[str] | None, default_mode: str | None = None) -> list[str] | None:
+    if default_mode is None:
+        return argv
+    resolved_argv = list(sys.argv[1:] if argv is None else argv)
+    if any(arg == "--mode" or arg.startswith("--mode=") for arg in resolved_argv):
+        return resolved_argv
+    return ["--mode", default_mode, *resolved_argv]
 
 
 def session_is_resumable(session_dir: Path) -> bool:
@@ -90,7 +103,17 @@ def apply_runtime_environment(args: argparse.Namespace) -> str | None:
     return window
 
 
+def clear_pyboy_rom_sidecars(rom_path: str | Path) -> None:
+    rom_file = Path(rom_path)
+    for suffix in (".ram", ".sav"):
+        candidate = rom_file.with_suffix(rom_file.suffix + suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+
 def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
+    debug_overlay_path = getattr(args, "debug_overlay_dir", None)
+    debug_overlay_enabled = bool(getattr(args, "debug_overlay", False) or debug_overlay_path)
     session_dir = None if not args.session_dir else (REPO_ROOT / args.session_dir).resolve()
     if args.fresh and session_dir and session_dir.exists():
         shutil.rmtree(session_dir)
@@ -99,10 +122,24 @@ def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
 
     mode = args.mode
     rom = args.rom
-    if mode == "pyboy" and rom is not None:
-        rom = str((REPO_ROOT / rom).resolve())
+    if mode == "pyboy":
+        resolved_rom = str((REPO_ROOT / (rom or AppConfig().default_rom_path)).resolve())
+        if args.fresh:
+            clear_pyboy_rom_sidecars(resolved_rom)
+        if rom is not None:
+            rom = resolved_rom
     continuous = args.continuous or (session_dir is not None and not args.once)
     checkpoint_dir = str(session_dir) if session_dir is not None else args.checkpoint_dir
+    debug_overlay_dir = None
+    if debug_overlay_enabled:
+        if debug_overlay_path:
+            debug_overlay_dir = str((REPO_ROOT / debug_overlay_path).resolve())
+        elif session_dir is not None:
+            debug_overlay_dir = str((session_dir / "debug_overlay").resolve())
+        elif checkpoint_dir is not None:
+            debug_overlay_dir = str((Path(checkpoint_dir) / "debug_overlay").resolve())
+        else:
+            debug_overlay_dir = str((REPO_ROOT / ".debug_overlay").resolve())
     resume = args.resume
     if session_dir is not None:
         resume = str(session_dir) if session_is_resumable(session_dir) else None
@@ -114,6 +151,7 @@ def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
         continuous=continuous,
         planner=resolve_planner(args),
         checkpoint_dir=checkpoint_dir,
+        debug_overlay_dir=debug_overlay_dir,
         resume=resume,
         log_mode=args.log_mode,
     )
@@ -198,6 +236,7 @@ def run_args(args: argparse.Namespace) -> None:
 
     turns = args.turns or config.max_turns
     dashboard = None
+    overlay_writer = DebugOverlayWriter(args.debug_overlay_dir) if args.debug_overlay_dir else None
     if args.log_mode == "dashboard":
         dashboard = TerminalDashboard(
             planner=args.planner,
@@ -243,6 +282,8 @@ def run_args(args: argparse.Namespace) -> None:
                 dashboard.update_turn(result, runner.summary())
             else:
                 _print_turn(result, args.log_mode)
+            if overlay_writer is not None:
+                overlay_writer.write_turn(result, runner.summary())
             if args.checkpoint_dir:
                 runner.save_checkpoint(args.checkpoint_dir)
             turn_index += 1
@@ -272,9 +313,9 @@ def run_args(args: argparse.Namespace) -> None:
         emulator.close()
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None, default_mode: str | None = None) -> None:
     parser = create_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(apply_default_mode(argv, default_mode))
     window = apply_runtime_environment(args)
     main_args = build_main_args(args)
     if args.session_dir:
@@ -287,6 +328,8 @@ def main(argv: list[str] | None = None) -> None:
             print(f"PyBoy window mode: {window}")
         if main_args.continuous:
             print("Watch mode is active. Press Ctrl+C once to stop after the current turn, or twice to save and exit immediately.")
+        if main_args.debug_overlay_dir:
+            print(f"Debug overlay output: {main_args.debug_overlay_dir}")
     run_args(main_args)
 
 

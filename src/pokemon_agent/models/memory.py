@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from .action import ActionType
 from .events import EventRecord
 from .planner import Objective
+from .planner import ObjectivePlanEnvelope
 from .state import WorldCoordinate
 
 
@@ -53,6 +54,8 @@ class DiscoveredMap(BaseModel):
 
 class NavigationGoal(BaseModel):
     target_map_name: str
+    target_landmark_id: str | None = None
+    target_landmark_type: str | None = None
     source: str = "objective"
     objective_kind: str = "reach_boundary_side"
     engine_mode: str = "progression"
@@ -82,6 +85,7 @@ class LongTermKnowledge(BaseModel):
     heuristics: list[str] = Field(default_factory=list)
     world_map: WorldMapMemory = Field(default_factory=WorldMapMemory)
     navigation_goal: NavigationGoal | None = None
+    objective_plan: ObjectivePlanEnvelope | None = None
 
 
 class MemoryState(BaseModel):

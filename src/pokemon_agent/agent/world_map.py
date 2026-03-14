@@ -16,6 +16,7 @@ from pokemon_agent.models.state import StructuredGameState
 from pokemon_agent.models.state import WorldCoordinate
 from pokemon_agent.agent.navigation import is_real_map_edge
 from pokemon_agent.agent.navigation import visible_boundary_side
+from pokemon_agent.navigation.world_graph import load_world_graph
 
 MOVE_TO_SIDE: dict[ActionType, str] = {
     ActionType.MOVE_UP: "north",
@@ -41,6 +42,7 @@ OPPOSITE_SIDE = {
     "south": "north",
     "west": "east",
 }
+_STATIC_WORLD_GRAPH = load_world_graph()
 
 
 def observe_state(world_map: WorldMapMemory, state: StructuredGameState) -> None:
@@ -48,8 +50,17 @@ def observe_state(world_map: WorldMapMemory, state: StructuredGameState) -> None
         return
 
     discovered_map = ensure_discovered_map(world_map, state.map_name, state.map_id, state.step)
-    discovered_map.walkable = _merge_coordinates(discovered_map.walkable, state.navigation.walkable)
-    discovered_map.blocked = _merge_coordinates(discovered_map.blocked, state.navigation.blocked)
+    walkable_updates, blocked_updates = _normalize_navigation_coordinates(state.navigation)
+    walkable_keys = {(coordinate.x, coordinate.y) for coordinate in walkable_updates}
+    blocked_keys = {(coordinate.x, coordinate.y) for coordinate in blocked_updates}
+    discovered_map.walkable = _merge_coordinates(
+        _filter_coordinates(discovered_map.walkable, remove_keys=blocked_keys),
+        walkable_updates,
+    )
+    discovered_map.blocked = _merge_coordinates(
+        _filter_coordinates(discovered_map.blocked, remove_keys=walkable_keys),
+        blocked_updates,
+    )
     discovered_map.last_seen_step = state.step
     _detect_connectors(world_map, discovered_map, state.navigation, state.step)
 
@@ -90,21 +101,22 @@ def confirm_transition(
     delta = MOVE_DELTAS.get(action.action)
     source_x = None if previous.x is None or delta is None else previous.x + delta[0]
     source_y = None if previous.y is None or delta is None else previous.y + delta[1]
+    kind, connector_side = _transition_connector_spec(previous.map_id or previous.map_name, side, source_x, source_y)
 
     connector = _match_connector(
         world_map,
         source_map=previous.map_name,
-        side=side,
+        side=connector_side,
         source_x=source_x,
         source_y=source_y,
     )
     if connector is None:
         connector = _create_connector(
             source_map=previous.map_name,
-            side=side,
+            side=connector_side,
             source_x=source_x,
             source_y=source_y,
-            kind=_kind_for_transition(side, source_x, source_y),
+            kind=kind,
             step=current.step,
         )
         _register_connector(world_map, previous_map, connector)
@@ -119,8 +131,8 @@ def confirm_transition(
     connector.confirmed_step = current.step
     if connector.discovered_step is None:
         connector.discovered_step = current.step
-    if side and connector.source_side is None:
-        connector.source_side = side
+    if connector_side and connector.source_side is None:
+        connector.source_side = connector_side
     if source_x is not None and connector.source_x is None:
         connector.source_x = source_x
     if source_y is not None and connector.source_y is None:
@@ -267,12 +279,24 @@ def _detect_connectors(
     navigation: NavigationSnapshot,
     step: int,
 ) -> None:
-    walkable = {(coord.x, coord.y) for coord in navigation.walkable}
-    blocked = {(coord.x, coord.y) for coord in navigation.blocked}
+    walkable_updates, blocked_updates = _normalize_navigation_coordinates(navigation)
+    walkable = {(coord.x, coord.y) for coord in walkable_updates}
+    blocked = {(coord.x, coord.y) for coord in blocked_updates}
+    canonical_warp_tiles, canonical_boundary_sides = _canonical_connector_hints(discovered_map.map_id or discovered_map.map_name)
+    if canonical_warp_tiles or canonical_boundary_sides:
+        _prune_invalid_suspected_connectors(
+            world_map,
+            discovered_map,
+            canonical_warp_tiles=canonical_warp_tiles,
+            canonical_boundary_sides=canonical_boundary_sides,
+        )
 
     for side, coordinate in _boundary_connectors(navigation):
         if not is_real_map_edge(navigation, side):
             continue
+        if canonical_warp_tiles or canonical_boundary_sides:
+            if side not in canonical_boundary_sides:
+                continue
         connector = _create_connector(
             source_map=discovered_map.map_name,
             side=side,
@@ -284,9 +308,24 @@ def _detect_connectors(
         _register_connector(world_map, discovered_map, connector)
 
     for blocked_x, blocked_y in blocked:
-        side = _boundary_side(navigation, blocked_x, blocked_y)
         walkable_neighbors = _adjacent_walkable_count(blocked_x, blocked_y, walkable)
-        if side is not None and is_real_map_edge(navigation, side) and walkable_neighbors > 0:
+        if walkable_neighbors <= 0:
+            continue
+        if canonical_warp_tiles or canonical_boundary_sides:
+            if (blocked_x, blocked_y) not in canonical_warp_tiles:
+                continue
+            connector = _create_connector(
+                source_map=discovered_map.map_name,
+                side=None,
+                source_x=blocked_x,
+                source_y=blocked_y,
+                kind="warp",
+                step=step,
+            )
+            _register_connector(world_map, discovered_map, connector)
+            continue
+        side = _boundary_side(navigation, blocked_x, blocked_y)
+        if side is not None and is_real_map_edge(navigation, side):
             connector = _create_connector(
                 source_map=discovered_map.map_name,
                 side=side,
@@ -296,7 +335,7 @@ def _detect_connectors(
                 step=step,
             )
             _register_connector(world_map, discovered_map, connector)
-        elif walkable_neighbors > 0 and _blocked_neighbor_count(blocked_x, blocked_y, blocked) <= 1:
+        elif _blocked_neighbor_count(blocked_x, blocked_y, blocked) <= 1:
             connector = _create_connector(
                 source_map=discovered_map.map_name,
                 side=None,
@@ -399,7 +438,7 @@ def _build_reverse_connector(connector: DiscoveredConnector, current: Structured
     if connector.destination_map is None or connector.approach_x is None or connector.approach_y is None:
         return None
     reverse_action = OPPOSITE_ACTION.get(connector.transition_action) if connector.transition_action is not None else None
-    reverse_side = OPPOSITE_SIDE.get(connector.source_side or "") or None
+    reverse_side = None if connector.kind == "warp" else OPPOSITE_SIDE.get(connector.source_side or "") or None
     reverse = DiscoveredConnector(
         id=_connector_id(current.map_name, reverse_side, current.x, current.y),
         source_map=current.map_name,
@@ -436,6 +475,23 @@ def _merge_coordinates(
     return [merged[key] for key in sorted(merged.keys(), key=lambda item: (item[1], item[0]))]
 
 
+def _normalize_navigation_coordinates(
+    navigation: NavigationSnapshot,
+) -> tuple[list[WorldCoordinate], list[WorldCoordinate]]:
+    walkable = _merge_coordinates([], navigation.walkable)
+    walkable_keys = {(coordinate.x, coordinate.y) for coordinate in walkable}
+    blocked = _filter_coordinates(_merge_coordinates([], navigation.blocked), remove_keys=walkable_keys)
+    return walkable, blocked
+
+
+def _filter_coordinates(
+    coordinates: list[WorldCoordinate],
+    *,
+    remove_keys: set[tuple[int, int]],
+) -> list[WorldCoordinate]:
+    return [coordinate for coordinate in coordinates if (coordinate.x, coordinate.y) not in remove_keys]
+
+
 def _boundary_side(navigation: NavigationSnapshot, x: int, y: int) -> str | None:
     return visible_boundary_side(navigation, x, y)
 
@@ -462,6 +518,67 @@ def _kind_for_transition(side: str | None, source_x: int | None, source_y: int |
     if source_x is not None and source_y is not None:
         return "door"
     return "unknown"
+
+
+def _transition_connector_spec(
+    map_ref: int | str | None,
+    side: str | None,
+    source_x: int | None,
+    source_y: int | None,
+) -> tuple[str, str | None]:
+    if source_x is not None and source_y is not None and _STATIC_WORLD_GRAPH.get_warp_at(map_ref, source_x, source_y) is not None:
+        return "warp", None
+    return _kind_for_transition(side, source_x, source_y), side
+
+
+def _canonical_connector_hints(map_ref: int | str | None) -> tuple[set[tuple[int, int]], set[str]]:
+    warp_tiles: set[tuple[int, int]] = set()
+    boundary_sides: set[str] = set()
+    for edge in _STATIC_WORLD_GRAPH.neighbors(map_ref):
+        if edge.kind == "warp" and edge.x is not None and edge.y is not None:
+            warp_tiles.add((edge.x, edge.y))
+        elif edge.direction:
+            boundary_sides.add(edge.direction)
+    return warp_tiles, boundary_sides
+
+
+def _prune_invalid_suspected_connectors(
+    world_map: WorldMapMemory,
+    discovered_map: DiscoveredMap,
+    *,
+    canonical_warp_tiles: set[tuple[int, int]],
+    canonical_boundary_sides: set[str],
+) -> None:
+    valid_connector_ids: list[str] = []
+    for connector_id in discovered_map.connectors:
+        connector = world_map.connectors.get(connector_id)
+        if connector is None:
+            continue
+        if connector.status == ConnectorStatus.CONFIRMED:
+            valid_connector_ids.append(connector_id)
+            continue
+        if _connector_matches_canonical_hints(
+            connector,
+            canonical_warp_tiles=canonical_warp_tiles,
+            canonical_boundary_sides=canonical_boundary_sides,
+        ):
+            valid_connector_ids.append(connector_id)
+            continue
+        world_map.connectors.pop(connector_id, None)
+    discovered_map.connectors = valid_connector_ids
+
+
+def _connector_matches_canonical_hints(
+    connector: DiscoveredConnector,
+    *,
+    canonical_warp_tiles: set[tuple[int, int]],
+    canonical_boundary_sides: set[str],
+) -> bool:
+    if connector.kind == "boundary":
+        return connector.source_side in canonical_boundary_sides
+    if connector.source_x is not None and connector.source_y is not None:
+        return (connector.source_x, connector.source_y) in canonical_warp_tiles
+    return False
 
 
 def _kind_rank(kind: str) -> int:

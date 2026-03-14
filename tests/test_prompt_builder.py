@@ -3,7 +3,13 @@ import json
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.emulator.screen_renderer import build_ascii_map
-from pokemon_agent.models.planner import CandidateNextStep, Objective, ObjectiveHorizon, ObjectiveTarget
+from pokemon_agent.models.planner import CandidateNextStep
+from pokemon_agent.models.planner import HumanObjectivePlan
+from pokemon_agent.models.planner import InternalObjectivePlan
+from pokemon_agent.models.planner import Objective
+from pokemon_agent.models.planner import ObjectiveHorizon
+from pokemon_agent.models.planner import ObjectivePlanEnvelope
+from pokemon_agent.models.planner import ObjectiveTarget
 from pokemon_agent.models.state import GameMode, NavigationSnapshot, StructuredGameState, WorldCoordinate
 
 
@@ -83,12 +89,12 @@ def test_prompt_builder_serializes_current_game_area_ascii_map():
     memory = MemoryManager()
     context_manager = ContextManager()
     game_area = [[0 for _ in range(20)] for _ in range(18)]
-    collision_area = [[0 for _ in range(20)] for _ in range(18)]
+    collision_area = [[1 for _ in range(20)] for _ in range(18)]
     for row in (3, 4):
         for col in (3, 4):
             game_area[row][col] = 99
-            collision_area[row][col] = 1
-    collision_area[7][0] = 1
+            collision_area[row][col] = 0
+    collision_area[7][0] = 0
 
     state = StructuredGameState(
         map_name="Viridian City",
@@ -115,3 +121,34 @@ def test_prompt_builder_serializes_current_game_area_ascii_map():
     payload = json.loads(messages[1]["content"])
 
     assert payload["context"]["overworld_context"]["visual_map"] == build_ascii_map(state)
+
+
+def test_prompt_builder_builds_objective_planner_snapshot():
+    memory = MemoryManager()
+    memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Move toward Oak's Lab",
+            mid_term_goal="Leave the house and cross Pallet Town.",
+            long_term_goal="Collect your starter Pokemon from Professor Oak.",
+            current_strategy="Keep the plan symbolic.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Oak's Lab",
+            success_signal="Enter Oak's Lab",
+            confidence=0.9,
+            notes="Existing plan.",
+        ),
+        valid_for_milestone_id="get_starter",
+        valid_for_map_name="Red's House 2F",
+    )
+    context_manager = ContextManager()
+    state = StructuredGameState(map_name="Red's House 2F", map_id=0x25, x=3, y=3, mode=GameMode.OVERWORLD)
+
+    snapshot = context_manager.build_objective_snapshot(state, memory.memory, replan_reason="missing_plan")
+    payload = json.loads(build_messages(snapshot)[1]["content"])
+
+    assert "human_plan" in payload["response_schema"]
+    assert payload["context"]["planner_kind"] == "objective"
+    assert payload["context"]["replan_reason"] == "missing_plan"
+    assert payload["context"]["current_objective_plan"]["internal_plan"]["target_map_name"] == "Oak's Lab"

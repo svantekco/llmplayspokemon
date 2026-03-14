@@ -12,18 +12,18 @@ from pokemon_agent.models.state import GameMode, NavigationSnapshot, PartyMember
 
 def _screen_grids() -> tuple[list[list[int]], list[list[int]]]:
     game_area = [[0 for _ in range(20)] for _ in range(18)]
-    collision_area = [[0 for _ in range(20)] for _ in range(18)]
+    collision_area = [[1 for _ in range(20)] for _ in range(18)]
 
     for row in (4, 5):
         for col in (4, 5):
             game_area[row][col] = 99
-            collision_area[row][col] = 1
+            collision_area[row][col] = 0
 
-    collision_area[8][6] = 1
-    collision_area[8][8] = 1
-    collision_area[9][0] = 1
-    collision_area[10][14] = 1
-    collision_area[10][15] = 1
+    collision_area[8][6] = 0
+    collision_area[8][8] = 0
+    collision_area[9][0] = 0
+    collision_area[10][14] = 0
+    collision_area[10][15] = 0
     return game_area, collision_area
 
 

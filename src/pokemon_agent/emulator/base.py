@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from pathlib import Path
 import time
+from typing import Any
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.state import StructuredGameState
 
@@ -44,4 +45,7 @@ class EmulatorAdapter(ABC):
         time.sleep(0.01)
 
     def end_planning_wait(self) -> None:
+        return None
+
+    def capture_screen_image(self) -> Any | None:
         return None

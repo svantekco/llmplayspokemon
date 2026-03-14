@@ -119,9 +119,8 @@ def test_state_extractor_marks_early_zero_coords_as_bootstrap():
 
 def test_state_extractor_exposes_symbolic_ram_context():
     game_area = np.full((18, 20), 383, dtype=np.uint32)
-    collision_area = np.zeros((18, 20), dtype=np.uint32)
-    collision_area[6][3] = 1
-    collision_area[6][4] = 1
+    collision_area = np.ones((18, 20), dtype=np.uint32)
+    collision_area[8:10, 8:10] = 0
     memory = {
         FIELD_MAP["options"].address: 0x01,
         FIELD_MAP["obtained_badges"].address: 0b00000011,
@@ -198,12 +197,13 @@ def test_state_extractor_exposes_symbolic_ram_context():
     assert state.navigation.player.x == 3
     assert state.navigation.player.y == 6
     assert state.navigation.min_x == 0
-    assert state.navigation.min_y == 0
+    assert state.navigation.min_y == 2
     assert len(state.game_area or []) == 18
     assert len((state.game_area or [])[0]) == 20
     assert state.collision_area is not None
-    assert state.collision_area[6][3] == 1
-    assert any(tile.x == 3 and tile.y == 6 for tile in state.navigation.blocked)
+    assert state.collision_area[8][8] == 0
+    assert any(tile.x == 3 and tile.y == 6 for tile in state.navigation.walkable)
+    assert any(tile.x == 4 and tile.y == 6 for tile in state.navigation.blocked)
 
 
 def test_state_extractor_uses_expanded_map_name_table():

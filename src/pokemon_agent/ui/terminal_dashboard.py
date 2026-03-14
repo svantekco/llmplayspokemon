@@ -265,10 +265,10 @@ class TerminalDashboard:
             summary.add_row("Usage", usage, "Nav", self._format_navigation(turn))
         else:
             summary.add_row("Usage", "n/a", "Nav", self._format_navigation(turn))
-        summary.add_row("State Map", self._presence_label(planning_map), "Prompt Map", self._presence_label(prompt_map))
-        summary.add_row("Map Match", self._map_match_label(planning_map, prompt_map), "Prompt Sent", self._yes_no(turn.llm_attempted))
+        summary.add_row("Prompt Map", self._presence_label(prompt_map), "Prompt Sent", self._yes_no(turn.llm_attempted))
+        summary.add_row("Short Goal", self._truncate_inline(self.summary.get("short_term_goal", "n/a"), 40), "Map Match", self._map_match_label(planning_map, prompt_map))
 
-        map_panel = self._render_prompt_map_panel(planning_map, prompt_map)
+        objectives_panel = self._render_objectives_panel()
 
         request_table = Table(expand=True, box=box.SIMPLE, show_header=True, header_style="bold yellow")
         request_table.add_column("Role", width=10, no_wrap=True)
@@ -300,7 +300,7 @@ class TerminalDashboard:
         body = Group(
             summary,
             Rule(style="dim"),
-            map_panel,
+            objectives_panel,
             Rule(style="dim"),
             Text("Request", style="bold yellow"),
             request_table,
@@ -428,30 +428,31 @@ class TerminalDashboard:
             return "n/a"
         return f"visible {len(turn.after.navigation.walkable)} walkable"
 
-    @classmethod
-    def _render_prompt_map_panel(cls, planning_map: str | None, prompt_map: str | None) -> Panel:
-        if planning_map is None and prompt_map is None:
-            message = Text("No overworld ASCII map was available for this turn.", style="dim")
-            return Panel(message, title="ASCII Map", border_style="cyan")
-
-        table = Table.grid(expand=True, padding=(0, 2))
-        table.add_column(ratio=1)
-        table.add_column(ratio=1)
-        table.add_row(
-            Text("Planning State", style="bold cyan"),
-            Text("Planner Payload", style="bold yellow"),
-        )
-        table.add_row(
-            cls._render_ascii_block(planning_map),
-            cls._render_ascii_block(prompt_map),
-        )
-        return Panel(table, title="ASCII Map", border_style="cyan")
-
     @staticmethod
     def _render_ascii_block(value: str | None) -> Text:
         if not value:
             return Text("n/a", style="dim")
         return Text(value)
+
+    def _render_objectives_panel(self) -> Panel:
+        objectives = [
+            ("Short-term", self.summary.get("short_term_goal")),
+            ("Mid-term", self.summary.get("mid_term_goal")),
+            ("Long-term", self.summary.get("long_term_goal")),
+        ]
+        if not any(text for _, text in objectives):
+            message = Text("Objectives will appear here once goal memory is available.", style="dim")
+            return Panel(message, title="Objectives", border_style="cyan")
+
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="bold cyan", no_wrap=True)
+        table.add_column(ratio=1)
+        for label, value in objectives:
+            table.add_row(label, value or "n/a")
+
+        strategy = self.summary.get("current_strategy")
+        subtitle = self._truncate_inline(str(strategy), 120) if strategy else None
+        return Panel(table, title="Objectives", subtitle=subtitle, border_style="cyan")
 
     @classmethod
     def _extract_prompt_visual_map(cls, messages: list[dict[str, Any]]) -> str | None:

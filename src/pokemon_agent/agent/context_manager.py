@@ -15,17 +15,47 @@ from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import CandidateRuntime
+from pokemon_agent.models.planner import ObjectivePlanEnvelope
 from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import StructuredGameState
+from pokemon_agent.navigation.world_graph import load_world_graph
 
 RESPONSE_SCHEMA = {
     "candidate_id": "<exact id from candidate_next_steps>",
+}
+OBJECTIVE_RESPONSE_SCHEMA = {
+    "human_plan": {
+        "short_term_goal": "<string>",
+        "mid_term_goal": "<string>",
+        "long_term_goal": "<string>",
+        "current_strategy": "<string>",
+    },
+    "internal_plan": {
+        "plan_type": "<go_to_map|go_to_landmark|interact_story_npc|advance_dialogue|resolve_menu|battle_default|recover>",
+        "target_map_name": "<string|null>",
+        "target_landmark_id": "<string|null>",
+        "target_landmark_type": "<string|null>",
+        "target_npc_hint": "<string|null>",
+        "success_signal": "<string|null>",
+        "stop_when": "<string|null>",
+        "confidence": "<float|null>",
+        "notes": "<string|null>",
+    },
 }
 PLANNER_SYSTEM_PROMPT = (
     "You control a Pokémon Red agent. Select exactly one id from candidate_next_steps. "
     "Obey mode and local_objective. Prefer the highest-priority candidate that advances the target. "
     "Never choose a blacklisted candidate. Use the dialogue only to resolve ambiguous yes/no choices. "
     'Return exactly {"candidate_id":"<id>"}. No markdown. No extra keys.'
+)
+OBJECTIVE_PLANNER_SYSTEM_PROMPT = (
+    "You are the objective planner for a Pokémon Red agent. "
+    "Return a human_plan plus an internal_plan. "
+    "The internal_plan must stay symbolic: choose objective type, target map, landmark, or NPC hint only. "
+    "Do not return buttons, tile routes, connector ids, or exact movement sequences as authority. "
+    "Prefer plans the engine can compile deterministically from the connector table and world graph. "
+    "If dialogue or menus are already open, return the matching non-navigation plan type. "
+    "Return exactly one JSON object matching response_schema. No markdown."
 )
 
 
@@ -118,6 +148,7 @@ class ContextManager:
         self.action_window = action_window
         self.event_window = event_window
         self.action_traces: list[ActionTrace] = []
+        self.static_world_graph = load_world_graph()
 
     def build_snapshot(
         self,
@@ -128,22 +159,24 @@ class ContextManager:
         candidate_runtime: dict[str, CandidateRuntime] | None = None,
     ) -> ContextSnapshot:
         context = self._build_context(state, memory_state, stuck_state, candidate_next_steps, candidate_runtime)
-        system_prompt = PLANNER_SYSTEM_PROMPT
-        payload = {
-            "context": context,
-            "response_schema": copy.deepcopy(RESPONSE_SCHEMA),
-        }
-        dropped_sections: list[str] = []
-        self._prune_to_budget(payload, dropped_sections, system_prompt)
-        section_tokens = self._measure_sections(payload, system_prompt)
-        return ContextSnapshot(
-            system_prompt=system_prompt,
-            payload=payload,
-            budget_tokens=self.budget_tokens,
-            used_tokens=self._measure_total_tokens(system_prompt, payload),
-            section_tokens=section_tokens,
-            dropped_sections=dropped_sections,
-        )
+        return self._finalize_snapshot(context, PLANNER_SYSTEM_PROMPT, RESPONSE_SCHEMA)
+
+    def build_objective_snapshot(
+        self,
+        state: StructuredGameState,
+        memory_state: MemoryState,
+        stuck_state: StuckState | None = None,
+        replan_reason: str | None = None,
+    ) -> ContextSnapshot:
+        context = self._build_context(state, memory_state, stuck_state, candidate_next_steps=None, candidate_runtime=None)
+        objective_context = dict(context)
+        objective_context["planner_kind"] = "objective"
+        if replan_reason:
+            objective_context["replan_reason"] = replan_reason
+        objective_plan = self._serialize_objective_plan(memory_state.long_term.objective_plan)
+        if objective_plan is not None:
+            objective_context["current_objective_plan"] = objective_plan
+        return self._finalize_snapshot(objective_context, OBJECTIVE_PLANNER_SYSTEM_PROMPT, OBJECTIVE_RESPONSE_SCHEMA)
 
     def record_turn(
         self,
@@ -182,6 +215,28 @@ class ContextManager:
     def restore_state(self, payload: dict[str, Any] | None) -> None:
         traces = [] if payload is None else payload.get("action_traces", [])
         self.action_traces = [ActionTrace.from_payload(item) for item in traces][-self.action_window :]
+
+    def _finalize_snapshot(
+        self,
+        context: dict[str, Any],
+        system_prompt: str,
+        response_schema: dict[str, Any],
+    ) -> ContextSnapshot:
+        payload = {
+            "context": context,
+            "response_schema": copy.deepcopy(response_schema),
+        }
+        dropped_sections: list[str] = []
+        self._prune_to_budget(payload, dropped_sections, system_prompt)
+        section_tokens = self._measure_sections(payload, system_prompt)
+        return ContextSnapshot(
+            system_prompt=system_prompt,
+            payload=payload,
+            budget_tokens=self.budget_tokens,
+            used_tokens=self._measure_total_tokens(system_prompt, payload),
+            section_tokens=section_tokens,
+            dropped_sections=dropped_sections,
+        )
 
     def _build_context(
         self,
@@ -285,6 +340,8 @@ class ContextManager:
         return {
             "kind": goal.objective_kind,
             "target_map": goal.target_map_name,
+            "target_landmark_id": goal.target_landmark_id,
+            "target_landmark_type": goal.target_landmark_type,
             "current_map": goal.current_map_name,
             "engine_mode": goal.engine_mode,
             "next_map": goal.next_map_name,
@@ -331,10 +388,61 @@ class ContextManager:
             state.map_name,
             memory_state.long_term.navigation_goal,
         )
+        canonical_navigation = self._build_canonical_navigation(state, memory_state)
         return {
             "visual_map": visual_map,
             "map_legend": "P=player .=walkable #=blocked ~=water @=isolated blocker D=door",
+            "canonical_navigation": canonical_navigation,
             **route_info,
+        }
+
+    def _build_canonical_navigation(self, state: StructuredGameState, memory_state: MemoryState) -> dict[str, Any]:
+        goal = memory_state.long_term.navigation_goal
+        current_map = self.static_world_graph.get_map_by_id(state.map_id)
+        if current_map is None:
+            current_map = self.static_world_graph.get_map_by_name(state.map_name)
+        current_map_symbol = None if current_map is None else current_map.symbol
+        target_map_symbol = None
+        target_landmark_payload = None
+        route_summary = None
+        neighbors: list[str] = []
+        nearest_pokecenter = None
+
+        if current_map is not None:
+            neighbor_symbols = [
+                edge.destination_symbol
+                for edge in self.static_world_graph.neighbors(current_map.symbol)
+                if edge.destination_symbol is not None
+            ]
+            deduped_neighbors = list(dict.fromkeys(neighbor_symbols))
+            neighbors = deduped_neighbors[:6]
+            pokecenter = self.static_world_graph.nearest_landmark(current_map.symbol, "pokecenter")
+            if pokecenter is not None:
+                nearest_pokecenter = {
+                    "landmark_id": pokecenter.landmark.id,
+                    "map": pokecenter.landmark.map_symbol,
+                }
+
+        if goal is not None:
+            target_map_symbol = self.static_world_graph.canonical_symbol(goal.target_map_name) or goal.target_map_name
+            target_landmark = self.static_world_graph.get_landmark(goal.target_landmark_id)
+            if target_landmark is not None:
+                target_landmark_payload = {
+                    "id": target_landmark.id,
+                    "map": target_landmark.map_symbol,
+                    "type": target_landmark.type,
+                }
+            if current_map is not None:
+                route = self.static_world_graph.find_route(current_map.symbol, goal.target_map_name)
+                route_summary = None if route is None else route.summary()[:8]
+
+        return {
+            "current_map": current_map_symbol or state.map_name,
+            "current_map_neighbors": neighbors,
+            "nearest_pokecenter": nearest_pokecenter,
+            "route_summary": route_summary,
+            "target_landmark": target_landmark_payload,
+            "target_map": target_map_symbol,
         }
 
     def _build_dialogue_context(self, state: StructuredGameState) -> dict[str, Any]:
@@ -490,6 +598,12 @@ class ContextManager:
     def _serialize_candidate(self, candidate: CandidateNextStep) -> dict[str, Any]:
         payload = candidate.model_dump(mode="json", exclude_none=True)
         return payload
+
+    @staticmethod
+    def _serialize_objective_plan(plan: ObjectivePlanEnvelope | None) -> dict[str, Any] | None:
+        if plan is None:
+            return None
+        return plan.model_dump(mode="json", exclude_none=True)
 
     def _build_stuck_warning(self, stuck_state: StuckState | None) -> dict[str, Any] | None:
         if stuck_state is None or stuck_state.score < 2:

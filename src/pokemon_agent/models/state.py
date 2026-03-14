@@ -77,6 +77,8 @@ class NavigationSnapshot(BaseModel):
     map_width: int | None = None
     map_height: int | None = None
     visible_world_edges: list[str] = Field(default_factory=list)
+    screen_origin_x: int | None = None
+    screen_origin_y: int | None = None
 
 
 class StructuredGameState(BaseModel):

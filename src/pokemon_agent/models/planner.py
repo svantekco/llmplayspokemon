@@ -29,6 +29,41 @@ class Objective(BaseModel):
     target: ObjectiveTarget | None = None
 
 
+class ObjectivePlanStatus(str, Enum):
+    ACTIVE = "active"
+    STALE = "stale"
+    INVALID = "invalid"
+
+
+class HumanObjectivePlan(BaseModel):
+    short_term_goal: str
+    mid_term_goal: str
+    long_term_goal: str
+    current_strategy: str
+
+
+class InternalObjectivePlan(BaseModel):
+    plan_type: str
+    target_map_name: str | None = None
+    target_landmark_id: str | None = None
+    target_landmark_type: str | None = None
+    target_npc_hint: str | None = None
+    success_signal: str | None = None
+    stop_when: str | None = None
+    confidence: float | None = None
+    notes: str | None = None
+
+
+class ObjectivePlanEnvelope(BaseModel):
+    human_plan: HumanObjectivePlan
+    internal_plan: InternalObjectivePlan
+    status: ObjectivePlanStatus = ObjectivePlanStatus.ACTIVE
+    generated_at_step: int | None = None
+    valid_for_milestone_id: str | None = None
+    valid_for_map_name: str | None = None
+    replan_reason: str | None = None
+
+
 @dataclass(slots=True)
 class CandidateRuntime:
     action: ActionDecision | None = None

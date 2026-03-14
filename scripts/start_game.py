@@ -12,4 +12,4 @@ if str(SRC_ROOT) not in sys.path:
 if __name__ == "__main__":
     from pokemon_agent.main import main
 
-    main()
+    main(default_mode="pyboy")

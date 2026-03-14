@@ -97,7 +97,7 @@ def _value_at(grid, row: int, col: int, default: int = 0) -> int:
 
 
 def _is_blocked(collision_area, row: int, col: int) -> bool:
-    return _value_at(collision_area, row, col, default=0) != 0
+    return _value_at(collision_area, row, col, default=0) == 0
 
 
 def _blocked_neighbor_count(row: int, col: int, blocked: list[list[bool]]) -> int:
