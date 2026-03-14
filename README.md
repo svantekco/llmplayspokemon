@@ -84,7 +84,7 @@ python -m pokemon_agent.main --mode pyboy --rom path/to/PokemonRed.gb
 
 ## Start or resume a local session
 
-This launcher starts PyBoy with `game.gb` by default and automatically resumes from an existing checkpoint if the session directory already contains one.
+This launcher starts PyBoy with `game.gb` by default and automatically resumes from an existing checkpoint when the session directory contains both the agent checkpoint and the PyBoy emulator save state.
 
 ```bash
 python3 scripts/start_game.py --session-dir .sessions/default
@@ -101,6 +101,8 @@ Use mock mode for quick smoke tests:
 ```bash
 python3 scripts/start_game.py --mode mock --session-dir .sessions/mock --turns 2
 ```
+
+In continuous watch mode, press `Ctrl-C` once to stop after the current turn, or press `Ctrl-C` twice to save the current checkpoint plus PyBoy state and exit immediately. Starting the same session directory again will resume from both saved states.
 
 ## Important note
 

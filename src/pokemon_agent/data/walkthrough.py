@@ -18,6 +18,7 @@ class Milestone:
     sub_steps: list[str]
     required_hms: list[str]
     next_milestone_id: str | None
+    completion_map_name: str | None = None  # for milestones with no flag/item
 
 
 MILESTONES: tuple[Milestone, ...] = (
@@ -111,6 +112,7 @@ MILESTONES: tuple[Milestone, ...] = (
         ],
         required_hms=[],
         next_milestone_id="gym1_brock",
+        completion_map_name="Pewter City",
     ),
     Milestone(
         id="gym1_brock",
@@ -157,6 +159,7 @@ MILESTONES: tuple[Milestone, ...] = (
         ],
         required_hms=[],
         next_milestone_id="gym2_misty",
+        completion_map_name="Cerulean City",
     ),
     Milestone(
         id="gym2_misty",
@@ -270,6 +273,7 @@ MILESTONES: tuple[Milestone, ...] = (
         ],
         required_hms=["Flash"],
         next_milestone_id="celadon_city",
+        completion_map_name="Lavender Town",
     ),
     Milestone(
         id="celadon_city",
@@ -293,6 +297,7 @@ MILESTONES: tuple[Milestone, ...] = (
         ],
         required_hms=[],
         next_milestone_id="gym4_erika",
+        completion_map_name="Celadon City",
     ),
     Milestone(
         id="gym4_erika",
@@ -530,6 +535,7 @@ MILESTONES: tuple[Milestone, ...] = (
         ],
         required_hms=["Strength"],
         next_milestone_id="elite_four_champion",
+        completion_map_name="Indigo Plateau",
     ),
     Milestone(
         id="elite_four_champion",
@@ -611,7 +617,7 @@ def get_current_milestone(
 ) -> Milestone:
     flag_set = {flag for flag in active_flags if flag}
     inventory_index = build_progress_inventory_names(inventory_names, badges)
-    first_incomplete = _first_incomplete_index(flag_set, inventory_index)
+    first_incomplete = _first_incomplete_index(flag_set, inventory_index, current_map_name)
     if first_incomplete >= len(MILESTONES):
         return MILESTONES[-1]
     active_index = _resolve_active_index(
@@ -631,7 +637,7 @@ def get_progress_summary(
 ) -> str:
     flag_set = {flag for flag in active_flags if flag}
     inventory_index = build_progress_inventory_names(inventory_names, badges)
-    first_incomplete = _first_incomplete_index(flag_set, inventory_index)
+    first_incomplete = _first_incomplete_index(flag_set, inventory_index, current_map_name)
     if first_incomplete >= len(MILESTONES):
         completed = len(MILESTONES)
     elif current_map_name:
@@ -650,19 +656,23 @@ def milestone_for_completion_flag(flag: str) -> Milestone | None:
     return MILESTONES_BY_COMPLETION_FLAG.get(flag)
 
 
-def _first_incomplete_index(active_flags: set[str], inventory_index: set[str]) -> int:
+def _first_incomplete_index(
+    active_flags: set[str],
+    inventory_index: set[str],
+    current_map_name: str | None = None,
+) -> int:
     highest_explicit_completion = max(
         (
             index
             for index, milestone in enumerate(MILESTONES)
-            if _is_complete(milestone, active_flags, inventory_index)
+            if _is_complete(milestone, active_flags, inventory_index, current_map_name)
         ),
         default=-1,
     )
     for index, milestone in enumerate(MILESTONES):
-        if milestone.completion_flag is None and milestone.completion_item is None and index < highest_explicit_completion:
+        if milestone.completion_flag is None and milestone.completion_item is None and milestone.completion_map_name is None and index < highest_explicit_completion:
             continue
-        if not _is_complete(milestone, active_flags, inventory_index):
+        if not _is_complete(milestone, active_flags, inventory_index, current_map_name):
             return index
     return len(MILESTONES)
 
@@ -686,12 +696,19 @@ def _resolve_active_index(
     return best_index
 
 
-def _is_complete(milestone: Milestone, active_flags: set[str], inventory_index: set[str]) -> bool:
+def _is_complete(
+    milestone: Milestone,
+    active_flags: set[str],
+    inventory_index: set[str],
+    current_map_name: str | None = None,
+) -> bool:
     checks: list[bool] = []
     if milestone.completion_flag is not None:
         checks.append(milestone.completion_flag in active_flags)
     if milestone.completion_item is not None:
         checks.append(_normalize_name(milestone.completion_item) in inventory_index)
+    if milestone.completion_map_name is not None and current_map_name is not None:
+        checks.append(_map_matches(current_map_name, milestone.completion_map_name))
     if not checks:
         return False
     return any(checks)

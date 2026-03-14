@@ -142,6 +142,10 @@ def test_state_extractor_exposes_symbolic_ram_context():
         FIELD_MAP["player_direction"].address: 0x0C,
         FIELD_MAP["player_moving_direction"].address: 0x03,
         FIELD_MAP["joy_ignore"].address: 0x00,
+        FIELD_MAP["top_menu_item_y"].address: 2,
+        FIELD_MAP["top_menu_item_x"].address: 13,
+        FIELD_MAP["current_menu_item"].address: 1,
+        FIELD_MAP["max_menu_item"].address: 4,
         FIELD_MAP["window_y"].address: 0x91,
         PARTY_MONS_ADDR: 0x99,
         PARTY_MONS_ADDR + MON_HP_OFFSET: 35,
@@ -183,6 +187,10 @@ def test_state_extractor_exposes_symbolic_ram_context():
     assert state.metadata["ram_context"]["player"]["money"] == 1234
     assert state.metadata["ram_context"]["player"]["badges"]["names"] == ["Boulder", "Cascade"]
     assert state.metadata["ram_context"]["map"] == {"tileset": 4, "height": 8, "width": 10, "palette": 0}
+    assert state.metadata["ram_context"]["ui"]["top_menu_item_y"] == 2
+    assert state.metadata["ram_context"]["ui"]["top_menu_item_x"] == 13
+    assert state.metadata["ram_context"]["ui"]["current_menu_item"] == 1
+    assert state.metadata["ram_context"]["ui"]["max_menu_item"] == 4
     assert state.metadata["ram_context"]["story"]["watched_flags"]["got_starter"] is True
     assert state.metadata["story_flags"] == ["got_starter"]
     assert state.metadata["badges"] == ["Boulder", "Cascade"]

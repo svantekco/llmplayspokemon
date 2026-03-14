@@ -68,6 +68,10 @@ def test_build_ram_context_decodes_player_map_ui_and_battle_fields():
             FIELD_MAP["player_moving_direction"].address: 3,
             FIELD_MAP["player_direction"].address: 0x0C,
             FIELD_MAP["joy_ignore"].address: 0x40,
+            FIELD_MAP["top_menu_item_y"].address: 2,
+            FIELD_MAP["top_menu_item_x"].address: 13,
+            FIELD_MAP["current_menu_item"].address: 1,
+            FIELD_MAP["max_menu_item"].address: 4,
             FIELD_MAP["window_y"].address: 0x70,
             NUM_BAG_ITEMS_ADDR: 2,
             BAG_ITEMS_ADDR: 0x14,
@@ -111,6 +115,10 @@ def test_build_ram_context_decodes_player_map_ui_and_battle_fields():
     ]
     assert context["map"] == {"tileset": 4, "height": 8, "width": 10, "palette": 6}
     assert context["ui"]["input_locked"] is True
+    assert context["ui"]["top_menu_item_y"] == 2
+    assert context["ui"]["top_menu_item_x"] == 13
+    assert context["ui"]["current_menu_item"] == 1
+    assert context["ui"]["max_menu_item"] == 4
     assert context["ui"]["options"]["battle_style"] == "SET"
     assert context["ui"]["options"]["text_speed_preset"] == "FAST"
     assert context["battle"] == {"flag": 2, "in_battle": True, "kind": "TRAINER"}

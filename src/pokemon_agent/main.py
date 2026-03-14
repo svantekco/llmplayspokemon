@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import signal
 from typing import Any
 
 try:
@@ -23,6 +24,20 @@ from pokemon_agent.config import AppConfig
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.emulator.pyboy_adapter import PyBoyAdapter
 from pokemon_agent.ui.terminal_dashboard import TerminalDashboard
+
+
+class _InterruptController:
+    def __init__(self, on_first_interrupt=None) -> None:
+        self.on_first_interrupt = on_first_interrupt
+        self.shutdown_requested = False
+
+    def handle_signal(self, signum, frame) -> None:  # pragma: no cover - exercised via integration
+        del signum, frame
+        if self.shutdown_requested:
+            raise KeyboardInterrupt
+        self.shutdown_requested = True
+        if self.on_first_interrupt is not None:
+            self.on_first_interrupt()
 
 
 def build_emulator(mode: str, rom: str | None, config: AppConfig):
@@ -148,8 +163,19 @@ def run_args(args: argparse.Namespace) -> None:
             target_turns=turns,
             checkpoint_dir=args.checkpoint_dir,
         )
+    def _request_stop() -> None:
+        if dashboard is not None:
+            dashboard.request_stop()
+            return
+        if args.log_mode != "quiet":
+            print("[bold]Stop requested[/bold] Press Ctrl+C again to save immediately and exit.")
+    interrupt_controller = _InterruptController(on_first_interrupt=_request_stop)
+    previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, interrupt_controller.handle_signal)
 
     interrupted = False
+    shutdown_checkpoint_saved = False
+    shutdown_message_printed = False
     try:
         if args.resume:
             payload = runner.load_checkpoint(args.resume)
@@ -167,6 +193,9 @@ def run_args(args: argparse.Namespace) -> None:
         start_turn = runner.completed_turns + 1
         turn_index = start_turn
         while args.continuous or turn_index < start_turn + turns:
+            if interrupt_controller.shutdown_requested:
+                interrupted = True
+                break
             result = runner.run_turn(turn_index)
             if dashboard is not None:
                 dashboard.update_turn(result, runner.summary())
@@ -175,13 +204,25 @@ def run_args(args: argparse.Namespace) -> None:
             if args.checkpoint_dir:
                 runner.save_checkpoint(args.checkpoint_dir)
             turn_index += 1
+            if interrupt_controller.shutdown_requested:
+                interrupted = True
+                break
     except KeyboardInterrupt:
         interrupted = True
         if dashboard is None and args.log_mode != "quiet":
             print("[bold]Stopped[/bold] Saving checkpoint and closing emulator.")
+            shutdown_message_printed = True
         if args.checkpoint_dir:
             runner.save_checkpoint(args.checkpoint_dir)
+            shutdown_checkpoint_saved = True
     finally:
+        signal.signal(signal.SIGINT, previous_sigint_handler)
+        if interrupt_controller.shutdown_requested and not interrupted:
+            interrupted = True
+        if interrupt_controller.shutdown_requested and dashboard is None and args.log_mode != "quiet" and not shutdown_message_printed:
+            print("[bold]Stopped[/bold] Saving checkpoint and closing emulator.")
+        if interrupt_controller.shutdown_requested and args.checkpoint_dir and not shutdown_checkpoint_saved:
+            runner.save_checkpoint(args.checkpoint_dir)
         if dashboard is not None:
             dashboard.finish(interrupted=interrupted)
         elif args.log_mode != "quiet":

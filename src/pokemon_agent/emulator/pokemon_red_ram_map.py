@@ -45,6 +45,8 @@ ENEMY_SPECIES_ADDR = 0xCFE5
 ENEMY_HP_ADDR = 0xCFE6
 ENEMY_LEVEL_ADDR = 0xCFF1
 ENEMY_MAX_HP_ADDR = 0xCFFC
+# Use the verified pokered WRAM cursor and active battle-mon struct offsets for
+# navigation/runtime decisions; some requested raw bytes are still preserved below.
 CURRENT_MENU_ITEM_ADDR = 0xCC26
 REQUESTED_MOVE_CURSOR_ADDR = 0xCC2B
 BATTLE_SAVED_MENU_ITEM_ADDR = 0xCC2D
@@ -132,6 +134,10 @@ FIELD_MAP = {
     ),
     "player_direction": RamField("player_direction", 0xD52A, "Facing direction byte", "player"),
     "joy_ignore": RamField("joy_ignore", 0xD730, "Ignored joypad mask", "ui"),
+    "top_menu_item_y": RamField("top_menu_item_y", 0xCC24, "Top menu cursor row", "ui"),
+    "top_menu_item_x": RamField("top_menu_item_x", 0xCC25, "Top menu cursor column", "ui"),
+    "current_menu_item": RamField("current_menu_item", 0xCC26, "Current menu cursor index", "ui"),
+    "max_menu_item": RamField("max_menu_item", 0xCC28, "Maximum menu cursor index", "ui"),
     "window_y": RamField("window_y", 0xFF4A, "Window Y hardware register", "ui"),
 }
 
@@ -266,6 +272,10 @@ def build_ram_context(memory) -> dict[str, object]:
             "window_y": raw["window_y"],
             "joy_ignore": raw["joy_ignore"],
             "input_locked": raw["joy_ignore"] != 0,
+            "top_menu_item_y": raw["top_menu_item_y"],
+            "top_menu_item_x": raw["top_menu_item_x"],
+            "current_menu_item": raw["current_menu_item"],
+            "max_menu_item": raw["max_menu_item"],
             "options": options,
         },
         "battle": battle,
@@ -347,13 +357,19 @@ def _decode_battle_context(memory, battle_kind: str | None) -> dict[str, object]
             }
         )
 
+    enemy_species = None if enemy_species_id in {0, 0xFF} else _lookup_species_name(enemy_species_id)
+    player_species = None if player_species_id in {0, 0xFF} else _lookup_species_name(player_species_id)
+
     return {
         "kind": battle_kind or "UNKNOWN",
-        "enemy_species": None if enemy_species_id in {0, 0xFF} else _lookup_species_name(enemy_species_id),
+        "opponent": enemy_species,
+        "opponent_level": int(memory[ENEMY_LEVEL_ADDR]) or None,
+        "moves": [move["name"] for move in moves],
+        "enemy_species": enemy_species,
         "enemy_level": int(memory[ENEMY_LEVEL_ADDR]) or None,
         "enemy_hp": enemy_hp,
         "enemy_max_hp": enemy_max_hp,
-        "player_active_species": None if player_species_id in {0, 0xFF} else _lookup_species_name(player_species_id),
+        "player_active_species": player_species,
         "player_active_level": int(memory[PLAYER_ACTIVE_LEVEL_ADDR]) or None,
         "player_active_hp": player_hp,
         "player_active_max_hp": player_max_hp,

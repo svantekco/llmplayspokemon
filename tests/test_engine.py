@@ -2,6 +2,8 @@ import json
 import time
 from pathlib import Path
 
+import numpy as np
+
 from pokemon_agent.agent.engine import ClosedLoopRunner
 from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.memory_manager import MemoryManager
@@ -10,8 +12,13 @@ from pokemon_agent.agent.prompt_builder import PromptBuilder
 from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.agent.evaluator import ScenarioEvaluator
+import pokemon_agent.agent.menu_manager as menu_manager_module
+from pokemon_agent.data.walkthrough import Milestone
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionType
+from pokemon_agent.models.memory import ConnectorStatus, DiscoveredConnector, DiscoveredMap
+from pokemon_agent.models.planner import Objective, ObjectiveHorizon, ObjectiveTarget
+from pokemon_agent.models.state import InventoryItem
 from pokemon_agent.models.state import GameMode
 
 
@@ -45,6 +52,19 @@ class _NoNpcMock(MockEmulatorAdapter):
         self._sync_navigation()
 
 
+class _ScreenAreaMock(_NoNpcMock):
+    def get_structured_state(self):
+        state = super().get_structured_state()
+        game_area = np.zeros((18, 20), dtype=np.uint32)
+        collision_area = np.zeros((18, 20), dtype=np.uint32)
+        game_area[4:6, 4:6] = 99
+        collision_area[4:6, 4:6] = 1
+        collision_area[8, 0] = 1
+        state.game_area = game_area.tolist()
+        state.collision_area = collision_area.tolist()
+        return state
+
+
 class _DynamicObstacleMock(_NoNpcMock):
     def __init__(self) -> None:
         super().__init__()
@@ -61,6 +81,36 @@ class _DynamicObstacleMock(_NoNpcMock):
             self._sync_navigation()
 
 
+class _MultiRouteMock(MockEmulatorAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maps = {
+            "Mock Town": {
+                "size": (10, 10),
+                "blocked": set(),
+                "warp": {(9, 5): ("Route 1", 1, 5)},
+                "npc": None,
+            },
+            "Route 1": {
+                "size": (4, 8),
+                "blocked": set(),
+                "warp": {(0, 5): ("Mock Town", 8, 5), (2, 5): ("Route 2", 1, 5)},
+                "npc": None,
+            },
+            "Route 2": {
+                "size": (4, 8),
+                "blocked": set(),
+                "warp": {(0, 5): ("Route 1", 1, 5)},
+                "npc": None,
+            },
+        }
+        self.state.map_name = "Mock Town"
+        self.state.map_id = "mock_town"
+        self.state.x = 7
+        self.state.y = 5
+        self._sync_navigation()
+
+
 class _BootstrapMock(MockEmulatorAdapter):
     def __init__(self) -> None:
         super().__init__()
@@ -71,6 +121,62 @@ class _BootstrapMock(MockEmulatorAdapter):
         self.state.facing = None
         self.state.mode = GameMode.CUTSCENE
         self.state.metadata = {"engine_phase": "bootstrap", "bootstrap_phase": "title_screen"}
+
+
+_ENCODE = {" ": 0x7F, "'": 0xE0, "!": 0xE7, "?": 0xE6}
+_ENCODE.update({letter: 0x80 + index for index, letter in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")})
+_ENCODE.update({letter: 0xA0 + index for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz")})
+_CUT_PROGRESS_FLAGS = [
+    "got_starter",
+    "oak_received_parcel",
+    "got_pokedex",
+    "beat_brock",
+    "beat_misty",
+    "got_ss_ticket",
+    "got_hm01_cut",
+]
+
+
+def _menu_grid(labels: list[str], *, top_x: int = 12, top_y: int = 2) -> list[list[int]]:
+    grid = np.full((18, 20), 383, dtype=np.uint32)
+    for index, label in enumerate(labels):
+        row = top_y + (index * 2)
+        for offset, char in enumerate(label[: max(0, 20 - (top_x + 1))], start=top_x + 1):
+            grid[row, offset] = _ENCODE.get(char, 0x7F)
+    return grid.tolist()
+
+
+class _VermilionNoNpcMock(_NoNpcMock):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maps["Vermilion City"] = self.maps.pop("Mock Town")
+        self.state.map_name = "Vermilion City"
+        self.state.map_id = "vermilion_city"
+        self.state.story_flags = list(_CUT_PROGRESS_FLAGS)
+        self.state.inventory = [InventoryItem(name="HM Cut", count=1)]
+        self._sync_navigation()
+
+
+class _StartMenuMock(_VermilionNoNpcMock):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state.menu_open = True
+        self.state.mode = GameMode.MENU
+        self.state.navigation = None
+        self.state.game_area = _menu_grid(["POKEDEX", "POKEMON", "ITEM", "SAVE", "EXIT"])
+        self.state.metadata["ram_context"] = {
+            "ui": {
+                "window_y": 0,
+                "top_menu_item_x": 12,
+                "top_menu_item_y": 2,
+                "current_menu_item": 0,
+                "max_menu_item": 4,
+            }
+        }
+
+    def execute_action(self, action):
+        self.state.metadata["last_button"] = action.action.value
+        self.advance_frames(1)
 
 
 class _YesNoPromptMock(MockEmulatorAdapter):
@@ -127,6 +233,18 @@ class _PlainDialogueMock(MockEmulatorAdapter):
             self.state.mode = GameMode.OVERWORLD
 
 
+class _StuckOverworldNoNavigationMock(MockEmulatorAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maps["Mock Town"]["npc"] = None
+        self.state.metadata["dialogue"] = None
+
+    def get_structured_state(self):
+        state = self.state.model_copy(deep=True)
+        state.navigation = None
+        return state
+
+
 class _SlowCandidateLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -179,6 +297,62 @@ def _build_runner(emulator, llm_client=None):
     )
 
 
+def _seed_discovered_route(runner: ClosedLoopRunner) -> None:
+    runner.memory.memory.goals.active_objectives = [
+        Objective(
+            id="long_route2",
+            horizon=ObjectiveHorizon.LONG_TERM,
+            summary="Reach Route 2",
+            priority=30,
+            target=ObjectiveTarget(kind="map", map_name="Route 2"),
+        ),
+        Objective(
+            id="mid_route2",
+            horizon=ObjectiveHorizon.MID_TERM,
+            summary="Travel toward Route 2",
+            priority=20,
+            target=ObjectiveTarget(kind="map", map_name="Route 2"),
+        ),
+        Objective(
+            id="short_here",
+            horizon=ObjectiveHorizon.SHORT_TERM,
+            summary="Take the best connector step",
+            priority=10,
+            target=ObjectiveTarget(kind="map", map_name="Mock Town", x=7, y=5),
+        ),
+    ]
+    world_map = runner.memory.memory.long_term.world_map
+    world_map.maps["Mock Town"] = DiscoveredMap(map_name="Mock Town", map_id="mock_town", connectors=["Mock Town::side::east"])
+    world_map.maps["Route 1"] = DiscoveredMap(map_name="Route 1", map_id="route_1", connectors=["Route 1::side::east"])
+    world_map.maps["Route 2"] = DiscoveredMap(map_name="Route 2", map_id="route_2", connectors=[])
+    world_map.connectors["Mock Town::side::east"] = DiscoveredConnector(
+        id="Mock Town::side::east",
+        source_map="Mock Town",
+        source_side="east",
+        kind="boundary",
+        status=ConnectorStatus.CONFIRMED,
+        approach_x=8,
+        approach_y=5,
+        transition_action=ActionType.MOVE_RIGHT,
+        destination_map="Route 1",
+        destination_x=1,
+        destination_y=5,
+    )
+    world_map.connectors["Route 1::side::east"] = DiscoveredConnector(
+        id="Route 1::side::east",
+        source_map="Route 1",
+        source_side="east",
+        kind="boundary",
+        status=ConnectorStatus.CONFIRMED,
+        approach_x=1,
+        approach_y=5,
+        transition_action=ActionType.MOVE_RIGHT,
+        destination_map="Route 2",
+        destination_x=1,
+        destination_y=5,
+    )
+
+
 def test_closed_loop_runner_executes_one_mock_turn():
     emulator = MockEmulatorAdapter()
     runner = _build_runner(emulator)
@@ -228,6 +402,31 @@ def test_runner_pumps_emulator_while_waiting_for_llm():
     assert result.llm_attempted is True
     assert emulator.planning_pump_count > 0
     assert llm.calls == 1
+
+
+def test_runner_passes_current_ascii_map_in_llm_payload():
+    class _CaptureMapLLM:
+        def __init__(self) -> None:
+            self.visual_map = None
+
+        def complete(self, messages):
+            from pokemon_agent.agent.llm_client import CompletionResponse
+
+            payload = json.loads(messages[-1]["content"])
+            self.visual_map = payload["context"]["overworld_context"]["visual_map"]
+            candidate_id = payload["context"]["candidate_next_steps"][0]["id"]
+            return CompletionResponse(content=json.dumps({"candidate_id": candidate_id, "reason": "use captured map"}), model="fake")
+
+    emulator = _ScreenAreaMock()
+    llm = _CaptureMapLLM()
+    runner = _build_runner(emulator, llm_client=llm)
+
+    result = runner.run_turn(1)
+
+    assert result.llm_attempted is True
+    assert llm.visual_map is not None
+    assert "P" in llm.visual_map
+    assert "~" in llm.visual_map
 
 
 def test_runner_skips_llm_during_bootstrap():
@@ -312,6 +511,61 @@ def test_runner_auto_selects_when_one_candidate_dominates():
     assert result.action.action == ActionType.PRESS_A
 
 
+def test_runner_opens_menu_proactively_for_required_hm(monkeypatch) -> None:
+    emulator = _VermilionNoNpcMock()
+    monkeypatch.setattr(
+        menu_manager_module,
+        "get_current_milestone",
+        lambda *args, **kwargs: Milestone(
+            id="gym3_surge",
+            description="Teach Cut and enter the Vermilion Gym.",
+            completion_flag=None,
+            completion_item=None,
+            prerequisite_flags=["got_hm01_cut"],
+            prerequisite_items=[],
+            target_map_name="Vermilion City",
+            route_hints=["Open the menu and prepare Cut."],
+            sub_steps=["Teach Cut if needed.", "Use Cut near the gym tree."],
+            required_hms=["Cut"],
+            next_milestone_id=None,
+        ),
+    )
+    runner = _build_runner(emulator)
+
+    result = runner.run_turn(1)
+
+    assert result.planner_source == "auto_candidate"
+    assert result.action.action == ActionType.PRESS_START
+
+
+def test_runner_uses_menu_manager_when_start_menu_is_open() -> None:
+    emulator = _StartMenuMock()
+    runner = _build_runner(emulator)
+
+    result = runner.run_turn(1)
+
+    assert result.planner_source == "auto_candidate"
+    assert result.action.action == ActionType.MOVE_DOWN
+
+
+def test_runner_prefers_local_recovery_over_press_start_when_stuck_in_overworld() -> None:
+    emulator = _StuckOverworldNoNavigationMock()
+    runner = _build_runner(emulator)
+    runner.stuck.state.score = 44
+    runner.stuck.state.recent_failed_actions = ["PRESS_A", "PRESS_A", "PRESS_A", "PRESS_A", "PRESS_B"]
+    runner.stuck.state.recovery_hint = "Try a local recovery action before reopening the menu."
+
+    result = runner.run_turn(1)
+
+    assert result.planner_source == "auto_candidate"
+    assert result.action.action in {
+        ActionType.MOVE_UP,
+        ActionType.MOVE_RIGHT,
+        ActionType.MOVE_DOWN,
+        ActionType.MOVE_LEFT,
+    }
+
+
 def test_runner_uses_llm_for_yes_no_text_prompt():
     emulator = _YesNoPromptMock()
     llm = _ChooseCandidateLLM(index=1)
@@ -386,3 +640,40 @@ def test_runner_replans_when_route_is_invalidated():
     assert llm.calls == 1
     assert second.planner_source != "execution_plan"
     assert runner.route_cache is None
+
+
+def test_runner_rechecks_navigation_goal_after_map_change():
+    emulator = _MultiRouteMock()
+    llm = _ChooseCandidateLLM(index=0)
+    runner = _build_runner(emulator, llm_client=llm)
+    _seed_discovered_route(runner)
+
+    first = runner.run_turn(1)
+    second = runner.run_turn(2)
+    third = runner.run_turn(3)
+
+    assert first.planner_source in {"llm", "auto_candidate"}
+    assert second.planner_source == "execution_plan"
+    assert second.after.map_name == "Route 1"
+    assert third.before.map_name == "Route 1"
+    assert third.llm_attempted is True
+    assert third.planner_source == "llm"
+    assert third.action.action == ActionType.MOVE_RIGHT
+
+
+def test_runner_checkpoint_preserves_world_map_and_navigation_goal(tmp_path: Path):
+    emulator = _MultiRouteMock()
+    runner = _build_runner(emulator)
+    _seed_discovered_route(runner)
+    runner.memory.memory.long_term.navigation_goal = runner._sync_navigation_goal(emulator.get_structured_state())
+
+    runner.save_checkpoint(tmp_path)
+    restored_runner = _build_runner(_MultiRouteMock())
+    restored_runner.load_checkpoint(tmp_path)
+
+    restored_goal = restored_runner.memory.memory.long_term.navigation_goal
+    restored_world_map = restored_runner.memory.memory.long_term.world_map
+    assert restored_goal is not None
+    assert restored_goal.target_map_name == "Route 2"
+    assert "Mock Town::side::east" in restored_world_map.connectors
+    assert restored_world_map.connectors["Mock Town::side::east"].destination_map == "Route 1"

@@ -5,6 +5,7 @@ from pathlib import Path
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_tiles
 from pokemon_agent.emulator.base import EmulatorAdapter
 from pokemon_agent.models.action import ActionDecision, ActionType
+from pokemon_agent.models.state import BattleContext
 from pokemon_agent.models.state import InventoryItem
 from pokemon_agent.models.state import PartyMember
 from pokemon_agent.models.state import StructuredGameState, GameMode
@@ -140,7 +141,7 @@ class MockEmulatorAdapter(EmulatorAdapter):
             return
 
         if self.state.map_name == "Route 1" and (self.state.x, self.state.y) == (5, 2) and not self.state.battle_state:
-            self.state.battle_state = {"kind": "WILD", "opponent": "PIDGEY"}
+            self.state.battle_state = BattleContext(kind="WILD", opponent="PIDGEY", enemy_species="PIDGEY")
             self.state.mode = GameMode.BATTLE
 
     def _press_b(self) -> None:

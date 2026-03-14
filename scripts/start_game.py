@@ -37,7 +37,6 @@ def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
     parser = create_parser()
     main_args = parser.parse_args([])
     session_dir = (REPO_ROOT / args.session_dir).resolve()
-    checkpoint_path = session_dir / "checkpoint.json"
 
     if args.eval:
         main_args.eval = True
@@ -54,9 +53,13 @@ def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
     main_args.continuous = not args.once
     main_args.planner = resolve_planner(args)
     main_args.checkpoint_dir = str(session_dir)
-    main_args.resume = str(session_dir) if checkpoint_path.exists() else None
+    main_args.resume = str(session_dir) if session_is_resumable(session_dir) else None
     main_args.log_mode = args.log_mode
     return main_args
+
+
+def session_is_resumable(session_dir: Path) -> bool:
+    return (session_dir / "checkpoint.json").exists() and (session_dir / "emulator.state").exists()
 
 
 def resolve_planner(args: argparse.Namespace) -> str:
@@ -90,7 +93,7 @@ def main(argv: list[str] | None = None) -> None:
         if window:
             print(f"PyBoy window mode: {window}")
         if main_args.continuous:
-            print("Watch mode is active. Press Ctrl+C to stop and keep the session checkpoint.")
+            print("Watch mode is active. Press Ctrl+C once to stop after the current turn, or twice to save and exit immediately.")
     run_args(main_args)
 
 

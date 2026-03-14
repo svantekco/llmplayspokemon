@@ -45,6 +45,21 @@ def test_validator_prefers_recovery_inputs_when_stuck():
     assert result.action.value in {"PRESS_A", "PRESS_START", "PRESS_B", "MOVE_DOWN", "MOVE_LEFT"}
 
 
+def test_validator_prefers_local_recovery_before_press_start_in_overworld():
+    validator = ActionValidator(max_repeat=4)
+    state = StructuredGameState(mode=GameMode.OVERWORLD)
+    stuck = StuckState(score=44, recent_failed_actions=["PRESS_A", "PRESS_A", "PRESS_A", "PRESS_A", "PRESS_B"])
+
+    result = validator.fallback(state, stuck, "recovery")
+
+    assert result.action in {
+        ActionType.MOVE_UP,
+        ActionType.MOVE_RIGHT,
+        ActionType.MOVE_DOWN,
+        ActionType.MOVE_LEFT,
+    }
+
+
 def test_validator_uses_startup_bootstrap_actions():
     validator = ActionValidator(max_repeat=4)
     title_state = StructuredGameState(

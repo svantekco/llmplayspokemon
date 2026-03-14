@@ -4,7 +4,7 @@ from argparse import Namespace
 
 import pytest
 
-from pokemon_agent.main import run_args
+from pokemon_agent.main import _InterruptController, run_args
 
 
 def test_run_args_requires_api_key_for_llm(monkeypatch, tmp_path):
@@ -24,3 +24,14 @@ def test_run_args_requires_api_key_for_llm(monkeypatch, tmp_path):
 
     with pytest.raises(SystemExit, match="OPENROUTER_API_KEY"):
         run_args(args)
+
+
+def test_interrupt_controller_requires_two_ctrl_c_presses():
+    controller = _InterruptController()
+
+    controller.handle_signal(None, None)
+
+    assert controller.shutdown_requested is True
+
+    with pytest.raises(KeyboardInterrupt):
+        controller.handle_signal(None, None)

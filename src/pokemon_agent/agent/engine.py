@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from pokemon_agent.agent.context_manager import ContextManager
+from pokemon_agent.agent.battle_manager import BattleManager
 from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRouterClient
+from pokemon_agent.agent.menu_manager import MenuManager
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.navigation import CachedRoute
 from pokemon_agent.agent.navigation import advance_position
@@ -18,10 +20,15 @@ from pokemon_agent.agent.progress import ProgressDetector, ProgressResult
 from pokemon_agent.agent.prompt_builder import PromptBuilder, PromptMetrics
 from pokemon_agent.agent.stuck_detector import StuckDetector, StuckState
 from pokemon_agent.agent.validator import ActionValidator
+from pokemon_agent.agent.world_map import connectors_from_map
+from pokemon_agent.agent.world_map import describe_connector
+from pokemon_agent.agent.world_map import shortest_confirmed_path
+from pokemon_agent.agent.world_map import world_map_stats
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
+from pokemon_agent.models.memory import NavigationGoal
 from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import ExecutionPlan
 from pokemon_agent.models.planner import ObjectiveHorizon
@@ -36,6 +43,7 @@ NAVIGATION_CANDIDATE_TYPES = {
     "GO_TO_MAP_EXIT",
     "EXPLORE_NEAREST_FRONTIER",
     "MOVE_ADJACENT_TO_INTERACTABLE",
+    "FOLLOW_DISCOVERED_CONNECTOR",
 }
 YES_NO_CANDIDATE_TYPES = {"SELECT_YES", "SELECT_NO"}
 
@@ -178,10 +186,21 @@ class ClosedLoopRunner:
         self.validator = validator
         self.llm_client = llm_client
         self.context_manager = context_manager or ContextManager()
+        self.battle_manager = BattleManager()
         self.telemetry = RunTelemetry()
         self.completed_turns = 0
         self.route_cache: CachedRoute | None = None
         self.execution_plan: ExecutionPlan | None = None
+        self.menu_manager = MenuManager()
+        self._last_entry_direction: str | None = None  # direction we entered current map from
+        self._previous_map_name: str | None = None
+
+    _OPPOSITE_DIRECTION: dict[str, str] = {
+        "north": "south",
+        "south": "north",
+        "east": "west",
+        "west": "east",
+    }
 
     def run_turn(self, turn_index: int) -> TurnResult:
         planning_state = self.executor.emulator.get_structured_state()
@@ -192,6 +211,14 @@ class ClosedLoopRunner:
         after = self.executor.emulator.get_structured_state()
         progress_result = self.progress.compare(before, after)
         stuck_state = self.stuck.update(after, action, progress_result.classification)
+        # Track entry direction on map change
+        if before.map_id != after.map_id or before.map_name != after.map_name:
+            self._previous_map_name = before.map_name
+            entered_via = self._side_for_action(action.action)
+            self._last_entry_direction = self._OPPOSITE_DIRECTION.get(entered_via) if entered_via else None
+            goal = self.memory.memory.long_term.navigation_goal
+            if goal is not None and goal.target_map_name != after.map_name:
+                goal.confirmation_required_map = after.map_name
         self._refresh_route_cache_after_turn(after, progress_result)
         self._refresh_execution_plan_after_turn(after, progress_result)
         events = self.memory.update_from_transition(before, after, action, progress_result, stuck_state)
@@ -262,7 +289,9 @@ class ClosedLoopRunner:
         candidates = self._build_candidate_steps(state)
         if not candidates:
             fallback = self.validator.fallback(state, self.stuck.state, "fallback without usable candidates")
-            return PlanningResult(action=self.validator.validate(fallback, state), used_fallback=True, planner_source="fallback")
+            result = PlanningResult(action=self.validator.validate(fallback, state), used_fallback=True, planner_source="fallback")
+            self._clear_navigation_confirmation(state.map_name)
+            return result
 
         recommended = candidates[0]
         if self._should_auto_select(candidates):
@@ -286,13 +315,15 @@ class ClosedLoopRunner:
         prompt_metrics = self.prompts.measure(messages, snapshot)
 
         if self.llm_client is None:
-            return self._fallback_from_candidates(
+            result = self._fallback_from_candidates(
                 state,
                 recommended,
                 messages=messages,
                 prompt_metrics=prompt_metrics,
                 reason="deterministic fallback planner",
             )
+            self._clear_navigation_confirmation(state.map_name)
+            return result
 
         try:
             raw_response = self._complete_with_window_pump(messages)
@@ -301,7 +332,7 @@ class ClosedLoopRunner:
             live_state = self.executor.emulator.get_structured_state()
             compiled = self._compile_candidate(chosen, live_state, decision.reason or self._short_reason(chosen))
             if compiled is None:
-                return self._fallback_from_candidates(
+                result = self._fallback_from_candidates(
                     live_state,
                     recommended,
                     messages=messages,
@@ -312,7 +343,9 @@ class ClosedLoopRunner:
                     llm_attempted=True,
                     reason="fallback after invalid planner choice",
                 )
-            return PlanningResult(
+                self._clear_navigation_confirmation(state.map_name)
+                return result
+            result = PlanningResult(
                 action=compiled,
                 raw_response=raw_response.content,
                 planner_source="llm",
@@ -324,8 +357,10 @@ class ClosedLoopRunner:
                 objective_id=chosen.objective_id,
                 candidate_id=chosen.id,
             )
+            self._clear_navigation_confirmation(state.map_name)
+            return result
         except Exception as exc:
-            return self._fallback_from_candidates(
+            result = self._fallback_from_candidates(
                 self.executor.emulator.get_structured_state(),
                 recommended,
                 messages=messages,
@@ -334,6 +369,8 @@ class ClosedLoopRunner:
                 llm_attempted=True,
                 reason=f"fallback after llm error: {type(exc).__name__}",
             )
+            self._clear_navigation_confirmation(state.map_name)
+            return result
 
     def _fallback_from_candidates(
         self,
@@ -401,11 +438,14 @@ class ClosedLoopRunner:
                 "repeated_state_count": self.stuck.state.repeated_state_count,
                 "steps_since_progress": self.stuck.state.steps_since_progress,
                 "oscillating": self.stuck.state.oscillating,
+                "recent_maps": list(self.stuck.state.recent_maps),
+                "map_oscillating": self.stuck.state.map_oscillating,
             },
             "telemetry": self.telemetry.to_dict(),
             "context_state": self.context_manager.export_state(),
             "route_cache": self.route_cache.model_dump(mode="json") if self.route_cache is not None else None,
             "execution_plan": self.execution_plan.model_dump(mode="json") if self.execution_plan is not None else None,
+            "last_entry_direction": self._last_entry_direction,
         }
         metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return metadata_path
@@ -426,8 +466,10 @@ class ClosedLoopRunner:
             repeated_state_count=stuck_payload["repeated_state_count"],
             steps_since_progress=stuck_payload["steps_since_progress"],
             oscillating=stuck_payload["oscillating"],
+            map_oscillating=stuck_payload.get("map_oscillating", False),
         )
         restored.recent_signatures.extend(stuck_payload["recent_signatures"])
+        restored.recent_maps.extend(stuck_payload.get("recent_maps", []))
         self.stuck.restore(restored)
         telemetry = payload.get("telemetry", {})
         self.telemetry = RunTelemetry(
@@ -452,10 +494,13 @@ class ClosedLoopRunner:
         self.route_cache = CachedRoute.model_validate(route_payload) if route_payload else None
         execution_payload = payload.get("execution_plan")
         self.execution_plan = ExecutionPlan.model_validate(execution_payload) if execution_payload else None
+        self._last_entry_direction = payload.get("last_entry_direction")
         return payload
 
     def summary(self) -> dict[str, Any]:
-        return self.telemetry.to_dict()
+        summary = self.telemetry.to_dict()
+        summary.update(world_map_stats(self.memory.memory.long_term.world_map))
+        return summary
 
     def _parse_planner_decision(self, raw_text: str) -> PlannerDecision:
         payload = self._extract_json(raw_text)
@@ -487,6 +532,7 @@ class ClosedLoopRunner:
     def _build_candidate_steps(self, state: StructuredGameState) -> list[CandidateNextStep]:
         short_objective_id = self._objective_id(ObjectiveHorizon.SHORT_TERM, "short_immediate_step")
         mid_objective_id = self._objective_id(ObjectiveHorizon.MID_TERM, "mid_local_progress")
+        navigation_goal = self._sync_navigation_goal(state)
         candidates: list[CandidateNextStep] = []
 
         if state.text_box_open:
@@ -535,31 +581,13 @@ class ClosedLoopRunner:
                 )
             ]
         if state.menu_open:
-            return [
-                CandidateNextStep(
-                    id="close_menu",
-                    type="CLOSE_MENU",
-                    why="A menu is open and blocks map progress.",
-                    priority=100,
-                    expected_success_signal="Menu closes or the selection changes",
-                    objective_id=short_objective_id,
-                    action=ActionDecision(action=ActionType.PRESS_B, repeat=1, reason="close menu"),
-                    step_budget=4,
-                )
-            ]
+            menu_candidates = self._dedupe_candidates(self.menu_manager.build_candidates(state, short_objective_id))
+            menu_candidates.sort(key=lambda item: (-item.priority, item.id))
+            return menu_candidates[:4]
         if state.battle_state:
-            return [
-                CandidateNextStep(
-                    id="battle_default",
-                    type="BATTLE_DEFAULT",
-                    why="Battle is active and needs a safe default action.",
-                    priority=100,
-                    expected_success_signal="Battle state changes or ends",
-                    objective_id=short_objective_id,
-                    action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance battle"),
-                    step_budget=6,
-                )
-            ]
+            return self.battle_manager.build_candidates(state, short_objective_id)
+
+        candidates.extend(self.menu_manager.build_candidates(state, short_objective_id))
 
         if self.stuck.state.score >= self.stuck.threshold:
             recovery_action = self.validator.fallback(state, self.stuck.state, "stuck recovery")
@@ -583,6 +611,10 @@ class ClosedLoopRunner:
         move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, short_objective_id)
         if move_to_interaction is not None:
             candidates.append(move_to_interaction)
+
+        connector_route = self._build_discovered_route_candidate(state, mid_objective_id, navigation_goal)
+        if connector_route is not None:
+            candidates.append(connector_route)
 
         candidates.extend(self._build_exit_candidates(state, mid_objective_id))
 
@@ -722,15 +754,37 @@ class ClosedLoopRunner:
             choice = (distance, coordinate.x, coordinate.y)
             if current is None or choice < current:
                 side_targets[side] = choice
+
         candidates: list[CandidateNextStep] = []
+        world_map = self.memory.memory.long_term.world_map
+        known_connectors = connectors_from_map(world_map, state.map_name, confirmed_only=False)
         for side, (distance, target_x, target_y) in sorted(side_targets.items()):
+            side_matches = [connector for connector in known_connectors if connector.source_side == side]
+            destinations = sorted({connector.destination_map for connector in side_matches if connector.destination_map})
+            if destinations:
+                destination_text = ", ".join(destinations[:2])
+                why = f"Exit {side} matches a discovered connector to {destination_text} ({distance} steps)."
+                detail = f"{side} → {destination_text}"
+            else:
+                why = f"Exit {side} ({distance} steps), destination still unknown."
+                detail = side
+
+            priority = 60 - min(distance, 10)
+            if side_matches and not destinations:
+                priority += 8
+                why = f"{why} This connector has been seen but not confirmed yet."
+
+            if self._last_entry_direction and side == self._last_entry_direction:
+                priority -= 25
+                why += " (backtrack — we just came from this direction)"
+
             candidates.append(
                 CandidateNextStep(
                     id=f"exit_{side}_{target_x}_{target_y}",
                     type="GO_TO_MAP_EXIT",
-                    target=ObjectiveTarget(kind="exit", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y, detail=side),
-                    why=f"The {side} edge is reachable in {distance} steps and may reveal a transition.",
-                    priority=60 - min(distance, 10),
+                    target=ObjectiveTarget(kind="exit", map_id=state.map_id, map_name=state.map_name, x=target_x, y=target_y, detail=detail),
+                    why=why,
+                    priority=priority,
                     expected_success_signal="Map changes or a new local affordance appears",
                     objective_id=objective_id,
                     target_x=target_x,
@@ -738,7 +792,51 @@ class ClosedLoopRunner:
                     step_budget=distance + 1,
                 )
             )
-        return candidates[:2]
+        return candidates[:4]
+
+    def _build_discovered_route_candidate(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal | None,
+    ) -> CandidateNextStep | None:
+        if goal is None or state.navigation is None or state.x is None or state.y is None:
+            return None
+        route = shortest_confirmed_path(self.memory.memory.long_term.world_map, state.map_name, goal.target_map_name)
+        if route is None or not route:
+            return None
+        connector = route[0]
+        if connector.source_map != state.map_name:
+            return None
+        if connector.approach_x is None or connector.approach_y is None or connector.transition_action is None:
+            return None
+        local_route = find_path(state.navigation, state.x, state.y, connector.approach_x, connector.approach_y)
+        if local_route is None:
+            return None
+        distance = len(local_route)
+        return CandidateNextStep(
+            id=f"follow_connector_{connector.id}",
+            type="FOLLOW_DISCOVERED_CONNECTOR",
+            target=ObjectiveTarget(
+                kind="connector",
+                map_id=state.map_id,
+                map_name=state.map_name,
+                x=connector.approach_x,
+                y=connector.approach_y,
+                detail=describe_connector(connector),
+            ),
+            why=(
+                f"Follow the discovered connector toward {goal.target_map_name}: "
+                f"{describe_connector(connector)}."
+            ),
+            priority=92 - min(distance, 10),
+            expected_success_signal=f"Transition toward {goal.target_map_name}",
+            objective_id=objective_id,
+            target_x=connector.approach_x,
+            target_y=connector.approach_y,
+            follow_up_action=connector.transition_action,
+            step_budget=max(1, distance + 1),
+        )
 
     def _build_frontier_candidate(
         self,
@@ -785,7 +883,7 @@ class ClosedLoopRunner:
         )
 
     def _dedupe_candidates(self, candidates: list[CandidateNextStep]) -> list[CandidateNextStep]:
-        seen: set[tuple[str, int | None, int | None, str | None]] = set()
+        seen: set[tuple[str, int | None, int | None, str | None, str | None]] = set()
         deduped: list[CandidateNextStep] = []
         for candidate in candidates:
             key = (
@@ -793,6 +891,7 @@ class ClosedLoopRunner:
                 candidate.target_x,
                 candidate.target_y,
                 candidate.action.action.value if candidate.action else None,
+                candidate.target.detail if candidate.target else None,
             )
             if key in seen:
                 continue
@@ -803,6 +902,17 @@ class ClosedLoopRunner:
     def _should_auto_select(self, candidates: list[CandidateNextStep]) -> bool:
         if not candidates:
             return False
+        current_state = self.executor.emulator.get_structured_state()
+        if current_state.menu_open:
+            return True
+        goal = self.memory.memory.long_term.navigation_goal
+        if (
+            goal is not None
+            and goal.confirmation_required_map
+            and candidates[0].type == "FOLLOW_DISCOVERED_CONNECTOR"
+            and goal.confirmation_required_map == current_state.map_name
+        ):
+            return False
         if len(candidates) == 1:
             return True
         if any(candidate.type in YES_NO_CANDIDATE_TYPES for candidate in candidates):
@@ -812,6 +922,11 @@ class ClosedLoopRunner:
             "CLOSE_MENU",
             "BATTLE_DEFAULT",
             "RECOVER_FROM_STUCK",
+            "OPEN_START_MENU_FOR_HM",
+            "SELECT_START_MENU_OPTION_FOR_HM",
+            "SELECT_HM_ITEM",
+            "SELECT_PARTY_POKEMON",
+            "USE_FIELD_MOVE",
         }:
             return True
         if candidates[0].type == "MOVE_ADJACENT_TO_INTERACTABLE" and candidates[0].action is not None:
@@ -825,6 +940,8 @@ class ClosedLoopRunner:
         reason: str,
     ) -> ActionDecision | None:
         self.execution_plan = None
+        if state.battle_state is not None:
+            self.battle_manager.record_choice(candidate)
         if candidate.action is not None:
             action = candidate.action.model_copy(deep=True)
             action.reason = reason
@@ -941,12 +1058,12 @@ class ClosedLoopRunner:
             return self._continue_button_plan(plan, state, condition=state.menu_open)
         if plan.plan_type == "BATTLE_DEFAULT":
             return self._continue_button_plan(plan, state, condition=state.battle_state is not None)
-        if plan.plan_type == "MOVE_ADJACENT_TO_INTERACTABLE" and plan.follow_up_action is not None:
+        if plan.plan_type in NAVIGATION_CANDIDATE_TYPES and plan.follow_up_action is not None:
             if (state.x, state.y) == (plan.target_x, plan.target_y):
                 follow_up_action = plan.follow_up_action
                 plan.follow_up_action = None
                 self.execution_plan = plan
-                return ActionDecision(action=follow_up_action, repeat=1, reason=plan.reason or "Interact at target")
+                return ActionDecision(action=follow_up_action, repeat=1, reason=plan.reason or "Trigger connector at target")
         if plan.plan_type in NAVIGATION_CANDIDATE_TYPES and plan.target_x is not None and plan.target_y is not None:
             if (state.x, state.y) == (plan.target_x, plan.target_y) and plan.follow_up_action is None:
                 self.execution_plan = None
@@ -1081,3 +1198,59 @@ class ClosedLoopRunner:
         if len(reason) <= 60:
             return reason
         return f"{reason[:57].rstrip()}..."
+
+    @staticmethod
+    def _side_for_action(action: ActionType) -> str | None:
+        mapping = {
+            ActionType.MOVE_UP: "north",
+            ActionType.MOVE_RIGHT: "east",
+            ActionType.MOVE_DOWN: "south",
+            ActionType.MOVE_LEFT: "west",
+        }
+        return mapping.get(action)
+
+    def _sync_navigation_goal(self, state: StructuredGameState) -> NavigationGoal | None:
+        target_map = None
+        for objective in self.memory.memory.goals.active_objectives:
+            if objective.target and objective.target.map_name and objective.horizon in {ObjectiveHorizon.MID_TERM, ObjectiveHorizon.LONG_TERM}:
+                target_map = objective.target.map_name
+                break
+
+        goal = self.memory.memory.long_term.navigation_goal
+        if state.is_bootstrap():
+            self.memory.memory.long_term.navigation_goal = None
+            return None
+
+        if goal is not None:
+            if goal.target_map_name == state.map_name:
+                self.memory.memory.long_term.navigation_goal = None
+                return None
+            if goal.confirmation_required_map == state.map_name:
+                return goal
+            if target_map is None:
+                return goal
+            if goal.target_map_name != target_map:
+                self.memory.memory.long_term.navigation_goal = None
+                goal = None
+
+        if not target_map or target_map == state.map_name:
+            self.memory.memory.long_term.navigation_goal = None
+            return None
+
+        if goal is None or goal.target_map_name != target_map:
+            goal = NavigationGoal(
+                target_map_name=target_map,
+                source="objective",
+                started_step=state.step,
+                last_confirmed_step=state.step,
+            )
+            self.memory.memory.long_term.navigation_goal = goal
+        return goal
+
+    def _clear_navigation_confirmation(self, map_name: str) -> None:
+        goal = self.memory.memory.long_term.navigation_goal
+        if goal is None:
+            return
+        if goal.confirmation_required_map == map_name:
+            goal.confirmation_required_map = None
+            goal.last_confirmed_step = self.executor.emulator.get_structured_state().step

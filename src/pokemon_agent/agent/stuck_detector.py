@@ -16,6 +16,8 @@ class StuckState:
     repeated_state_count: int = 0
     steps_since_progress: int = 0
     oscillating: bool = False
+    recent_maps: deque = field(default_factory=lambda: deque(maxlen=6))
+    map_oscillating: bool = False
 
 
 class StuckDetector:
@@ -26,6 +28,9 @@ class StuckDetector:
     def update(self, game_state: StructuredGameState, action: ActionDecision, progress_classification: str) -> StuckState:
         signature = game_state.state_signature()
         self.state.recent_signatures.append(signature)
+        if game_state.map_name:
+            self.state.recent_maps.append(game_state.map_name)
+        self.state.map_oscillating = self._is_map_oscillating()
 
         progress_made = progress_classification in {
             "major_progress",
@@ -49,7 +54,7 @@ class StuckDetector:
 
         self.state.repeated_state_count = sum(1 for item in self.state.recent_signatures if item == signature)
         self.state.oscillating = self._is_oscillating()
-        if self.state.repeated_state_count >= 3 or self.state.oscillating or self.state.steps_since_progress >= 6:
+        if self.state.repeated_state_count >= 3 or self.state.oscillating or self.state.map_oscillating or self.state.steps_since_progress >= 6:
             self.state.score = max(self.state.score, self.threshold)
 
         if len(self.state.recent_signatures) >= 4:
@@ -72,6 +77,14 @@ class StuckDetector:
         a, b, c, d = list(self.state.recent_signatures)[-4:]
         return a == c and b == d and a != b
 
+    def _is_map_oscillating(self) -> bool:
+        """Detect A→B→A→B bouncing between maps."""
+        maps = list(self.state.recent_maps)
+        if len(maps) < 4:
+            return False
+        a, b, c, d = maps[-4], maps[-3], maps[-2], maps[-1]
+        return a == c and b == d and a != b
+
     def _build_recovery_hint(
         self,
         game_state: StructuredGameState,
@@ -86,6 +99,10 @@ class StuckDetector:
             return "Battle is active; keep inputs single-step and prefer PRESS_A unless the menu changes."
         if progress_classification == "no_effect" and action.action.value.startswith("MOVE_"):
             return "Movement had no effect; try a different direction or interact with PRESS_A."
+        if self.state.map_oscillating:
+            maps = list(self.state.recent_maps)
+            pair = f"{maps[-2]} ↔ {maps[-1]}" if len(maps) >= 2 else "two maps"
+            return f"Bouncing between {pair}; choose a different exit or interact with something before leaving."
         if self.state.oscillating:
             return "You are oscillating between states; stop repeating the same pattern."
         if self.state.score >= self.threshold:

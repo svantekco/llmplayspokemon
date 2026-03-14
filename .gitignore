@@ -1,3 +1,20 @@
 .env
 game.gb.ram
 .sessions/
+
+# ROMs
+*.gb
+*.gbc
+*.gba
+
+# Local tooling state
+.claude/settings.local.json
+
+# Python caches
+__pycache__/
+
+# Test/runtime temp folders
+.pytest_cache/
+.tmp/
+.tmp_pytest/
+.tmp_pytest_local/

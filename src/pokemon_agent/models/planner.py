@@ -59,7 +59,6 @@ class PlannerDecision(BaseModel):
     candidate_id: str | None = None
     intent: str | None = None
     reason: str = ""
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _validate_choice(self) -> "PlannerDecision":

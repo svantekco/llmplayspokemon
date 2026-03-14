@@ -52,12 +52,8 @@ class ActionValidator:
             return ActionDecision(action=ActionType.PRESS_B, repeat=1, reason=reason)
         if state.mode == GameMode.BATTLE:
             return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
-        if stuck_score >= 6 and "PRESS_B" not in recent_failed:
-            return ActionDecision(action=ActionType.PRESS_B, repeat=1, reason=reason)
         if stuck_score >= 4 and "PRESS_A" not in recent_failed:
             return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
-        if stuck_score >= 5 and "PRESS_START" not in recent_failed:
-            return ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=reason)
 
         cycle = [
             ActionType.MOVE_UP,
@@ -66,9 +62,16 @@ class ActionValidator:
             ActionType.MOVE_LEFT,
         ]
         candidates = [action for action in cycle if action.value not in recent_failed]
-        if not candidates:
-            candidates = cycle
-        action = candidates[stuck_score % len(candidates)]
+        if candidates:
+            action = candidates[stuck_score % len(candidates)]
+            return ActionDecision(action=action, repeat=1, reason=reason)
+
+        if stuck_score >= 6 and "PRESS_B" not in recent_failed:
+            return ActionDecision(action=ActionType.PRESS_B, repeat=1, reason=reason)
+        if stuck_score >= 8 and "PRESS_START" not in recent_failed:
+            return ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=reason)
+
+        action = cycle[stuck_score % len(cycle)]
         return ActionDecision(action=action, repeat=1, reason=reason)
 
     def bootstrap(

@@ -4,6 +4,9 @@ import re
 
 from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckState
+from pokemon_agent.agent.world_map import confirm_transition
+from pokemon_agent.agent.world_map import observe_state
+from pokemon_agent.agent.world_map import world_map_stats
 from pokemon_agent.data.walkthrough import Milestone
 from pokemon_agent.data.walkthrough import get_current_milestone
 from pokemon_agent.data.walkthrough import milestone_for_completion_flag
@@ -39,6 +42,8 @@ class MemoryManager:
         stuck_state: StuckState | None = None,
     ) -> list[EventRecord]:
         events: list[EventRecord] = []
+        observe_state(self.memory.long_term.world_map, previous)
+        observe_state(self.memory.long_term.world_map, current)
 
         if not current.is_bootstrap() and (previous.is_bootstrap() or previous.map_id != current.map_id or previous.map_name != current.map_name):
             events.append(
@@ -51,6 +56,21 @@ class MemoryManager:
             )
             if current.map_id is not None:
                 self.memory.long_term.known_locations[str(current.map_id)] = current.map_name
+            connector = confirm_transition(self.memory.long_term.world_map, previous, action, current)
+            if connector is not None:
+                events.append(
+                    EventRecord(
+                        type=EventType.CONNECTOR_CONFIRMED,
+                        summary=f"Confirmed connector from {previous.map_name} to {current.map_name}",
+                        step=current.step,
+                        metadata={
+                            "connector_id": connector.id,
+                            "source_map": previous.map_name,
+                            "destination_map": current.map_name,
+                            "kind": connector.kind,
+                        },
+                    )
+                )
 
         if previous.x != current.x or previous.y != current.y:
             events.append(
@@ -122,6 +142,12 @@ class MemoryManager:
                 "story_flags": self.memory.long_term.story_flags[-8:],
                 "navigation_notes": self.memory.long_term.navigation_notes[-6:],
                 "heuristics": self.memory.long_term.heuristics[-6:],
+                "world_map_stats": world_map_stats(self.memory.long_term.world_map),
+                "navigation_goal": (
+                    self.memory.long_term.navigation_goal.model_dump()
+                    if self.memory.long_term.navigation_goal is not None
+                    else None
+                ),
             },
         }
 

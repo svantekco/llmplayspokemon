@@ -9,6 +9,7 @@ from pokemon_agent.agent.prompt_builder import PromptBuilder
 from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
+from pokemon_agent.models.state import BattleContext
 from pokemon_agent.models.state import GameMode
 
 
@@ -111,5 +112,5 @@ class ScenarioEvaluator:
         emulator.state.metadata["dialogue"] = "Testing dialogue"
 
     def _setup_battle_recovery(self, emulator: MockEmulatorAdapter) -> None:
-        emulator.state.battle_state = {"kind": "WILD", "opponent": "RATTATA"}
+        emulator.state.battle_state = BattleContext(kind="WILD", opponent="RATTATA", enemy_species="RATTATA")
         emulator.state.mode = GameMode.BATTLE

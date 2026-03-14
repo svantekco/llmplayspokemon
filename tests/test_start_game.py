@@ -5,13 +5,14 @@ import os
 from argparse import Namespace
 from pathlib import Path
 
-from scripts.start_game import apply_runtime_environment, build_main_args, resolve_planner
+from scripts.start_game import apply_runtime_environment, build_main_args, resolve_planner, session_is_resumable
 
 
 def test_start_game_uses_resume_when_checkpoint_exists(tmp_path: Path):
     session_dir = tmp_path / "session"
     session_dir.mkdir()
     (session_dir / "checkpoint.json").write_text(json.dumps({"completed_turns": 2}), encoding="utf-8")
+    (session_dir / "emulator.state").write_bytes(b"state")
 
     args = Namespace(
         mode="mock",
@@ -33,6 +34,43 @@ def test_start_game_uses_resume_when_checkpoint_exists(tmp_path: Path):
     assert main_args.checkpoint_dir == str(session_dir.resolve())
     assert main_args.continuous is True
     assert main_args.log_mode == "compact"
+
+
+def test_start_game_does_not_resume_without_emulator_state(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "checkpoint.json").write_text(json.dumps({"completed_turns": 2}), encoding="utf-8")
+
+    args = Namespace(
+        mode="mock",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="fallback",
+        session_dir=str(session_dir),
+        fresh=False,
+        eval=False,
+        log_mode="compact",
+        window=None,
+        headless=False,
+    )
+
+    main_args = build_main_args(args)
+
+    assert main_args.resume is None
+
+
+def test_session_is_resumable_requires_both_checkpoint_and_emulator_state(tmp_path: Path):
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+
+    assert session_is_resumable(session_dir) is False
+
+    (session_dir / "checkpoint.json").write_text("{}", encoding="utf-8")
+    assert session_is_resumable(session_dir) is False
+
+    (session_dir / "emulator.state").write_bytes(b"state")
+    assert session_is_resumable(session_dir) is True
 
 
 def test_start_game_clears_session_when_fresh(tmp_path: Path):

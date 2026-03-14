@@ -124,22 +124,26 @@ def test_context_manager_builds_tight_overworld_payload():
 
     assert context["immediate_state"]["map"]["name"] == "Viridian City"
     assert context["immediate_state"]["current_milestone"]["id"] == "viridian_forest"
-    assert context["immediate_state"]["story_progress"] == "3/24 milestones complete"
-    assert context["walkthrough_context"]["milestone_id"] == "viridian_forest"
-    assert context["active_objective_stack"][0]["id"] == "long"
+    assert "story_progress" not in context["immediate_state"]
+    assert "navigation_window" not in context["immediate_state"]
+    assert "walkthrough_context" not in context
+    assert "active_objective_stack" not in context
+    assert "recommended_next_step" not in context
+    assert "goal" in context
+    assert "Viridian Forest" in context["goal"]
     assert context["overworld_context"]["visual_map"] is not None
     assert "P" in context["overworld_context"]["visual_map"]
     assert "~" in context["overworld_context"]["visual_map"]
     assert "@" in context["overworld_context"]["visual_map"]
     assert "D" in context["overworld_context"]["visual_map"]
     assert context["candidate_next_steps"][0]["id"] == "exit_east"
-    assert context["recommended_next_step"]["id"] == "exit_east"
-    assert "Overworld:" in snapshot.system_prompt
-    assert "Viridian City" in snapshot.system_prompt
+    assert "candidate_next_steps" in snapshot.system_prompt
     assert '"walkable":' not in text
     assert '"blocked":' not in text
     assert "party" not in text
     assert "inventory" not in text
+
+
 
 
 def test_context_manager_keeps_deterministic_text_context_small():
@@ -163,7 +167,7 @@ def test_context_manager_keeps_deterministic_text_context_small():
     assert context["immediate_state"]["current_milestone"]["id"] == "get_starter"
     assert context["dialogue_context"]["dialogue_text"] == "Oak: Take this?"
     assert context["dialogue_context"]["choice_mode"] == "ADVANCE_OR_CHOOSE"
-    assert "Dialogue:" in snapshot.system_prompt
+    assert "select_yes or select_no" in snapshot.system_prompt
     assert "candidate_next_steps" not in context
     assert "recommended_next_step" not in context
 
@@ -185,7 +189,7 @@ def test_context_manager_marks_yes_no_dialogue_prompts():
 
     assert context["dialogue_context"]["choice_mode"] == "YES_NO"
     assert context["dialogue_context"]["dialogue_text"] == "Professor Oak: Do you want a Pokedex? YES/NO"
-    assert "Choose Yes or No" in snapshot.system_prompt
+    assert "select_yes or select_no" in snapshot.system_prompt
 
 
 def test_context_manager_builds_battle_specific_prompt_and_context():
@@ -212,8 +216,8 @@ def test_context_manager_builds_battle_specific_prompt_and_context():
     assert context["battle_context"]["enemy"]["level"] == 3
     assert context["battle_context"]["lead_pokemon"]["name"] == "Charmander"
     assert context["battle_context"]["moves"] == ["Tackle", "Growl"]
-    assert "Battle:" in snapshot.system_prompt
-    assert "PIDGEY lv 3" in snapshot.system_prompt
+    assert "battle_prompt" not in context["battle_context"]
+    assert "candidate_next_steps" in snapshot.system_prompt
 
 
 def test_context_manager_includes_stuck_warning_and_last_outcome():
@@ -261,4 +265,4 @@ def test_context_manager_prunes_recent_events_before_objectives_and_candidates()
 
     assert "recent_events" in snapshot.dropped_sections
     assert "candidate_next_steps" in snapshot.payload["context"]
-    assert "active_objective_stack" in snapshot.payload["context"]
+    assert "goal" in snapshot.payload["context"]

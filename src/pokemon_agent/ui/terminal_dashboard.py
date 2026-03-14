@@ -13,6 +13,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from pokemon_agent.agent.ascii_map import build_ascii_map
 from pokemon_agent.agent.engine import TurnResult
 from pokemon_agent.models.state import StructuredGameState
 
@@ -38,6 +39,7 @@ class TerminalDashboard:
         self.turn_history: list[TurnResult] = []
         self.summary: dict[str, Any] = {}
         self.status = "Starting"
+        self.status_note: str | None = None
         self.resume_path: str | None = None
         self.resume_turns = 0
         self._live: Live | None = None
@@ -81,18 +83,26 @@ class TerminalDashboard:
             return
         self.console.print(self.render())
 
+    def request_stop(self) -> None:
+        self.status = "Stopping"
+        self.status_note = "Press Ctrl+C again to save immediately and exit."
+        if self._live is not None:
+            self._refresh()
+
     def render(self) -> Layout:
         layout = Layout(name="root")
         layout.split_column(
-            Layout(name="top", size=10),
+            Layout(name="top", size=16),
             Layout(name="turns", ratio=1, minimum_size=6),
             Layout(name="llm", ratio=2, minimum_size=12),
         )
         layout["top"].split_row(
             Layout(name="state"),
+            Layout(name="seen_area", size=34),
             Layout(name="status", size=44),
         )
         layout["state"].update(self._render_current_state())
+        layout["seen_area"].update(self._render_current_seen_area())
         layout["status"].update(self._render_status())
         layout["turns"].update(self._render_turns())
         layout["llm"].update(self._render_llm_calls())
@@ -127,6 +137,25 @@ class TerminalDashboard:
         table.add_row("Step", str(state.step))
         return Panel(table, title="Current State", border_style="cyan")
 
+    def _render_current_seen_area(self) -> Panel:
+        if self.current_state is None:
+            return Panel("Waiting for overworld map...", title="Current Seen Area", border_style="bright_cyan")
+
+        ascii_map = build_ascii_map(self.current_state)
+        body = self._render_ascii_block(ascii_map)
+        subtitle_parts: list[str] = []
+        discovered_maps = self.summary.get("discovered_maps")
+        confirmed = self.summary.get("confirmed_connectors")
+        suspected = self.summary.get("suspected_connectors")
+        if discovered_maps is not None:
+            subtitle_parts.append(f"maps {discovered_maps}")
+        if confirmed is not None:
+            subtitle_parts.append(f"confirmed {confirmed}")
+        if suspected is not None:
+            subtitle_parts.append(f"suspected {suspected}")
+        subtitle = " | ".join(subtitle_parts) if subtitle_parts else "world minimap hook ready"
+        return Panel(body, title="Current Seen Area", subtitle=subtitle, border_style="bright_cyan")
+
     def _render_status(self) -> Panel:
         table = Table.grid(expand=True, padding=(0, 1))
         table.add_column(style="magenta", no_wrap=True)
@@ -138,6 +167,8 @@ class TerminalDashboard:
             target = self.target_turns if self.target_turns is not None else "?"
             turn_progress = f"{turns_completed} / {target}"
         table.add_row("Status", self.status)
+        if self.status_note:
+            table.add_row("Note", self.status_note)
         table.add_row("Planner", self.planner)
         table.add_row("Turns", turn_progress)
         table.add_row("Fallback", str(self.summary.get("fallback_turns", 0)))
@@ -208,6 +239,8 @@ class TerminalDashboard:
             return Panel(message, title="LLM Calls", border_style="yellow")
 
         turn = self.latest_turn
+        planning_map = build_ascii_map(turn.before)
+        prompt_map = self._extract_prompt_visual_map(turn.prompt_messages)
         summary = Table.grid(expand=True, padding=(0, 1))
         summary.add_column(style="yellow", no_wrap=True)
         summary.add_column(ratio=1)
@@ -232,6 +265,10 @@ class TerminalDashboard:
             summary.add_row("Usage", usage, "Nav", self._format_navigation(turn))
         else:
             summary.add_row("Usage", "n/a", "Nav", self._format_navigation(turn))
+        summary.add_row("State Map", self._presence_label(planning_map), "Prompt Map", self._presence_label(prompt_map))
+        summary.add_row("Map Match", self._map_match_label(planning_map, prompt_map), "Prompt Sent", self._yes_no(turn.llm_attempted))
+
+        map_panel = self._render_prompt_map_panel(planning_map, prompt_map)
 
         request_table = Table(expand=True, box=box.SIMPLE, show_header=True, header_style="bold yellow")
         request_table.add_column("Role", width=10, no_wrap=True)
@@ -262,6 +299,8 @@ class TerminalDashboard:
         )
         body = Group(
             summary,
+            Rule(style="dim"),
+            map_panel,
             Rule(style="dim"),
             Text("Request", style="bold yellow"),
             request_table,
@@ -388,3 +427,61 @@ class TerminalDashboard:
         if turn.after.navigation is None:
             return "n/a"
         return f"visible {len(turn.after.navigation.walkable)} walkable"
+
+    @classmethod
+    def _render_prompt_map_panel(cls, planning_map: str | None, prompt_map: str | None) -> Panel:
+        if planning_map is None and prompt_map is None:
+            message = Text("No overworld ASCII map was available for this turn.", style="dim")
+            return Panel(message, title="ASCII Map", border_style="cyan")
+
+        table = Table.grid(expand=True, padding=(0, 2))
+        table.add_column(ratio=1)
+        table.add_column(ratio=1)
+        table.add_row(
+            Text("Planning State", style="bold cyan"),
+            Text("Planner Payload", style="bold yellow"),
+        )
+        table.add_row(
+            cls._render_ascii_block(planning_map),
+            cls._render_ascii_block(prompt_map),
+        )
+        return Panel(table, title="ASCII Map", border_style="cyan")
+
+    @staticmethod
+    def _render_ascii_block(value: str | None) -> Text:
+        if not value:
+            return Text("n/a", style="dim")
+        return Text(value)
+
+    @classmethod
+    def _extract_prompt_visual_map(cls, messages: list[dict[str, Any]]) -> str | None:
+        for message in reversed(messages):
+            if str(message.get("role", "")).lower() != "user":
+                continue
+            payload = cls._parse_message_payload(message.get("content"))
+            if payload is None:
+                continue
+            visual_map = payload.get("context", {}).get("overworld_context", {}).get("visual_map")
+            if isinstance(visual_map, str) and visual_map.strip():
+                return visual_map
+        return None
+
+    @staticmethod
+    def _parse_message_payload(content: Any) -> dict[str, Any] | None:
+        if isinstance(content, dict):
+            return content
+        try:
+            payload = json.loads(str(content))
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _presence_label(value: str | None) -> str:
+        return "yes" if value else "no"
+
+    @classmethod
+    def _map_match_label(cls, planning_map: str | None, prompt_map: str | None) -> str:
+        if planning_map is None or prompt_map is None:
+            return "n/a"
+        return cls._yes_no(planning_map == prompt_map)

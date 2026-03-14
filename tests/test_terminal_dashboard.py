@@ -16,7 +16,7 @@ from pokemon_agent.agent.stuck_detector import StuckDetector
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionDecision, ActionType
 from pokemon_agent.models.events import EventRecord, EventType
-from pokemon_agent.models.state import GameMode, InventoryItem, PartyMember, StructuredGameState
+from pokemon_agent.models.state import GameMode, InventoryItem, NavigationSnapshot, PartyMember, StructuredGameState, WorldCoordinate
 from pokemon_agent.ui.terminal_dashboard import TerminalDashboard
 
 
@@ -29,6 +29,16 @@ def test_dashboard_renders_state_turns_and_llm_details():
         y=5,
         facing="UP",
         mode=GameMode.OVERWORLD,
+        navigation=NavigationSnapshot(
+            min_x=0,
+            min_y=0,
+            max_x=9,
+            max_y=9,
+            player=WorldCoordinate(x=5, y=5),
+            walkable=[WorldCoordinate(x=5, y=5), WorldCoordinate(x=5, y=4), WorldCoordinate(x=9, y=5)],
+            blocked=[WorldCoordinate(x=4, y=5)],
+            collision_hash="mock-hash",
+        ),
         party=[PartyMember(name="Charmander", hp=20, max_hp=20)],
         inventory=[InventoryItem(name="Potion", count=1)],
         step=12,
@@ -46,7 +56,13 @@ def test_dashboard_renders_state_turns_and_llm_details():
         raw_model_response='{"action":"MOVE_UP","repeat":1,"reason":"Walk north to progress."}',
         prompt_messages=[
             {"role": "system", "content": "You are a planner."},
-            {"role": "user", "content": '{"context":{"candidate_next_steps":[{"id":"exit_north"}]}}'},
+            {
+                "role": "user",
+                "content": (
+                    '{"context":{"candidate_next_steps":[{"id":"exit_north"}],'
+                    '"overworld_context":{"visual_map":"....\\n.#..\\n..P."}}}'
+                ),
+            },
         ],
         prompt_metrics=PromptMetrics(chars=120, approx_tokens=30, compact=True),
         llm_usage=LLMUsage(prompt_tokens=20, completion_tokens=10, total_tokens=30),
@@ -82,12 +98,16 @@ def test_dashboard_renders_state_turns_and_llm_details():
     rendered = console.export_text()
 
     assert "Current State" in rendered
+    assert "Current Seen Area" in rendered
     assert "Turn History" in rendered
     assert "LLM Calls" in rendered
     assert "Pallet Town" in rendered
     assert "MOVE_UP x1" in rendered
     assert "openai/gpt-5-mini" in rendered
     assert "Walk north to progress." in rendered
+    assert "ASCII Map" in rendered
+    assert "Planner Payload" in rendered
+    assert "Map Match" in rendered
 
 
 def test_dashboard_shows_fallback_note_when_no_llm_call():

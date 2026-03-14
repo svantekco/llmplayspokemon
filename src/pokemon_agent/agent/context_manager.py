@@ -5,33 +5,31 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from pokemon_agent.agent.ascii_map import build_ascii_map
 from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckState
+from pokemon_agent.agent.world_map import summarize_navigation_goal
 from pokemon_agent.data.walkthrough import get_current_milestone
-from pokemon_agent.data.walkthrough import get_progress_summary
-from pokemon_agent.emulator.screen_renderer import render_ascii_map
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.planner import CandidateNextStep
-from pokemon_agent.models.planner import Objective
 from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import StructuredGameState
 
 RESPONSE_SCHEMA = {
-    "candidate_id": "candidate_1",
-    "reason": "nearest exit looks safest",
-    "confidence": 0.72,
+    "candidate_id": "<exact id from candidate_next_steps>",
+    "reason": "<10 words max>",
 }
 PLANNER_SYSTEM_PROMPT = (
-    "You select the next intent for a Pokemon Red engine; you do not control inputs directly. "
-    "The engine handles routing, timing, execution, validation, and recovery. "
-    "Decision order: resolve forced UI, text, or battle states first, continue a still-valid objective next, "
-    "then choose from candidate_next_steps. "
-    "Prefer the shortest valid step most likely to trigger its expected success signal. "
-    "Avoid repeating recent failed actions unless the state changed. "
-    "Return exactly one JSON object with candidate_id, reason, and optional confidence. "
-    "Keep reason short. No markdown or extra keys."
+    "You control a Pokémon Red agent. Your only task: select one candidate from candidate_next_steps "
+    "and return its exact id. "
+    "Rules: "
+    "(1) If stuck_warning is present, do not select a candidate listed in stuck_warning.failed_candidate_ids. "
+    "(2) For yes/no prompts, read the dialogue and choose select_yes or select_no. "
+    "(3) Otherwise prefer the candidate whose why best matches the current state and goal. "
+    'Return exactly: {"candidate_id": "<id>", "reason": "<10 words max>"}. '
+    "No markdown. No extra keys. candidate_id must be one of the ids shown."
 )
 
 
@@ -166,22 +164,26 @@ class ContextManager:
         memory_state: MemoryState,
         stuck_state: StuckState | None,
         candidate_next_steps: list[CandidateNextStep] | None,
-        recommended_step: CandidateNextStep | None,
+        recommended_step: CandidateNextStep | None,  # kept for API compat, not used
     ) -> dict[str, Any]:
         immediate_state = self._build_immediate_state(state)
-        walkthrough_context = self._build_walkthrough_context(immediate_state)
         context: dict[str, Any] = {
             "immediate_state": immediate_state,
-            "walkthrough_context": walkthrough_context,
-            "active_objective_stack": self._build_objectives(memory_state),
+            "goal": self._build_goal(immediate_state),
         }
-        context.update(self._build_mode_context(state, walkthrough_context))
+        context.update(self._build_mode_context(state, memory_state))
         if candidate_next_steps:
             context["candidate_next_steps"] = [self._serialize_candidate(item) for item in candidate_next_steps[:4]]
-        if recommended_step is not None:
-            context["recommended_next_step"] = self._serialize_candidate(recommended_step)
         stuck_warning = self._build_stuck_warning(stuck_state)
         if stuck_warning is not None:
+            if candidate_next_steps and stuck_state is not None:
+                failed_actions = set(stuck_state.recent_failed_actions[-3:])
+                failed_ids = [
+                    cand.id for cand in candidate_next_steps
+                    if cand.action and cand.action.action.value in failed_actions
+                ]
+                if failed_ids:
+                    stuck_warning["failed_candidate_ids"] = failed_ids
             context["stuck_warning"] = stuck_warning
         last_outcome = self._build_last_outcome()
         if last_outcome is not None:
@@ -192,38 +194,17 @@ class ContextManager:
         return context
 
     def _build_system_prompt(self, state: StructuredGameState, context: dict[str, Any]) -> str:
-        walkthrough = context.get("walkthrough_context", {})
-        milestone = str(walkthrough.get("milestone", "the active walkthrough milestone"))
-        target_map = str(walkthrough.get("target_map", "the next map"))
-        if state.battle_state or state.mode == GameMode.BATTLE:
-            battle_context = context.get("battle_context", {})
-            enemy = battle_context.get("enemy", {})
-            lead = battle_context.get("lead_pokemon", {})
-            moves = battle_context.get("moves", [])
-            enemy_label = str(enemy.get("name") or enemy.get("kind") or "the current enemy")
-            enemy_level = enemy.get("level")
-            if enemy_level is not None:
-                enemy_label = f"{enemy_label} lv {enemy_level}"
-            lead_name = str(lead.get("name", "your lead Pokemon"))
-            lead_hp = self._hp_text(lead.get("hp"), lead.get("max_hp"))
-            moves_label = ", ".join(str(move) for move in moves[:4]) if isinstance(moves, list) and moves else "unavailable"
-            return (
-                f"{PLANNER_SYSTEM_PROMPT} Battle: Fighting {enemy_label}. "
-                f"Your {lead_name} has {lead_hp}. Moves: {moves_label}. Choose wisely."
-            )
-        if state.text_box_open or state.mode == GameMode.TEXT:
-            dialogue_context = context.get("dialogue_context", {})
-            dialogue_text = str(dialogue_context.get("dialogue_text") or "dialogue text unavailable")
-            return (
-                f"{PLANNER_SYSTEM_PROMPT} Dialogue: NPC says: {dialogue_text!r}. "
-                "Choose Yes or No if a confirmation prompt is visible; otherwise pick the safest dialogue candidate."
-            )
-        if self._is_overworld_mode(state):
-            return (
-                f"{PLANNER_SYSTEM_PROMPT} Overworld: Navigate toward {milestone}. "
-                f"You are on {state.map_name}. Target: {target_map}."
-            )
-        return f"{PLANNER_SYSTEM_PROMPT} Stay aligned with the current walkthrough milestone: {milestone}."
+        return PLANNER_SYSTEM_PROMPT
+
+    def _build_goal(self, immediate_state: dict[str, Any]) -> str:
+        milestone = immediate_state.get("current_milestone", {})
+        description = str(milestone.get("description") or "")
+        target_map = str(milestone.get("target_map") or "")
+        if target_map and description:
+            return f"Navigate to {target_map} — {description}"
+        if description:
+            return description
+        return "Follow the walkthrough."
 
     def _build_immediate_state(self, state: StructuredGameState) -> dict[str, Any]:
         battle_payload = self._battle_payload(state)
@@ -235,26 +216,18 @@ class ContextManager:
             current_map_name=state.map_name,
             badges=state.badges,
         )
-        immediate = {
+        immediate: dict[str, Any] = {
             "engine_phase": state.metadata.get("engine_phase", "active"),
             "map": {"name": state.map_name, "id": state.map_id},
             "position": {"x": state.x, "y": state.y},
             "facing": state.facing,
             "mode": state.mode.value,
             "badges": list(state.badges),
-            "story_progress": get_progress_summary(
-                state.story_flags,
-                inventory_names,
-                current_map_name=state.map_name,
-                badges=state.badges,
-            ),
             "current_milestone": {
                 "id": current_milestone.id,
                 "description": current_milestone.description,
                 "target_map": current_milestone.target_map_name,
-                "route_hints": current_milestone.route_hints[:1],
-                "sub_steps": current_milestone.sub_steps[:1],
-                "required_hms": current_milestone.required_hms,
+                "next_hint": current_milestone.route_hints[0] if current_milestone.route_hints else None,
             },
             "ui_flags": {
                 "menu_open": state.menu_open,
@@ -270,55 +243,38 @@ class ContextManager:
             immediate["dialogue_text"] = dialogue_text
         if state.text_box_open:
             immediate["ui_flags"]["yes_no_prompt"] = bool(state.metadata.get("yes_no_prompt"))
-        if state.navigation is not None:
-            immediate["navigation_window"] = {
-                "min_x": state.navigation.min_x,
-                "min_y": state.navigation.min_y,
-                "max_x": state.navigation.max_x,
-                "max_y": state.navigation.max_y,
-                "collision_hash": state.navigation.collision_hash,
-            }
         return immediate
 
-    def _build_walkthrough_context(self, immediate_state: dict[str, Any]) -> dict[str, Any]:
-        milestone = immediate_state.get("current_milestone", {})
-        return {
-            "milestone_id": milestone.get("id"),
-            "milestone": milestone.get("description"),
-            "target_map": milestone.get("target_map"),
-            "route_hints": list(milestone.get("route_hints", []))[:3],
-        }
-
-    def _build_mode_context(self, state: StructuredGameState, walkthrough_context: dict[str, Any]) -> dict[str, Any]:
+    def _build_mode_context(self, state: StructuredGameState, memory_state: MemoryState) -> dict[str, Any]:
         if state.battle_state or state.mode == GameMode.BATTLE:
-            return {"battle_context": self._build_battle_context(state, walkthrough_context)}
+            return {"battle_context": self._build_battle_context(state)}
         if state.text_box_open or state.mode == GameMode.TEXT:
-            return {"dialogue_context": self._build_dialogue_context(state, walkthrough_context)}
+            return {"dialogue_context": self._build_dialogue_context(state)}
         if self._is_overworld_mode(state) and state.navigation is not None:
-            return {"overworld_context": self._build_overworld_context(state, walkthrough_context)}
+            return {"overworld_context": self._build_overworld_context(state, memory_state)}
         return {}
 
-    def _build_overworld_context(self, state: StructuredGameState, walkthrough_context: dict[str, Any]) -> dict[str, Any]:
-        milestone = str(walkthrough_context.get("milestone") or "the current milestone")
-        target_map = str(walkthrough_context.get("target_map") or "the next map")
-        visual_map = self._build_ascii_map(state)
+    def _build_overworld_context(self, state: StructuredGameState, memory_state: MemoryState) -> dict[str, Any]:
+        visual_map = build_ascii_map(state)
+        route_info = summarize_navigation_goal(
+            memory_state.long_term.world_map,
+            state.map_name,
+            memory_state.long_term.navigation_goal,
+        )
         return {
-            "navigation_prompt": f"Navigate toward {milestone}. You are on {state.map_name}. Target: {target_map}.",
             "visual_map": visual_map,
             "map_legend": "P=player .=walkable #=blocked ~=water @=isolated blocker D=door",
+            **route_info,
         }
 
-    def _build_dialogue_context(self, state: StructuredGameState, walkthrough_context: dict[str, Any]) -> dict[str, Any]:
+    def _build_dialogue_context(self, state: StructuredGameState) -> dict[str, Any]:
         dialogue_text = self._dialogue_text(state)
-        milestone = str(walkthrough_context.get("milestone") or "the current milestone")
         return {
-            "dialogue_prompt": f"NPC says: {dialogue_text!r}. Choose Yes or No.",
             "dialogue_text": dialogue_text,
             "choice_mode": "YES_NO" if self._looks_like_yes_no_prompt(dialogue_text) else "ADVANCE_OR_CHOOSE",
-            "milestone_focus": f"Prefer the dialogue branch that best advances {milestone}.",
         }
 
-    def _build_battle_context(self, state: StructuredGameState, walkthrough_context: dict[str, Any]) -> dict[str, Any]:
+    def _build_battle_context(self, state: StructuredGameState) -> dict[str, Any]:
         battle_state = self._battle_payload(state)
         enemy_name = (
             battle_state.get("opponent")
@@ -330,7 +286,6 @@ class ContextManager:
         enemy_level = self._coalesce(battle_state.get("opponent_level"), battle_state.get("enemy_level"))
         lead = state.party[0] if state.party else None
         moves = self._battle_moves(state)
-        milestone_target = str(walkthrough_context.get("target_map") or "the next map")
         lead_payload: dict[str, Any] = {
             "name": self._coalesce(battle_state.get("player_active_species"), lead.name if lead else None, "UNKNOWN"),
             "level": self._coalesce(battle_state.get("player_active_level"), lead.level if lead else None),
@@ -339,12 +294,6 @@ class ContextManager:
             "status": lead.status if lead else None,
         }
         return {
-            "battle_prompt": (
-                f"Fighting {enemy_name}"
-                f"{f' lv {enemy_level}' if enemy_level is not None else ''}. "
-                f"Your {lead_payload['name']} has {self._hp_text(lead_payload['hp'], lead_payload['max_hp'])}. "
-                f"Moves: {', '.join(moves[:4]) if moves else 'unavailable'}. Choose wisely."
-            ),
             "enemy": {
                 "kind": battle_state.get("kind"),
                 "name": enemy_name,
@@ -362,32 +311,7 @@ class ContextManager:
                 }
                 for member in state.party[:3]
             ],
-            "milestone_pressure": f"Winning or surviving this battle resumes progress toward {milestone_target}.",
         }
-
-    def _build_ascii_map(self, state: StructuredGameState) -> str | None:
-        if state.x is not None and state.y is not None and state.game_area is not None and state.collision_area is not None:
-            return render_ascii_map(state.game_area, state.collision_area, state.x, state.y)
-
-        navigation = state.navigation
-        if navigation is None or state.x is None or state.y is None:
-            return None
-        walkable = {(coord.x, coord.y) for coord in navigation.walkable}
-        blocked = {(coord.x, coord.y) for coord in navigation.blocked}
-        lines: list[str] = []
-        for y in range(navigation.min_y, navigation.max_y + 1):
-            chars: list[str] = []
-            for x in range(navigation.min_x, navigation.max_x + 1):
-                if (x, y) == (state.x, state.y):
-                    chars.append("P")
-                elif (x, y) in blocked:
-                    chars.append("#")
-                elif (x, y) in walkable:
-                    chars.append(".")
-                else:
-                    chars.append(" ")
-            lines.append("".join(chars).rstrip())
-        return "\n".join(line for line in lines if line)
 
     @staticmethod
     def _dialogue_text(state: StructuredGameState) -> str:
@@ -460,12 +384,6 @@ class ContextManager:
                 return payload
         return {}
 
-    def _build_objectives(self, memory_state: MemoryState) -> list[dict[str, Any]]:
-        objectives = memory_state.goals.active_objectives
-        if not objectives:
-            objectives = self._fallback_objectives(memory_state)
-        return [self._serialize_objective(item) for item in objectives[:3]]
-
     def _build_recent_events(self, memory_state: MemoryState) -> list[dict[str, Any]]:
         return [
             {
@@ -490,38 +408,6 @@ class ContextManager:
             "stuck_score": trace.stuck_score,
         }
 
-    def _fallback_objectives(self, memory_state: MemoryState) -> list[Objective]:
-        goals = memory_state.goals
-        return [
-            Objective(
-                id="fallback_long",
-                horizon="long",
-                summary=goals.long_term_goal,
-                priority=30,
-                success_conditions=goals.success_conditions[-2:] or ["Reach a new map or story interaction"],
-            ),
-            Objective(
-                id="fallback_mid",
-                horizon="mid",
-                summary=goals.mid_term_goal,
-                priority=20,
-                success_conditions=["Make meaningful local progress"],
-            ),
-            Objective(
-                id="fallback_short",
-                horizon="short",
-                summary=goals.short_term_goal,
-                priority=10,
-                success_conditions=["Cause a visible state change"],
-            ),
-        ]
-
-    def _serialize_objective(self, objective: Objective) -> dict[str, Any]:
-        payload = objective.model_dump(mode="json", exclude_none=True)
-        payload["success_conditions"] = payload.get("success_conditions", [])[:2]
-        payload["invalidation_conditions"] = payload.get("invalidation_conditions", [])[:2]
-        return payload
-
     def _serialize_candidate(self, candidate: CandidateNextStep) -> dict[str, Any]:
         payload = candidate.model_dump(mode="json", exclude_none=True)
         return payload
@@ -534,7 +420,6 @@ class ContextManager:
             "recent_failed_actions": stuck_state.recent_failed_actions,
             "loop_signature": stuck_state.loop_signature,
             "recovery_hint": stuck_state.recovery_hint,
-            "instruction": "Avoid repeating recent no-effect actions unless the state changed.",
         }
 
     def _prune_to_budget(self, payload: dict[str, Any], dropped_sections: list[str], system_prompt: str) -> None:
@@ -542,12 +427,62 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        if "recommended_next_step" in context:
-            context["recommended_next_step"].pop("why", None)
-            dropped_sections.append("recommended_step_reduced")
+        # 1. Drop ASCII map first (large, only useful when stuck)
+        overworld_context = context.get("overworld_context")
+        if isinstance(overworld_context, dict) and "visual_map" in overworld_context:
+            overworld_context.pop("visual_map", None)
+            overworld_context.pop("map_legend", None)
+            dropped_sections.append("overworld_ascii_map")
         if self._within_budget(payload, system_prompt):
             return
 
+        # 2. Drop battle party preview
+        battle_context = context.get("battle_context")
+        if isinstance(battle_context, dict) and "party_preview" in battle_context:
+            del battle_context["party_preview"]
+            dropped_sections.append("battle_party_preview")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        # 3. Reduce then drop recent events
+        recent_events = context.get("recent_events")
+        if isinstance(recent_events, list) and len(recent_events) > 1:
+            context["recent_events"] = recent_events[-1:]
+            dropped_sections.append("recent_events_reduced")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        if "recent_events" in context:
+            del context["recent_events"]
+            dropped_sections.append("recent_events")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        # 4. Reduce last_outcome
+        last_outcome = context.get("last_outcome")
+        if isinstance(last_outcome, dict) and "event_summaries" in last_outcome:
+            last_outcome["event_summaries"] = last_outcome.get("event_summaries", [])[:1]
+            dropped_sections.append("last_outcome_reduced")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        # 5. Reduce stuck_warning (drop loop_signature, failed_candidate_ids)
+        if "stuck_warning" in context:
+            context["stuck_warning"].pop("loop_signature", None)
+            context["stuck_warning"].pop("failed_candidate_ids", None)
+            dropped_sections.append("stuck_warning_reduced")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        # 6. Reduce candidate list to 3
+        candidates = context.get("candidate_next_steps")
+        if isinstance(candidates, list) and len(candidates) > 3:
+            context["candidate_next_steps"] = candidates[:3]
+            dropped_sections.append("candidate_next_steps_reduced")
+        if self._within_budget(payload, system_prompt):
+            return
+
+        # 7. Drop candidate why fields (near-last — most actionable data)
         candidates = context.get("candidate_next_steps")
         if isinstance(candidates, list):
             reduced_any = False
@@ -560,78 +495,7 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        overworld_context = context.get("overworld_context")
-        if isinstance(overworld_context, dict) and "visual_map" in overworld_context:
-            overworld_context.pop("visual_map", None)
-            overworld_context.pop("map_legend", None)
-            dropped_sections.append("overworld_ascii_map")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        battle_context = context.get("battle_context")
-        if isinstance(battle_context, dict) and "party_preview" in battle_context:
-            del battle_context["party_preview"]
-            dropped_sections.append("battle_party_preview")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        walkthrough_context = context.get("walkthrough_context")
-        if isinstance(walkthrough_context, dict):
-            walkthrough_context["route_hints"] = list(walkthrough_context.get("route_hints", []))[:1]
-            dropped_sections.append("walkthrough_context_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        recent_events = context.get("recent_events")
-        if isinstance(recent_events, list) and len(recent_events) > 2:
-            context["recent_events"] = recent_events[-2:]
-            dropped_sections.append("recent_events_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        if "recent_events" in context:
-            del context["recent_events"]
-            dropped_sections.append("recent_events")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        last_outcome = context.get("last_outcome")
-        if isinstance(last_outcome, dict) and "event_summaries" in last_outcome:
-            last_outcome["event_summaries"] = last_outcome.get("event_summaries", [])[:1]
-            dropped_sections.append("last_outcome_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        if "stuck_warning" in context:
-            context["stuck_warning"].pop("loop_signature", None)
-            context["stuck_warning"].pop("instruction", None)
-            dropped_sections.append("stuck_warning_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        candidates = context.get("candidate_next_steps")
-        if isinstance(candidates, list) and len(candidates) > 3:
-            context["candidate_next_steps"] = candidates[:3]
-            dropped_sections.append("candidate_next_steps_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        objectives = context.get("active_objective_stack")
-        if isinstance(objectives, list):
-            for objective in objectives:
-                objective["success_conditions"] = objective.get("success_conditions", [])[:1]
-                objective["invalidation_conditions"] = objective.get("invalidation_conditions", [])[:1]
-            dropped_sections.append("objective_stack_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        immediate_state = context.get("immediate_state", {})
-        if "navigation_window" in immediate_state:
-            del immediate_state["navigation_window"]
-            dropped_sections.append("navigation_window")
-        if self._within_budget(payload, system_prompt):
-            return
-
+        # 8. Last resort: reduce to single candidate
         candidates = context.get("candidate_next_steps")
         if isinstance(candidates, list) and len(candidates) > 1:
             context["candidate_next_steps"] = candidates[:1]
