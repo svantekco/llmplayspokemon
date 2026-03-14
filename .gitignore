@@ -8,7 +8,7 @@ game.gb.ram
 *.gba
 
 # Local tooling state
-.claude/settings.local.json
+.claude/
 
 # Python caches
 __pycache__/

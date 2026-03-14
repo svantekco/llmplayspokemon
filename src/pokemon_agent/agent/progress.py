@@ -11,9 +11,15 @@ class ProgressResult:
     changed_fields: list[str] = field(default_factory=list)
     newly_completed_subgoals: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # True when the same dialogue/sign was opened again — should not count as real progress.
+    repeated_dialogue: bool = False
 
 
 class ProgressDetector:
+    def __init__(self) -> None:
+        # Dialogue text from the most recently closed text box, used to detect sign re-reads.
+        self._last_closed_dialogue: str | None = None
+
     def compare(self, previous: StructuredGameState, current: StructuredGameState) -> ProgressResult:
         changed: list[str] = []
         notes: list[str] = []
@@ -67,6 +73,15 @@ class ProgressDetector:
             notes.append(f"Inventory changed: {', '.join(inventory_gain)}")
             completed.extend([f"Obtained {item}" for item in inventory_gain])
 
+        # Detect when the same dialogue reopens (sign re-read loop).
+        repeated_dialogue = False
+        if not previous.text_box_open and current.text_box_open:
+            current_dialogue = self._get_dialogue(current)
+            if current_dialogue and current_dialogue == self._last_closed_dialogue:
+                repeated_dialogue = True
+        if previous.text_box_open and not current.text_box_open:
+            self._last_closed_dialogue = self._get_dialogue(previous)
+
         if not changed:
             return ProgressResult("no_effect", [], [], ["No meaningful state change detected"])
         if previous.battle_state and not current.battle_state:
@@ -76,12 +91,19 @@ class ProgressDetector:
         if "position" in changed:
             return ProgressResult("movement_success", changed, completed, notes)
         if "text_box_open" in changed or "menu_open" in changed or "battle_state" in changed or "screen_state" in changed:
-            return ProgressResult("interaction_success", changed, completed, notes)
+            return ProgressResult("interaction_success", changed, completed, notes, repeated_dialogue=repeated_dialogue)
         if current.mode == GameMode.BATTLE and previous.mode != GameMode.BATTLE:
             return ProgressResult("interaction_success", changed, completed, notes)
         if "facing" in changed or "mode" in changed:
             return ProgressResult("partial_progress", changed, completed, notes)
         return ProgressResult("unknown", changed, completed, notes or ["State changed in an unclassified way"])
+
+    @staticmethod
+    def _get_dialogue(state: StructuredGameState) -> str | None:
+        text = state.metadata.get("dialogue_text") or state.metadata.get("dialogue")
+        if isinstance(text, str):
+            return text.strip() or None
+        return None
 
     def _inventory_gain(self, previous: StructuredGameState, current: StructuredGameState) -> list[str]:
         before = {item.name: item.count for item in previous.inventory}

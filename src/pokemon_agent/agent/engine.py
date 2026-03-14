@@ -194,6 +194,10 @@ class ClosedLoopRunner:
         self.menu_manager = MenuManager()
         self._last_entry_direction: str | None = None  # direction we entered current map from
         self._previous_map_name: str | None = None
+        # Tracks (map_id, player_x, player_y) → turn_index of last text-box interaction.
+        # Used to suppress re-interacting with the same sign/object within a cooldown window.
+        self._interacted_tiles: dict[tuple[int, int, int], int] = {}
+        self._interaction_cooldown: int = 20
 
     _OPPOSITE_DIRECTION: dict[str, str] = {
         "north": "south",
@@ -210,8 +214,8 @@ class ClosedLoopRunner:
         self.executor.run(action)
         after = self.executor.emulator.get_structured_state()
         progress_result = self.progress.compare(before, after)
-        stuck_state = self.stuck.update(after, action, progress_result.classification)
-        # Track entry direction on map change
+        stuck_state = self.stuck.update(after, action, progress_result.classification, progress_result)
+        # Track entry direction on map change, and clear interaction cooldown on new map.
         if before.map_id != after.map_id or before.map_name != after.map_name:
             self._previous_map_name = before.map_name
             entered_via = self._side_for_action(action.action)
@@ -219,6 +223,17 @@ class ClosedLoopRunner:
             goal = self.memory.memory.long_term.navigation_goal
             if goal is not None and goal.target_map_name != after.map_name:
                 goal.confirmation_required_map = after.map_name
+            self._interacted_tiles.clear()
+        # Record player position when a text box opens (sign/NPC interaction detected).
+        if (
+            not before.text_box_open
+            and after.text_box_open
+            and before.map_id is not None
+            and before.x is not None
+            and before.y is not None
+        ):
+            key = (before.map_id, before.x, before.y)
+            self._interacted_tiles[key] = turn_index
         self._refresh_route_cache_after_turn(after, progress_result)
         self._refresh_execution_plan_after_turn(after, progress_result)
         events = self.memory.update_from_transition(before, after, action, progress_result, stuck_state)
@@ -669,6 +684,11 @@ class ClosedLoopRunner:
             return None
         if "PRESS_A" in self.stuck.state.recent_failed_actions[-2:]:
             return None
+        if state.map_id is not None and state.x is not None and state.y is not None:
+            key = (state.map_id, state.x, state.y)
+            last_turn = self._interacted_tiles.get(key)
+            if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
+                return None
         return CandidateNextStep(
             id=f"interact_adjacent_{best_x}_{best_y}",
             type="MOVE_ADJACENT_TO_INTERACTABLE",
@@ -701,6 +721,12 @@ class ClosedLoopRunner:
                 target_y = blocked_y + dy
                 if (target_x, target_y) not in walkable_set or (target_x, target_y) == (state.x, state.y):
                     continue
+                # Skip approach positions recently used for an interaction.
+                if state.map_id is not None:
+                    approach_key = (state.map_id, target_x, target_y)
+                    last_turn = self._interacted_tiles.get(approach_key)
+                    if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
+                        continue
                 route = find_path(state.navigation, state.x, state.y, target_x, target_y)
                 if route is None or len(route) == 0:
                     continue

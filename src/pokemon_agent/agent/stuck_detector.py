@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.state import StructuredGameState
 
@@ -25,30 +26,34 @@ class StuckDetector:
         self.state = StuckState()
         self.threshold = threshold
 
-    def update(self, game_state: StructuredGameState, action: ActionDecision, progress_classification: str) -> StuckState:
+    def update(self, game_state: StructuredGameState, action: ActionDecision, progress_classification: str, progress_result: ProgressResult | None = None) -> StuckState:
         signature = game_state.state_signature()
         self.state.recent_signatures.append(signature)
         if game_state.map_name:
             self.state.recent_maps.append(game_state.map_name)
         self.state.map_oscillating = self._is_map_oscillating()
 
-        progress_made = progress_classification in {
+        # Repeated dialogue (same sign read again) is treated as no_effect for scoring.
+        repeated_dialogue = progress_result is not None and progress_result.repeated_dialogue
+        effective_classification = "no_effect" if repeated_dialogue else progress_classification
+
+        progress_made = effective_classification in {
             "major_progress",
             "movement_success",
             "interaction_success",
             "partial_progress",
         }
 
-        if progress_classification == "no_effect":
+        if effective_classification == "no_effect":
             self.state.score += 1
             self.state.recent_failed_actions.append(action.action.value)
             self.state.recent_failed_actions = self.state.recent_failed_actions[-5:]
             self.state.steps_since_progress += 1
-        elif progress_classification == "regression":
+        elif effective_classification == "regression":
             self.state.score += 2
             self.state.steps_since_progress += 1
         else:
-            self.state.score = max(0, self.state.score - (2 if progress_classification == "major_progress" else 1))
+            self.state.score = max(0, self.state.score - (2 if effective_classification == "major_progress" else 1))
             if progress_made:
                 self.state.steps_since_progress = 0
 

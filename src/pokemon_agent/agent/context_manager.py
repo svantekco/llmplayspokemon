@@ -86,8 +86,8 @@ class ContextManager:
     def __init__(
         self,
         budget_tokens: int = 2500,
-        action_window: int = 4,
-        event_window: int = 4,
+        action_window: int = 8,
+        event_window: int = 6,
     ) -> None:
         self.budget_tokens = budget_tokens
         self.action_window = action_window
@@ -182,6 +182,14 @@ class ContextManager:
                     cand.id for cand in candidate_next_steps
                     if cand.action and cand.action.action.value in failed_actions
                 ]
+                # When oscillating/high stuck score, also flag interactable candidates so the
+                # LLM avoids re-selecting them (same sign re-read pattern).
+                if stuck_state.score >= 2 and (stuck_state.oscillating or stuck_state.score >= 3):
+                    interactable_ids = [
+                        cand.id for cand in candidate_next_steps
+                        if cand.type == "MOVE_ADJACENT_TO_INTERACTABLE"
+                    ]
+                    failed_ids = list(dict.fromkeys(failed_ids + interactable_ids))
                 if failed_ids:
                     stuck_warning["failed_candidate_ids"] = failed_ids
             context["stuck_warning"] = stuck_warning
