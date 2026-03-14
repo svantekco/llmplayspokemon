@@ -1586,7 +1586,7 @@ class ClosedLoopRunner:
             approach_y = source_y - dy
             if (approach_x, approach_y) not in walkable_set:
                 continue
-            route = find_path(state.navigation, state.x, state.y, approach_x, approach_y)
+            route = self._find_path_with_temporary_blockers(state, approach_x, approach_y)
             if route is None:
                 continue
             distance = len(route)

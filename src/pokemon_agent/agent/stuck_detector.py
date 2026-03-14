@@ -25,8 +25,22 @@ class StuckDetector:
     def __init__(self, threshold: int = 4) -> None:
         self.state = StuckState()
         self.threshold = threshold
+        self._last_mode: str | None = None
 
     def update(self, game_state: StructuredGameState, action: ActionDecision, progress_classification: str, progress_result: ProgressResult | None = None) -> StuckState:
+        # Reset stuck score on game-mode transitions (e.g. CUTSCENE → OVERWORLD).
+        # Cutscene turns produce many no_effect results that are expected
+        # behaviour; carrying that score into OVERWORLD would incorrectly
+        # trigger recovery logic for dozens of turns.
+        current_mode = game_state.mode.value if game_state.mode else None
+        if self._last_mode is not None and current_mode != self._last_mode:
+            self.state.score = 0
+            self.state.steps_since_progress = 0
+            self.state.recent_failed_actions.clear()
+            self.state.oscillating = False
+            self.state.repeated_state_count = 0
+        self._last_mode = current_mode
+
         signature = game_state.state_signature()
         self.state.recent_signatures.append(signature)
         if game_state.map_name:
