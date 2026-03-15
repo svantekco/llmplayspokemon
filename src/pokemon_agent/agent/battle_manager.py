@@ -116,7 +116,6 @@ class BattleManager:
             )
             self._runtime[candidate.id] = CandidateRuntime(
                 action=self._action_for_move_selection(battle, index),
-                step_budget=1,
             )
             candidates.append(candidate)
 
@@ -147,7 +146,6 @@ class BattleManager:
             )
             self._runtime[candidate.id] = CandidateRuntime(
                 action=self._action_for_main_menu_target(battle, MAIN_MENU_POSITIONS["RUN"], "RUN"),
-                step_budget=1,
             )
             candidates.append(candidate)
 
@@ -227,7 +225,7 @@ class BattleManager:
             expected_success_signal=f"{item_name} is used or the bag cursor changes",
             objective_id=objective_id,
         )
-        self._runtime[candidate.id] = CandidateRuntime(action=action, step_budget=1)
+        self._runtime[candidate.id] = CandidateRuntime(action=action)
         return candidate
 
     def _build_switch_candidate(
@@ -251,7 +249,7 @@ class BattleManager:
             expected_success_signal="The active Pokemon changes or the party cursor advances",
             objective_id=objective_id,
         )
-        self._runtime[candidate.id] = CandidateRuntime(action=action, step_budget=1)
+        self._runtime[candidate.id] = CandidateRuntime(action=action)
         return candidate
 
     def _fallback_candidate(self, objective_id: str | None, why: str) -> CandidateNextStep:
@@ -265,7 +263,6 @@ class BattleManager:
         )
         self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance battle"),
-            step_budget=6,
         )
         return candidate
 

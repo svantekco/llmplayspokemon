@@ -43,36 +43,13 @@ class ActionValidator:
         if state.is_bootstrap():
             return self.bootstrap(state, stuck_state=stuck_state, reason=reason)
 
-        stuck_score = stuck_state.score if stuck_state else 0
-        recent_failed = set(stuck_state.recent_failed_actions[-3:] if stuck_state else [])
-
         if state.text_box_open:
             return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
         if state.menu_open:
             return ActionDecision(action=ActionType.PRESS_B, repeat=1, reason=reason)
         if state.mode == GameMode.BATTLE:
             return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
-        if stuck_score >= 4 and "PRESS_A" not in recent_failed:
-            return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
-
-        cycle = [
-            ActionType.MOVE_UP,
-            ActionType.MOVE_RIGHT,
-            ActionType.MOVE_DOWN,
-            ActionType.MOVE_LEFT,
-        ]
-        candidates = [action for action in cycle if action.value not in recent_failed]
-        if candidates:
-            action = candidates[stuck_score % len(candidates)]
-            return ActionDecision(action=action, repeat=1, reason=reason)
-
-        if stuck_score >= 6 and "PRESS_B" not in recent_failed:
-            return ActionDecision(action=ActionType.PRESS_B, repeat=1, reason=reason)
-        if stuck_score >= 8 and "PRESS_START" not in recent_failed:
-            return ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=reason)
-
-        action = cycle[stuck_score % len(cycle)]
-        return ActionDecision(action=action, repeat=1, reason=reason)
+        return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
 
     def bootstrap(
         self,

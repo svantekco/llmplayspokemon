@@ -4,8 +4,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from pokemon_agent.agent.engine import ClosedLoopRunner
+from pokemon_agent.agent.engine import PlanningResult
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_collision
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_tiles
 from pokemon_agent.agent.memory_manager import MemoryManager
@@ -18,9 +20,10 @@ from pokemon_agent.data.walkthrough import Milestone
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
+from pokemon_agent.models.action import Task
+from pokemon_agent.models.action import TaskKind
 from pokemon_agent.models.memory import ConnectorStatus, DiscoveredConnector, DiscoveredMap
 from pokemon_agent.models.planner import CandidateNextStep
-from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.planner import HumanObjectivePlan
 from pokemon_agent.models.planner import InternalObjectivePlan
 from pokemon_agent.models.planner import Objective
@@ -55,6 +58,32 @@ class _PlanningAdvanceMock(MockEmulatorAdapter):
         self.state.x = 6
         self.state.step += 1
         self._planning_advanced = True
+
+
+class _LiveOverlayMock(MockEmulatorAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.maps["Mock Town"]["npc"] = None
+        self._sync_navigation()
+        self.frame = Image.new("RGBA", (160, 144), color=(32, 48, 96, 255))
+        self.call_log: list[str] = []
+        self.overlay_payloads: list[tuple[StructuredGameState, list[tuple[int, int]]]] = []
+
+    def capture_screen_image(self):
+        self.call_log.append("capture")
+        return self.frame.copy()
+
+    def set_live_path_overlay(self, state: StructuredGameState, suggested_path: list[tuple[int, int]]) -> None:
+        self.call_log.append("set")
+        self.overlay_payloads.append((state.model_copy(deep=True), list(suggested_path)))
+        self.frame.paste((255, 0, 0, 255), (0, 0, 8, 8))
+
+    def clear_live_path_overlay(self) -> None:
+        self.call_log.append("clear")
+
+    def execute_action(self, action):
+        self.call_log.append("execute")
+        super().execute_action(action)
 
 
 class _NoNpcMock(MockEmulatorAdapter):
@@ -507,6 +536,48 @@ def test_closed_loop_runner_executes_one_mock_turn():
     assert result.prompt_metrics is not None
 
 
+def test_runner_publishes_and_clears_live_overlay_around_action():
+    emulator = _LiveOverlayMock()
+    runner = _build_runner(emulator)
+    before = emulator.get_structured_state()
+    planned_path = [(before.x + 1, before.y)]
+    runner._resolve_turn_plan = lambda: (
+        before,
+        PlanningResult(
+            action=ActionDecision(action=ActionType.MOVE_RIGHT, repeat=1, reason="step right"),
+            suggested_path=planned_path,
+            planner_source="executor",
+        ),
+    )
+
+    result = runner.run_turn(1)
+
+    assert emulator.call_log[:4] == ["capture", "set", "execute", "clear"]
+    assert emulator.overlay_payloads[0][0].x == before.x
+    assert emulator.overlay_payloads[0][1] == planned_path
+    assert result.suggested_path == planned_path
+
+
+def test_runner_keeps_captured_screen_raw_when_live_overlay_mutates_frame():
+    emulator = _LiveOverlayMock()
+    runner = _build_runner(emulator)
+    before = emulator.get_structured_state()
+    runner._resolve_turn_plan = lambda: (
+        before,
+        PlanningResult(
+            action=ActionDecision(action=ActionType.MOVE_RIGHT, repeat=1, reason="step right"),
+            suggested_path=[(before.x + 1, before.y)],
+            planner_source="executor",
+        ),
+    )
+
+    result = runner.run_turn(1)
+
+    assert result.screen_image is not None
+    assert result.screen_image.getpixel((1, 1)) == (32, 48, 96, 255)
+    assert emulator.frame.getpixel((1, 1)) == (255, 0, 0, 255)
+
+
 def test_runner_checkpoint_round_trip(tmp_path: Path):
     emulator = MockEmulatorAdapter()
     runner = _build_runner(emulator)
@@ -518,13 +589,11 @@ def test_runner_checkpoint_round_trip(tmp_path: Path):
 
     assert payload["completed_turns"] == 1
     assert "context_state" in payload
-    assert "execution_plan" in payload
+    assert "executor_state" in payload
     restored_state = restored_runner.emulator.get_structured_state()
     assert restored_state.text_box_open is False
-    # Route draining executes the full cached path in one turn,
-    # so the player ends up at the navigation target rather than one step away.
-    assert restored_state.x == 9
-    assert restored_state.y == 1
+    assert restored_state.x == 5
+    assert restored_state.y == 4
     assert restored_runner.completed_turns == 1
     assert len(restored_runner.context_manager.action_traces) == 1
 
@@ -614,13 +683,12 @@ def test_runner_uses_live_state_after_planning_wait():
     result = runner.run_turn(1)
 
     assert result.before.x == 6
-    # Route draining executes the full cached path in one turn.
     assert result.after.x is not None
     assert result.after.x != result.before.x or result.after.y != result.before.y
     assert result.progress.classification == "movement_success"
 
 
-def test_runner_uses_execution_plan_for_followup_dialogue_without_llm():
+def test_runner_replans_followup_dialogue_without_llm():
     emulator = _TwoStepDialogueMock()
     llm = _ChooseCandidateLLM()
     runner = _build_runner(emulator, llm_client=llm)
@@ -631,11 +699,11 @@ def test_runner_uses_execution_plan_for_followup_dialogue_without_llm():
     assert llm.calls == 1
     assert first.llm_attempted is True
     assert first.planner_source == "auto_candidate"
-    assert second.planner_source == "execution_plan"
+    assert second.planner_source == "auto_candidate"
     assert second.action.action == ActionType.PRESS_A
 
 
-def test_runner_uses_execution_plan_for_cached_route_without_repeat_llm_calls():
+def test_runner_keeps_executor_task_active_without_repeat_llm_calls():
     emulator = _NoNpcMock()
     llm = _ChooseCandidateLLM(index=0)
     runner = _build_runner(emulator, llm_client=llm)
@@ -738,12 +806,7 @@ def test_runner_prefers_local_recovery_over_press_start_when_stuck_in_overworld(
     result = runner.run_turn(1)
 
     assert result.planner_source == "auto_candidate"
-    assert result.action.action in {
-        ActionType.MOVE_UP,
-        ActionType.MOVE_RIGHT,
-        ActionType.MOVE_DOWN,
-        ActionType.MOVE_LEFT,
-    }
+    assert result.action.action == ActionType.PRESS_A
 
 
 def test_runner_uses_llm_for_yes_no_text_prompt():
@@ -758,7 +821,7 @@ def test_runner_uses_llm_for_yes_no_text_prompt():
     assert first.llm_attempted is True
     assert first.planner_source in {"llm", "auto_candidate"}
     assert first.action.action in {ActionType.MOVE_DOWN, ActionType.PRESS_A}
-    assert second.planner_source in {"execution_plan", "auto_candidate", "fallback", "llm"}
+    assert second.planner_source in {"auto_candidate", "fallback", "llm"}
     assert emulator.state.metadata["selected"] in {"YES", "NO"}
 
 
@@ -794,8 +857,7 @@ def test_runner_restores_cached_route_from_checkpoint(tmp_path: Path):
     runner = _build_runner(emulator, llm_client=llm)
 
     first = runner.run_turn(1)
-    # Route draining consumes the entire cached route in one turn.
-    assert runner.route_cache is None
+    assert runner.executor.is_active() is True
     runner.save_checkpoint(tmp_path)
 
     restored_llm = _ChooseCandidateLLM(index=0)
@@ -803,6 +865,7 @@ def test_runner_restores_cached_route_from_checkpoint(tmp_path: Path):
     payload = restored_runner.load_checkpoint(tmp_path)
 
     assert first.planner_source == "llm"
+    assert payload["executor_state"] is not None
     assert payload["objective_plan"] is not None
 
 
@@ -816,9 +879,7 @@ def test_runner_replans_when_route_is_invalidated():
 
     assert first.planner_source == "llm"
     assert llm.calls >= 2
-    # Navigation plans now survive collision changes and re-path, so the
-    # second turn may still use the execution plan with an updated route.
-    assert second.planner_source in {"execution_plan", "llm", "auto_candidate"}
+    assert second.planner_source in {"executor", "llm", "auto_candidate"}
 
 
 def test_runner_rechecks_navigation_goal_after_map_change():
@@ -831,11 +892,10 @@ def test_runner_rechecks_navigation_goal_after_map_change():
     second = runner.run_turn(2)
 
     assert first.planner_source in {"llm", "auto_candidate"}
-    # Route draining executes the route + follow-up in one turn, causing the
-    # map change to happen immediately.
-    assert first.after.map_name == "Route 1"
-    assert second.before.map_name == "Route 1"
-    assert second.planner_source in {"llm", "auto_candidate"}
+    assert first.after.map_name == "Mock Town"
+    assert second.before.map_name == "Mock Town"
+    assert second.after.map_name == "Route 1"
+    assert second.planner_source in {"executor", "llm", "auto_candidate"}
     assert second.action.action in {
         ActionType.MOVE_UP,
         ActionType.MOVE_RIGHT,
@@ -1035,28 +1095,98 @@ def test_engine_reroutes_after_failed_first_step_with_temporary_blocker() -> Non
         expected_success_signal="The map changes to Red's House 1F.",
         objective_id="local_enter_selected_connector",
     )
-    runner._candidate_runtime[candidate.id] = CandidateRuntime(
-        target_x=6,
+    compiled = runner._compile_candidate(candidate, state, "walk to stairs")
+    assert compiled is not None
+    assert compiled.task is not None
+
+    first = runner.executor.begin(compiled.task, state, follow_up_task=compiled.follow_up_task)
+    assert first.action is not None
+    assert first.action.action == ActionType.MOVE_UP
+
+    runner.executor.report_move_failed(state, first.action)
+
+    second = runner.executor.step(state)
+    assert second.action is not None
+    assert second.action.action == ActionType.MOVE_RIGHT
+
+
+def test_engine_planner_transition_routing_respects_executor_blocked_tiles() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    navigation = build_navigation_snapshot_from_tiles(
+        width=8,
+        height=8,
+        player_x=3,
+        player_y=6,
+        blocked_tiles=[],
+        collision_hash="open-room",
+    )
+    state = StructuredGameState(
+        map_name="Red's House 2F",
+        map_id=0x26,
+        x=3,
+        y=6,
+        facing="LEFT",
+        mode=GameMode.OVERWORLD,
+        step=100,
+        navigation=navigation,
+    )
+    task = Task(
+        kind=TaskKind.ENTER_CONNECTOR,
+        connector_id="stairs",
+        target_x=7,
         target_y=1,
-        follow_up_action=ActionType.MOVE_RIGHT,
-        step_budget=10,
+        reason="walk to stairs",
     )
 
-    first = runner._compile_candidate(candidate, state, "walk to stairs")
-    assert first is not None
-    assert first.action == ActionType.MOVE_UP
+    first = runner.executor.begin(task, state)
+    assert first.action is not None
+    assert first.action.action == ActionType.MOVE_UP
+
+    runner.executor.report_move_failed(state, first.action)
+
+    approach = runner._approach_for_transition_tile(state, 7, 1)
+    assert approach is not None
+
+    route = runner._planning_find_path(state, approach[0], approach[1])
+    assert route is not None
+    assert route[0] == ActionType.MOVE_RIGHT
+
+
+def test_engine_planner_transition_routing_respects_recent_failed_move_blockers() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    navigation = build_navigation_snapshot_from_tiles(
+        width=8,
+        height=8,
+        player_x=3,
+        player_y=6,
+        blocked_tiles=[],
+        collision_hash="open-room",
+    )
+    state = StructuredGameState(
+        map_name="Red's House 2F",
+        map_id=0x26,
+        x=3,
+        y=6,
+        facing="LEFT",
+        mode=GameMode.OVERWORLD,
+        step=100,
+        navigation=navigation,
+    )
 
     runner._record_failed_move_blocker(
         before=state,
         after=state.model_copy(deep=True),
         action=ActionDecision(action=ActionType.MOVE_UP, repeat=1, reason="walk to stairs"),
         progress=ProgressResult("no_effect"),
-        turn_index=1,
+        turn_index=114,
     )
 
-    second = runner._compile_candidate(candidate, state, "reroute to stairs")
-    assert second is not None
-    assert second.action == ActionType.MOVE_RIGHT
+    approach = runner._approach_for_transition_tile(state, 7, 1)
+    assert approach is not None
+
+    route = runner._planning_find_path(state, approach[0], approach[1])
+    assert route is not None
+    assert route[0] == ActionType.MOVE_RIGHT
 
 
 def test_runner_checkpoint_preserves_world_map_and_navigation_goal(tmp_path: Path):

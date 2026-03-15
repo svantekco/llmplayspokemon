@@ -92,6 +92,11 @@ def test_dashboard_renders_state_turns_and_llm_details():
         "mid_term_goal": "Leave Pallet Town and head toward Route 1.",
         "long_term_goal": "Reach Viridian City and continue the opening route.",
         "current_strategy": "Use the nearest safe path and confirm map transitions.",
+        "pathfinding_route": ["PALLET_TOWN", "ROUTE_1", "VIRIDIAN_CITY"],
+        "pathfinding_route_available": True,
+        "pathfinding_target_symbol": "VIRIDIAN_CITY",
+        "pathfinding_next_symbol": "ROUTE_1",
+        "pathfinding_next_hop_kind": "boundary",
     }
     dashboard.status = "Running"
 
@@ -99,10 +104,12 @@ def test_dashboard_renders_state_turns_and_llm_details():
     rendered = console.export_text()
 
     assert "Current State" in rendered
-    assert "Current Seen Area" in rendered
+    assert "Pathfinding Route" in rendered
     assert "Turn History" in rendered
     assert "LLM Calls" in rendered
     assert "Pallet Town" in rendered
+    assert "PALLET_TOWN > ROUTE_1 >" in rendered
+    assert "VIRIDIAN_CITY" in rendered
     assert "MOVE_UP x1" in rendered
     assert "openai/gpt-5-mini" in rendered
     assert "Walk north to progress." in rendered

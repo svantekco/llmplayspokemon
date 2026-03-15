@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from pokemon_agent.models.action import ActionDecision, ActionType
+from pokemon_agent.models.action import ActionDecision, Task
 
 
 class ObjectiveHorizon(str, Enum):
@@ -67,10 +67,8 @@ class ObjectivePlanEnvelope(BaseModel):
 @dataclass(slots=True)
 class CandidateRuntime:
     action: ActionDecision | None = None
-    target_x: int | None = None
-    target_y: int | None = None
-    follow_up_action: ActionType | None = None
-    step_budget: int = 1
+    task: Task | None = None
+    follow_up_task: Task | None = None
 
 
 class CandidateNextStep(BaseModel):
@@ -90,20 +88,3 @@ class CandidateNextStep(BaseModel):
 class PlannerDecision(BaseModel):
     candidate_id: str
     reason: str = ""
-
-
-class ExecutionPlan(BaseModel):
-    objective_id: str | None = None
-    candidate_id: str
-    plan_type: str
-    target: ObjectiveTarget | None = None
-    expected_success_signal: str
-    step_budget: int = Field(default=1, ge=1)
-    button_action: ActionType | None = None
-    target_x: int | None = None
-    target_y: int | None = None
-    follow_up_action: ActionType | None = None
-    map_id: str | int | None = None
-    collision_hash: str | None = None
-    reason: str = ""
-    started_step: int | None = None

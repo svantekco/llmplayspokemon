@@ -86,7 +86,6 @@ class MenuManager:
         )
         self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=f"open start menu for {hm_label}"),
-            step_budget=2,
         )
         return [candidate]
 
@@ -400,7 +399,7 @@ class MenuManager:
         candidate_type: str,
         success_signal: str | None = None,
     ) -> CandidateNextStep:
-        action, step_budget = self._menu_action(snapshot.cursor_index, target_index)
+        action, _step_budget = self._menu_action(snapshot.cursor_index, target_index)
         slug = self._slugify(label) or f"item_{target_index}"
         candidate = CandidateNextStep(
             id=f"{candidate_type.lower()}_{slug}",
@@ -413,7 +412,6 @@ class MenuManager:
         )
         self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=action, repeat=1, reason=why),
-            step_budget=step_budget,
         )
         return candidate
 
@@ -436,7 +434,6 @@ class MenuManager:
         )
         self._runtime[candidate.id] = CandidateRuntime(
             action=ActionDecision(action=ActionType.PRESS_B, repeat=1, reason="close menu"),
-            step_budget=3,
         )
         return candidate
 

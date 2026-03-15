@@ -46,10 +46,10 @@ class _InterruptController:
             self.on_first_interrupt()
 
 
-def build_emulator(mode: str, rom: str | None, config: AppConfig):
+def build_emulator(mode: str, rom: str | None, config: AppConfig, *, live_path_overlay: bool = False):
     if mode == "pyboy":
         rom_path = rom or config.default_rom_path
-        return PyBoyAdapter(rom_path, config=config)
+        return PyBoyAdapter(rom_path, config=config, live_path_overlay=live_path_overlay)
     return MockEmulatorAdapter()
 
 
@@ -70,6 +70,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-mode", choices=["dashboard", "verbose", "compact", "quiet"], default="dashboard")
     parser.add_argument("--debug-overlay", action="store_true")
     parser.add_argument("--debug-overlay-dir", default=None)
+    parser.add_argument("--live-path-overlay", action="store_true")
     return parser
 
 
@@ -154,6 +155,7 @@ def build_main_args(args: argparse.Namespace) -> argparse.Namespace:
         debug_overlay_dir=debug_overlay_dir,
         resume=resume,
         log_mode=args.log_mode,
+        live_path_overlay=bool(getattr(args, "live_path_overlay", False)),
     )
 
 
@@ -211,7 +213,12 @@ def _print_turn(result, log_mode: str) -> None:
 
 def run_args(args: argparse.Namespace) -> None:
     config = AppConfig()
-    emulator = build_emulator(args.mode, args.rom, config)
+    emulator = build_emulator(
+        args.mode,
+        args.rom,
+        config,
+        live_path_overlay=bool(getattr(args, "live_path_overlay", False)),
+    )
     memory = MemoryManager(window=config.short_term_window)
     progress = ProgressDetector()
     stuck = StuckDetector(threshold=config.stuck_threshold)

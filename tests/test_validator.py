@@ -52,12 +52,7 @@ def test_validator_prefers_local_recovery_before_press_start_in_overworld():
 
     result = validator.fallback(state, stuck, "recovery")
 
-    assert result.action in {
-        ActionType.MOVE_UP,
-        ActionType.MOVE_RIGHT,
-        ActionType.MOVE_DOWN,
-        ActionType.MOVE_LEFT,
-    }
+    assert result.action == ActionType.PRESS_A
 
 
 def test_validator_uses_startup_bootstrap_actions():

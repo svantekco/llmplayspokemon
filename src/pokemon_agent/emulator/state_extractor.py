@@ -30,8 +30,10 @@ class PokemonRedStateExtractor:
         story_flags = list(ram_context.get("story", {}).get("active_flags", []))
         badges = list(player.get("badges", {}).get("names", []))
         map_id = player["map_id"]
-        x = player["x"]
-        y = player["y"]
+        raw_x = player["x"]
+        raw_y = player["y"]
+        x = raw_x
+        y = raw_y
         battle_flag = battle["flag"]
         moving_direction_raw = player["moving_direction_raw"]
         direction_raw = player["direction_raw"]
@@ -57,6 +59,8 @@ class PokemonRedStateExtractor:
                 player_y=y,
                 map_width_blocks=map_context.get("width") if isinstance(map_context, dict) else None,
                 map_height_blocks=map_context.get("height") if isinstance(map_context, dict) else None,
+                screen_origin_x=map_context.get("screen_origin_x") if isinstance(map_context, dict) else None,
+                screen_origin_y=map_context.get("screen_origin_y") if isinstance(map_context, dict) else None,
                 collision_hash=collision_hash,
             )
         bootstrap_phase = self._detect_bootstrap_phase(
@@ -147,6 +151,8 @@ class PokemonRedStateExtractor:
                 "joy_ignore": joy_ignore,
                 "direction_raw": direction_raw,
                 "moving_direction_raw": moving_direction_raw,
+                "raw_x": raw_x,
+                "raw_y": raw_y,
                 "dialogue_text": dialogue_text,
                 "yes_no_prompt": yes_no_prompt,
                 "story_flags": story_flags,

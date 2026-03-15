@@ -118,6 +118,18 @@ FIELD_MAP = {
     "party_count": RamField("party_count", 0xD163, "Pokemon in party", "player"),
     "map_palette": RamField("map_palette", 0xD35D, "Map palette override", "map"),
     "current_map": RamField("current_map", 0xD35E, "Current map number", "map"),
+    "current_map_view_pointer_lo": RamField(
+        "current_map_view_pointer_lo",
+        0xD35F,
+        "Lower byte of the current block-map view pointer",
+        "map",
+    ),
+    "current_map_view_pointer_hi": RamField(
+        "current_map_view_pointer_hi",
+        0xD360,
+        "Upper byte of the current block-map view pointer",
+        "map",
+    ),
     "player_y": RamField("player_y", 0xD361, "Current player Y position", "player"),
     "player_x": RamField("player_x", 0xD362, "Current player X position", "player"),
     "player_block_y": RamField("player_block_y", 0xD363, "Current player block Y position", "player"),
@@ -140,6 +152,9 @@ FIELD_MAP = {
     "max_menu_item": RamField("max_menu_item", 0xCC28, "Maximum menu cursor index", "ui"),
     "window_y": RamField("window_y", 0xFF4A, "Window Y hardware register", "ui"),
 }
+
+OVERWORLD_MAP_BASE_ADDR = 0xC6E8
+MAP_BORDER_BLOCKS = 3
 
 
 def read_rom_header(rom_bytes: bytes) -> RomHeader:
@@ -244,6 +259,14 @@ def build_ram_context(memory) -> dict[str, object]:
     }
     if battle_context is not None and _battle_context_has_signal(battle_context):
         battle["context"] = battle_context
+    view_pointer = raw["current_map_view_pointer_lo"] | (raw["current_map_view_pointer_hi"] << 8)
+    screen_origin = _decode_screen_origin(
+        view_pointer=view_pointer,
+        map_width_blocks=raw["map_width"],
+        map_height_blocks=raw["map_height"],
+        block_x=raw["player_block_x"],
+        block_y=raw["player_block_y"],
+    )
 
     return {
         "profile_id": PROFILE_ID,
@@ -267,6 +290,9 @@ def build_ram_context(memory) -> dict[str, object]:
             "height": raw["map_height"],
             "width": raw["map_width"],
             "palette": raw["map_palette"],
+            "view_pointer": view_pointer,
+            "screen_origin_x": None if screen_origin is None else screen_origin[0],
+            "screen_origin_y": None if screen_origin is None else screen_origin[1],
         },
         "ui": {
             "window_y": raw["window_y"],
@@ -285,6 +311,27 @@ def build_ram_context(memory) -> dict[str, object]:
 
 def _read_field(memory, key: str) -> int:
     return int(memory[FIELD_MAP[key].address])
+
+
+def _decode_screen_origin(
+    *,
+    view_pointer: int,
+    map_width_blocks: int,
+    map_height_blocks: int,
+    block_x: int,
+    block_y: int,
+) -> tuple[int, int] | None:
+    if map_width_blocks <= 0 or map_height_blocks <= 0:
+        return None
+    stride = map_width_blocks + (MAP_BORDER_BLOCKS * 2)
+    buffer_size = stride * (map_height_blocks + (MAP_BORDER_BLOCKS * 2))
+    offset = view_pointer - OVERWORLD_MAP_BASE_ADDR
+    if offset < 0 or offset >= buffer_size:
+        return None
+    view_block_y, view_block_x = divmod(offset, stride)
+    origin_x = ((view_block_x - MAP_BORDER_BLOCKS) * 2) + block_x
+    origin_y = ((view_block_y - MAP_BORDER_BLOCKS) * 2) + block_y
+    return origin_x, origin_y
 
 
 def _decode_bcd(*values: int) -> int | None:

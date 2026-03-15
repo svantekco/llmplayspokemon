@@ -10,6 +10,7 @@ from pokemon_agent.main import (
     apply_runtime_environment,
     build_main_args,
     clear_pyboy_rom_sidecars,
+    create_parser,
     resolve_planner,
     session_is_resumable,
 )
@@ -232,3 +233,32 @@ def test_start_game_launcher_preserves_explicit_mode():
     parsed = apply_default_mode(["--mode=mock", "--session-dir", ".sessions/mock"], default_mode="pyboy")
 
     assert parsed == ["--mode=mock", "--session-dir", ".sessions/mock"]
+
+
+def test_start_game_parser_accepts_live_path_overlay_flag():
+    args = create_parser().parse_args(["--mode", "pyboy", "--live-path-overlay"])
+
+    assert args.live_path_overlay is True
+
+
+def test_start_game_build_main_args_preserves_live_path_overlay(tmp_path: Path):
+    args = Namespace(
+        mode="pyboy",
+        rom="game.gb",
+        turns=3,
+        once=False,
+        planner="fallback",
+        session_dir=str(tmp_path / "session"),
+        fresh=False,
+        log_mode="compact",
+        window=None,
+        headless=False,
+        checkpoint_dir=None,
+        resume=None,
+        continuous=False,
+        live_path_overlay=True,
+    )
+
+    main_args = build_main_args(args)
+
+    assert main_args.live_path_overlay is True

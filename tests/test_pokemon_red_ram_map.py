@@ -113,7 +113,15 @@ def test_build_ram_context_decodes_player_map_ui_and_battle_fields():
         {"name": "Potion", "item_id": 0x14, "count": 3},
         {"name": "Lift Key", "item_id": 0x4A, "count": 1},
     ]
-    assert context["map"] == {"tileset": 4, "height": 8, "width": 10, "palette": 6}
+    assert context["map"] == {
+        "tileset": 4,
+        "height": 8,
+        "width": 10,
+        "palette": 6,
+        "view_pointer": 0,
+        "screen_origin_x": None,
+        "screen_origin_y": None,
+    }
     assert context["ui"]["input_locked"] is True
     assert context["ui"]["top_menu_item_y"] == 2
     assert context["ui"]["top_menu_item_x"] == 13
@@ -125,3 +133,25 @@ def test_build_ram_context_decodes_player_map_ui_and_battle_fields():
     assert context["story"]["watched_flags"]["got_starter"] is True
     assert context["story"]["watched_flags"]["beat_brock"] is True
     assert context["story"]["active_flags"] == ["got_starter", "beat_brock"]
+
+
+def test_build_ram_context_derives_screen_origin_from_map_view_pointer():
+    memory = _FakeMemory(
+        {
+            FIELD_MAP["current_map"].address: 0x26,
+            FIELD_MAP["player_y"].address: 1,
+            FIELD_MAP["player_x"].address: 7,
+            FIELD_MAP["player_block_y"].address: 1,
+            FIELD_MAP["player_block_x"].address: 1,
+            FIELD_MAP["current_map_view_pointer_lo"].address: 0xF6,
+            FIELD_MAP["current_map_view_pointer_hi"].address: 0xC6,
+            FIELD_MAP["map_height"].address: 4,
+            FIELD_MAP["map_width"].address: 4,
+        }
+    )
+
+    context = build_ram_context(memory)
+
+    assert context["map"]["view_pointer"] == 0xC6F6
+    assert context["map"]["screen_origin_x"] == 3
+    assert context["map"]["screen_origin_y"] == -3

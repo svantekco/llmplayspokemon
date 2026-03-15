@@ -1,5 +1,5 @@
 .env
-game.gb.ram
+*.ram
 .sessions/
 
 # ROMs
@@ -12,9 +12,15 @@ game.gb.ram
 
 # Python caches
 __pycache__/
+.mypy_cache/
+.ruff_cache/
 
 # Test/runtime temp folders
+.checkpoint_smoke/
+.pyboy_ckpt/
 .pytest_cache/
 .tmp/
+.tmp_boot_shots/
 .tmp_pytest/
 .tmp_pytest_local/
+.tmp_title_press/

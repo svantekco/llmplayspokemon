@@ -185,7 +185,15 @@ def test_state_extractor_exposes_symbolic_ram_context():
     assert state.metadata["ram_profile"]["compatible"] is True
     assert state.metadata["ram_context"]["player"]["money"] == 1234
     assert state.metadata["ram_context"]["player"]["badges"]["names"] == ["Boulder", "Cascade"]
-    assert state.metadata["ram_context"]["map"] == {"tileset": 4, "height": 8, "width": 10, "palette": 0}
+    assert state.metadata["ram_context"]["map"] == {
+        "tileset": 4,
+        "height": 8,
+        "width": 10,
+        "palette": 0,
+        "view_pointer": 0,
+        "screen_origin_x": None,
+        "screen_origin_y": None,
+    }
     assert state.metadata["ram_context"]["ui"]["top_menu_item_y"] == 2
     assert state.metadata["ram_context"]["ui"]["top_menu_item_x"] == 13
     assert state.metadata["ram_context"]["ui"]["current_menu_item"] == 1
@@ -202,6 +210,8 @@ def test_state_extractor_exposes_symbolic_ram_context():
     assert len((state.game_area or [])[0]) == 20
     assert state.collision_area is not None
     assert state.collision_area[8][8] == 0
+    assert state.y == 6
+    assert state.metadata["raw_y"] == 6
     assert any(tile.x == 3 and tile.y == 6 for tile in state.navigation.walkable)
     assert any(tile.x == 4 and tile.y == 6 for tile in state.navigation.blocked)
 

@@ -26,12 +26,99 @@ class CachedRoute(BaseModel):
     expected_start: WorldCoordinate
 
 
+class NavigationGrid:
+    """Task-scoped navigation view with temporary blocked-tile support."""
+
+    def __init__(self, snapshot: NavigationSnapshot | None = None) -> None:
+        self._snapshot: NavigationSnapshot | None = None
+        self._walkable: set[tuple[int, int]] = set()
+        self._blocked: set[tuple[int, int]] = set()
+        if snapshot is not None:
+            self.refresh(snapshot)
+
+    @property
+    def snapshot(self) -> NavigationSnapshot | None:
+        return self._snapshot
+
+    def refresh(self, snapshot: NavigationSnapshot | None) -> None:
+        self._snapshot = snapshot
+        self._walkable = set()
+        if snapshot is None:
+            return
+        self._walkable = {(coordinate.x, coordinate.y) for coordinate in snapshot.walkable}
+        # Keep only blockers that remain inside the currently visible walkable set.
+        self._blocked = {coordinate for coordinate in self._blocked if coordinate in self._walkable}
+
+    def clear_blocked(self) -> None:
+        self._blocked.clear()
+
+    def mark_blocked(self, x: int, y: int) -> None:
+        self._blocked.add((x, y))
+
+    def is_walkable(self, x: int, y: int) -> bool:
+        return (x, y) in self._walkable and (x, y) not in self._blocked
+
+    def find_path(
+        self,
+        start_x: int | None,
+        start_y: int | None,
+        target_x: int,
+        target_y: int,
+    ) -> list[ActionType] | None:
+        if self._snapshot is None or start_x is None or start_y is None:
+            return None
+
+        start = (start_x, start_y)
+        target = (target_x, target_y)
+        if not self.is_walkable(*start) or not self.is_walkable(*target):
+            return None
+        if start == target:
+            return []
+
+        frontier = deque([start])
+        parents: dict[tuple[int, int], tuple[tuple[int, int], ActionType] | None] = {start: None}
+        while frontier:
+            current_x, current_y = frontier.popleft()
+            if (current_x, current_y) == target:
+                break
+            for action, dx, dy in MOVE_DELTAS:
+                neighbor = (current_x + dx, current_y + dy)
+                if neighbor in parents or not self.is_walkable(*neighbor):
+                    continue
+                parents[neighbor] = ((current_x, current_y), action)
+                frontier.append(neighbor)
+
+        if target not in parents:
+            return None
+
+        route: list[ActionType] = []
+        current = target
+        while parents[current] is not None:
+            parent, action = parents[current]
+            route.append(action)
+            current = parent
+        route.reverse()
+        return route
+
+    def best_adjacent_tile(self, target_x: int, target_y: int) -> tuple[int, int] | None:
+        candidates: list[tuple[int, int]] = []
+        for _action, dx, dy in MOVE_DELTAS:
+            coordinate = (target_x + dx, target_y + dy)
+            if self.is_walkable(*coordinate):
+                candidates.append(coordinate)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: (item[1], item[0]))
+
+
 def build_navigation_snapshot_from_collision(
     collision_area,
     player_x: int | None,
     player_y: int | None,
     map_width_blocks: int | None,
     map_height_blocks: int | None,
+    screen_origin_x: int | None = None,
+    screen_origin_y: int | None = None,
     collision_hash: str | None = None,
 ) -> NavigationSnapshot | None:
     if player_x is None or player_y is None:
@@ -45,13 +132,16 @@ def build_navigation_snapshot_from_collision(
 
     map_width_tiles = max(1, int(map_width_blocks or 0) * 2)
     map_height_tiles = max(1, int(map_height_blocks or 0) * 2)
-    origin_x, origin_y = _select_visible_origin(
-        logical_collision,
-        player_x=player_x,
-        player_y=player_y,
-        map_width_tiles=map_width_tiles,
-        map_height_tiles=map_height_tiles,
-    )
+    if screen_origin_x is None or screen_origin_y is None:
+        origin_x, origin_y = _select_visible_origin(
+            logical_collision,
+            player_x=player_x,
+            player_y=player_y,
+            map_width_tiles=map_width_tiles,
+            map_height_tiles=map_height_tiles,
+        )
+    else:
+        origin_x, origin_y = screen_origin_x, screen_origin_y
 
     walkable: list[WorldCoordinate] = []
     blocked: list[WorldCoordinate] = []
@@ -198,6 +288,32 @@ def find_path(
         current = parent
     route.reverse()
     return route
+
+
+def facing_action_for_target(player_x: int, player_y: int, target_x: int, target_y: int) -> ActionType | None:
+    dx = target_x - player_x
+    dy = target_y - player_y
+    if (dx, dy) == (0, -1):
+        return ActionType.MOVE_UP
+    if (dx, dy) == (1, 0):
+        return ActionType.MOVE_RIGHT
+    if (dx, dy) == (0, 1):
+        return ActionType.MOVE_DOWN
+    if (dx, dy) == (-1, 0):
+        return ActionType.MOVE_LEFT
+    return None
+
+
+def facing_name_for_action(action: ActionType | None) -> str | None:
+    if action == ActionType.MOVE_UP:
+        return "UP"
+    if action == ActionType.MOVE_RIGHT:
+        return "RIGHT"
+    if action == ActionType.MOVE_DOWN:
+        return "DOWN"
+    if action == ActionType.MOVE_LEFT:
+        return "LEFT"
+    return None
 
 
 def advance_position(x: int, y: int, action: ActionType) -> WorldCoordinate:

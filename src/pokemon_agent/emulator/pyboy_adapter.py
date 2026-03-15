@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+import numpy as np
+from PIL import Image
 from pokemon_agent.config import AppConfig
 from pokemon_agent.emulator.base import EmulatorAdapter
 from pokemon_agent.emulator.pokemon_red_ram_map import rom_profile_metadata
@@ -10,6 +12,7 @@ from pokemon_agent.emulator.state_extractor import PokemonRedStateExtractor
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.state import StructuredGameState, GameMode
+from pokemon_agent.ui.debug_overlay import WorldPathOverlayPainter
 
 try:
     from pyboy import PyBoy
@@ -30,7 +33,13 @@ class PyBoyAdapter(EmulatorAdapter):
         ActionType.PRESS_START: "START",
     }
 
-    def __init__(self, rom_path: str, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        rom_path: str,
+        config: AppConfig | None = None,
+        *,
+        live_path_overlay: bool = False,
+    ) -> None:
         if PyBoy is None:
             raise RuntimeError("PyBoy is not installed or failed to import.")
         if not Path(rom_path).exists():
@@ -41,6 +50,10 @@ class PyBoyAdapter(EmulatorAdapter):
         self.button_map = self._build_button_map()
         self.pyboy = PyBoy(rom_path, window=self.config.pyboy_window)
         self.step = 0
+        self.live_path_overlay_enabled = bool(live_path_overlay and self.config.pyboy_window == "SDL2")
+        self._live_overlay_state: StructuredGameState | None = None
+        self._live_suggested_path: list[tuple[int, int]] = []
+        self._path_overlay_painter = WorldPathOverlayPainter()
         self.extractor = PokemonRedStateExtractor(self.pyboy, rom_profile=rom_profile_metadata(self.rom_verification))
         self.advance_frames(self.config.pyboy_boot_frames)
 
@@ -76,6 +89,7 @@ class PyBoyAdapter(EmulatorAdapter):
         for _ in range(n):
             self.pyboy.tick()
             self.step += 1
+            self._present_live_path_overlay()
 
     def execute_action(self, action: ActionDecision) -> None:
         button = self.ACTION_TO_BUTTON[action.action]
@@ -124,6 +138,8 @@ class PyBoyAdapter(EmulatorAdapter):
             render = self.config.pyboy_window != "null"
             self.pyboy.tick(1, render=render, sound=False)
             self.step += 1
+            if render:
+                self._present_live_path_overlay()
             if not render:
                 time.sleep(0.01)
         except Exception:
@@ -135,3 +151,38 @@ class PyBoyAdapter(EmulatorAdapter):
     def capture_screen_image(self):
         image = self.pyboy.screen.image
         return image.copy() if image is not None else None
+
+    def set_live_path_overlay(
+        self,
+        state: StructuredGameState,
+        suggested_path: list[tuple[int, int]],
+    ) -> None:
+        if not self.live_path_overlay_enabled or state.navigation is None or not suggested_path:
+            self.clear_live_path_overlay()
+            return
+        self._live_overlay_state = state.model_copy(deep=True)
+        self._live_suggested_path = list(suggested_path)
+
+    def clear_live_path_overlay(self) -> None:
+        self._live_overlay_state = None
+        self._live_suggested_path = []
+
+    def _present_live_path_overlay(self) -> None:
+        if not self.live_path_overlay_enabled or self._live_overlay_state is None or not self._live_suggested_path:
+            return
+        plugin_manager = getattr(self.pyboy, "_plugin_manager", None)
+        window = getattr(plugin_manager, "window_sdl2", None)
+        post_tick = getattr(window, "post_tick", None)
+        if post_tick is None:
+            return
+        overlay = self._path_overlay_painter.render(self._live_overlay_state, self._live_suggested_path)
+        if overlay.getbbox() is None:
+            return
+        screen_buffer = self.pyboy.screen.ndarray
+        original_frame = screen_buffer.copy()
+        try:
+            composited = Image.alpha_composite(Image.fromarray(original_frame, "RGBA"), overlay)
+            np.copyto(screen_buffer, np.asarray(composited, dtype=np.uint8))
+            post_tick()
+        finally:
+            np.copyto(screen_buffer, original_frame)

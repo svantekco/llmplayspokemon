@@ -98,11 +98,11 @@ class TerminalDashboard:
         )
         layout["top"].split_row(
             Layout(name="state"),
-            Layout(name="seen_area", size=34),
+            Layout(name="pathfinding_route", size=34),
             Layout(name="status", size=44),
         )
         layout["state"].update(self._render_current_state())
-        layout["seen_area"].update(self._render_current_seen_area())
+        layout["pathfinding_route"].update(self._render_pathfinding_route())
         layout["status"].update(self._render_status())
         layout["turns"].update(self._render_turns())
         layout["llm"].update(self._render_llm_calls())
@@ -137,24 +137,34 @@ class TerminalDashboard:
         table.add_row("Step", str(state.step))
         return Panel(table, title="Current State", border_style="cyan")
 
-    def _render_current_seen_area(self) -> Panel:
-        if self.current_state is None:
-            return Panel("Waiting for overworld map...", title="Current Seen Area", border_style="bright_cyan")
+    def _render_pathfinding_route(self) -> Panel:
+        route = [str(item) for item in self.summary.get("pathfinding_route", []) if item]
+        target = self.summary.get("pathfinding_target_symbol")
+        next_symbol = self.summary.get("pathfinding_next_symbol")
+        next_hop_kind = self.summary.get("pathfinding_next_hop_kind")
+        route_available = bool(self.summary.get("pathfinding_route_available"))
 
-        ascii_map = build_ascii_map(self.current_state)
-        body = self._render_ascii_block(ascii_map)
-        subtitle_parts: list[str] = []
-        discovered_maps = self.summary.get("discovered_maps")
-        confirmed = self.summary.get("confirmed_connectors")
-        suspected = self.summary.get("suspected_connectors")
-        if discovered_maps is not None:
-            subtitle_parts.append(f"maps {discovered_maps}")
-        if confirmed is not None:
-            subtitle_parts.append(f"confirmed {confirmed}")
-        if suspected is not None:
-            subtitle_parts.append(f"suspected {suspected}")
-        subtitle = " | ".join(subtitle_parts) if subtitle_parts else "world minimap hook ready"
-        return Panel(body, title="Current Seen Area", subtitle=subtitle, border_style="bright_cyan")
+        if not route:
+            current_map = None if self.current_state is None else self.current_state.map_name
+            body = Text(current_map or "Waiting for route...", style="dim")
+            return Panel(body, title="Pathfinding Route", subtitle="route unavailable", border_style="bright_cyan")
+
+        route_text = Text(" > ".join(route))
+        details = Table.grid(expand=True, padding=(0, 1))
+        details.add_column(style="bright_cyan", no_wrap=True)
+        details.add_column(ratio=1)
+        details.add_row("Route", route_text)
+        if target:
+            details.add_row("Target", str(target))
+        if next_symbol:
+            next_label = str(next_symbol)
+            if next_hop_kind:
+                next_label = f"{next_label} ({next_hop_kind})"
+            details.add_row("Next", next_label)
+
+        subtitle_parts: list[str] = [f"hops {max(0, len(route) - 1)}"]
+        subtitle_parts.append("confirmed" if route_available else "unconfirmed")
+        return Panel(details, title="Pathfinding Route", subtitle=" | ".join(subtitle_parts), border_style="bright_cyan")
 
     def _render_status(self) -> Panel:
         table = Table.grid(expand=True, padding=(0, 1))
@@ -172,9 +182,8 @@ class TerminalDashboard:
         table.add_row("Planner", self.planner)
         table.add_row("Turns", turn_progress)
         table.add_row("Fallback", str(self.summary.get("fallback_turns", 0)))
-        table.add_row("Route Cache", str(self.summary.get("route_cache_turns", 0)))
+        table.add_row("Executor", str(self.summary.get("executor_turns", 0)))
         table.add_row("Auto Select", str(self.summary.get("auto_selected_turns", 0)))
-        table.add_row("Exec Plan", str(self.summary.get("execution_plan_turns", 0)))
         prompt_chars = self.summary.get("prompt_chars", 0)
         prompt_tokens = self.summary.get("approx_prompt_tokens", 0)
         table.add_row("Prompt", f"{prompt_chars} chars | ~{prompt_tokens} tokens")
@@ -394,10 +403,8 @@ class TerminalDashboard:
 
     @staticmethod
     def _format_llm_status(turn: TurnResult) -> str:
-        if turn.planner_source == "route_cache":
-            return "route"
-        if turn.planner_source == "execution_plan":
-            return "plan"
+        if turn.planner_source == "executor":
+            return "exec"
         if turn.planner_source == "bootstrap":
             return "boot"
         if turn.planner_source == "auto_candidate":
@@ -412,10 +419,8 @@ class TerminalDashboard:
 
     @staticmethod
     def _planner_note(turn: TurnResult) -> str:
-        if turn.planner_source == "route_cache":
-            return "No network call was made; a cached coordinate route chose the next movement step."
-        if turn.planner_source == "execution_plan":
-            return "No network call was made; the engine continued an execution plan until a stop condition fired."
+        if turn.planner_source == "executor":
+            return "No network call was made; the executor resumed a deterministic task from the previous turn."
         if turn.planner_source == "bootstrap":
             return "No network call was made; deterministic bootstrap handling chose the action."
         if turn.planner_source == "auto_candidate":

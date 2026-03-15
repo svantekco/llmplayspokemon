@@ -49,3 +49,14 @@ class EmulatorAdapter(ABC):
 
     def capture_screen_image(self) -> Any | None:
         return None
+
+    def set_live_path_overlay(
+        self,
+        state: StructuredGameState,
+        suggested_path: list[tuple[int, int]],
+    ) -> None:
+        del state, suggested_path
+        return None
+
+    def clear_live_path_overlay(self) -> None:
+        return None
