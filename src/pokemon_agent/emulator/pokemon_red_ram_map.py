@@ -57,6 +57,13 @@ PLAYER_ACTIVE_LEVEL_ADDR = 0xD022
 PLAYER_ACTIVE_MAX_HP_ADDR = 0xD023
 PLAYER_ACTIVE_PP_ADDR = 0xD02D
 
+# NPC sprite system
+WRAM_NUM_SPRITES = 0xD4E4
+SPRITE_STATE_BASE = 0xC100      # 16 bytes per sprite; index 0 = player
+SPRITE_STATE_STRIDE = 0x10
+MAP_SPRITE_DATA_BASE = 0xD4E5   # 16 bytes per NPC sprite (index 0 = NPC 1)
+MAP_SPRITE_DATA_STRIDE = 0x10
+
 SPECIAL_NAME_OVERRIDES = {
     "NO_MON": "None",
     "NO_ITEM": "None",
@@ -306,6 +313,7 @@ def build_ram_context(memory) -> dict[str, object]:
         },
         "battle": battle,
         "story": story,
+        "sprites": _decode_sprites(memory),
     }
 
 
@@ -486,6 +494,33 @@ def _decode_inventory(memory, bag_count: int) -> list[dict[str, object]]:
             }
         )
     return items
+
+
+def _decode_sprites(memory) -> list[dict[str, int]]:
+    count = int(memory[WRAM_NUM_SPRITES])
+    count = max(0, min(count, 15))
+    sprites: list[dict[str, int]] = []
+    for index in range(1, count + 1):
+        state_base = SPRITE_STATE_BASE + (index * SPRITE_STATE_STRIDE)
+        pixel_y = int(memory[state_base + 0x04])
+        pixel_x = int(memory[state_base + 0x06])
+        if pixel_x == 0 and pixel_y == 0:
+            continue
+        facing_raw = int(memory[state_base + 0x01])
+        map_data_base = MAP_SPRITE_DATA_BASE + ((index - 1) * MAP_SPRITE_DATA_STRIDE)
+        picture_id = int(memory[map_data_base + 0x00])
+        text_id = int(memory[map_data_base + 0x05])
+        tile_x = (pixel_x // 16) - 4
+        tile_y = (pixel_y // 16) - 4
+        sprites.append({
+            "sprite_index": index,
+            "tile_x": tile_x,
+            "tile_y": tile_y,
+            "picture_id": picture_id,
+            "text_id": text_id,
+            "facing_raw": facing_raw,
+        })
+    return sprites
 
 
 def _decode_story_flags(memory) -> dict[str, object]:

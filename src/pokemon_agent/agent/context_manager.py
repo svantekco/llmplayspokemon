@@ -390,12 +390,18 @@ class ContextManager:
             memory_state.long_term.navigation_goal,
         )
         canonical_navigation = self._build_canonical_navigation(state, memory_state)
-        return {
+        context: dict[str, Any] = {
             "visual_map": visual_map,
-            "map_legend": "P=player .=walkable #=blocked ~=water @=isolated blocker D=door",
+            "map_legend": "P=player .=walkable #=blocked ~=water @=isolated blocker D=door N=NPC",
             "canonical_navigation": canonical_navigation,
             **route_info,
         }
+        if state.npcs:
+            context["npcs"] = [
+                {"x": npc.tile_x, "y": npc.tile_y, "sprite": npc.sprite_index}
+                for npc in state.npcs
+            ]
+        return context
 
     def _build_canonical_navigation(self, state: StructuredGameState, memory_state: MemoryState) -> dict[str, Any]:
         goal = memory_state.long_term.navigation_goal

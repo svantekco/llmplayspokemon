@@ -68,6 +68,7 @@ NAVIGATION_CANDIDATE_TYPES = {
     "ADVANCE_TOWARD_BOUNDARY",
     "ENTER_CONNECTOR",
     "EXPLORE_CONNECTOR",
+    "EXPLORE_FOR_NPC",
     "EXPLORE_WINDOW",
 }
 YES_NO_CANDIDATE_TYPES = {"SELECT_YES", "SELECT_NO"}
@@ -1123,12 +1124,24 @@ class ClosedLoopRunner:
     ) -> list[CandidateNextStep]:
         candidates: list[CandidateNextStep] = []
         if goal.objective_kind == "talk_to_required_npc":
-            interaction = self._candidate_for_adjacent_interactable(state, objective_id, priority_boost=14)
-            if interaction is not None:
-                candidates.append(interaction)
-            move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, objective_id, priority_boost=14)
-            if move_to_interaction is not None:
-                candidates.append(move_to_interaction)
+            # Offer all reachable NPCs so the LLM can pick which to try.
+            # After a failed interaction the cooldown filters that NPC out,
+            # naturally cycling through the rest on subsequent turns.
+            npc_candidates = self._build_all_npc_candidates(state, objective_id, goal, priority_boost=14)
+            if npc_candidates:
+                candidates.extend(npc_candidates)
+            else:
+                # No confirmed NPCs reachable — fall back to heuristic blockers
+                interaction = self._candidate_for_adjacent_interactable(state, objective_id, priority_boost=14)
+                if interaction is not None:
+                    candidates.append(interaction)
+                move_to_interaction = self._candidate_to_move_adjacent_to_interactable(state, objective_id, priority_boost=14)
+                if move_to_interaction is not None:
+                    candidates.append(move_to_interaction)
+            if not candidates:
+                explore = self._build_room_exploration_candidate(state, objective_id)
+                if explore is not None:
+                    candidates.append(explore)
             return candidates
 
         if goal.next_hop_kind == "boundary" and goal.next_hop_side:
@@ -1881,6 +1894,11 @@ class ClosedLoopRunner:
             runtime,
         )
 
+    def _npc_tile_set(self, state: StructuredGameState) -> set[tuple[int, int]]:
+        if state.navigation is None:
+            return set()
+        return {(npc.tile_x, npc.tile_y) for npc in state.navigation.npc_positions}
+
     def _candidate_for_adjacent_interactable(
         self,
         state: StructuredGameState,
@@ -1891,17 +1909,22 @@ class ClosedLoopRunner:
         blocked_set = self._blocked_coordinates(state.navigation)
         if state.x is None or state.y is None or not blocked_set:
             return None
-        adjacent: list[tuple[int, int, int]] = []
+        npc_set = self._npc_tile_set(state)
+        adjacent: list[tuple[int, int, int, bool]] = []
         for dx, dy in DIRECTION_DELTAS:
             blocked_coordinate = (state.x + dx, state.y + dy)
             if blocked_coordinate not in blocked_set:
                 continue
             blocked_neighbors = self._blocked_neighbor_count(blocked_coordinate, blocked_set)
-            adjacent.append((blocked_coordinate[0], blocked_coordinate[1], blocked_neighbors))
+            is_npc = blocked_coordinate in npc_set
+            adjacent.append((blocked_coordinate[0], blocked_coordinate[1], blocked_neighbors, is_npc))
         if not adjacent:
             return None
-        best_x, best_y, neighbor_count = sorted(adjacent, key=lambda item: (item[2], item[0], item[1]))[0]
-        if neighbor_count != 0:
+        # Prefer confirmed NPCs (sort key 0) over isolated blockers (sort key 1)
+        best_x, best_y, neighbor_count, is_npc = sorted(
+            adjacent, key=lambda item: (0 if item[3] else 1, item[2], item[0], item[1])
+        )[0]
+        if neighbor_count != 0 and not is_npc:
             return None
         if "PRESS_A" in self.stuck.state.recent_failed_actions[-2:]:
             return None
@@ -1910,11 +1933,12 @@ class ClosedLoopRunner:
             last_turn = self._interacted_tiles.get(key)
             if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
                 return None
+        why = "An adjacent NPC is ready to talk." if is_npc else "An adjacent isolated blocker may be an NPC or doorway."
         candidate = CandidateNextStep(
             id=f"interact_adjacent_{best_x}_{best_y}",
             type="MOVE_ADJACENT_TO_INTERACTABLE",
             target=ObjectiveTarget(kind="interactable", map_id=state.map_id, map_name=state.map_name, x=best_x, y=best_y),
-            why="An adjacent isolated blocker may be an NPC or doorway.",
+            why=why,
             priority=46 + priority_boost - min(neighbor_count, 2) * 4,
             expected_success_signal="Text opens or the local state changes",
             objective_id=objective_id,
@@ -1937,18 +1961,21 @@ class ClosedLoopRunner:
         if nav_grid is None:
             return None
         blocked_set = self._blocked_coordinates(state.navigation)
+        npc_set = self._npc_tile_set(state)
+
+        # Pass 1: scan confirmed NPC positions (no distance limit, no isolation check)
         best_choice: tuple[int, int, int, int] | None = None
-        for blocked_x, blocked_y in blocked_set:
-            if abs(blocked_x - state.x) + abs(blocked_y - state.y) > 4:
+        is_npc_match = False
+        for npc_x, npc_y in npc_set:
+            if (npc_x, npc_y) not in blocked_set:
                 continue
-            if self._blocked_neighbor_count((blocked_x, blocked_y), blocked_set) != 0:
-                continue
+            if abs(npc_x - state.x) + abs(npc_y - state.y) <= 1:
+                continue  # already adjacent, handled by _candidate_for_adjacent_interactable
             for dx, dy in DIRECTION_DELTAS:
-                target_x = blocked_x + dx
-                target_y = blocked_y + dy
+                target_x = npc_x + dx
+                target_y = npc_y + dy
                 if not nav_grid.is_walkable(target_x, target_y) or (target_x, target_y) == (state.x, state.y):
                     continue
-                # Skip approach positions recently used for an interaction.
                 if state.map_id is not None:
                     approach_key = (state.map_id, target_x, target_y)
                     last_turn = self._interacted_tiles.get(approach_key)
@@ -1958,14 +1985,46 @@ class ClosedLoopRunner:
                 if route is None or len(route) == 0:
                     continue
                 distance = len(route)
-                choice = (distance, target_x, target_y, blocked_x * 1000 + blocked_y)
+                choice = (distance, target_x, target_y, npc_x * 1000 + npc_y)
                 if best_choice is None or choice < best_choice:
                     best_choice = choice
+                    is_npc_match = True
+
+        # Pass 2: fallback to isolated blocked tiles within distance 4
+        if best_choice is None:
+            for blocked_x, blocked_y in blocked_set:
+                if abs(blocked_x - state.x) + abs(blocked_y - state.y) > 4:
+                    continue
+                if self._blocked_neighbor_count((blocked_x, blocked_y), blocked_set) != 0:
+                    continue
+                for dx, dy in DIRECTION_DELTAS:
+                    target_x = blocked_x + dx
+                    target_y = blocked_y + dy
+                    if not nav_grid.is_walkable(target_x, target_y) or (target_x, target_y) == (state.x, state.y):
+                        continue
+                    if state.map_id is not None:
+                        approach_key = (state.map_id, target_x, target_y)
+                        last_turn = self._interacted_tiles.get(approach_key)
+                        if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
+                            continue
+                    route = self._planning_find_path(state, target_x, target_y, nav_grid=nav_grid)
+                    if route is None or len(route) == 0:
+                        continue
+                    distance = len(route)
+                    choice = (distance, target_x, target_y, blocked_x * 1000 + blocked_y)
+                    if best_choice is None or choice < best_choice:
+                        best_choice = choice
+
         if best_choice is None:
             return None
         distance, target_x, target_y, encoded = best_choice
         blocked_x = encoded // 1000
         blocked_y = encoded % 1000
+        why = (
+            f"A confirmed NPC is reachable in {distance} steps."
+            if is_npc_match
+            else f"A nearby interactable-looking blocker is reachable in {distance} steps."
+        )
         candidate = CandidateNextStep(
             id=f"approach_interactable_{blocked_x}_{blocked_y}",
             type="MOVE_ADJACENT_TO_INTERACTABLE",
@@ -1977,7 +2036,7 @@ class ClosedLoopRunner:
                 y=blocked_y,
                 detail=f"stand at ({target_x}, {target_y})",
             ),
-            why=f"A nearby interactable-looking blocker is reachable in {distance} steps.",
+            why=why,
             priority=34 + priority_boost - min(distance, 6),
             expected_success_signal="Reach the adjacent tile, then open text or change state",
             objective_id=objective_id,
@@ -1986,6 +2045,148 @@ class ClosedLoopRunner:
         self._candidate_runtime[candidate.id] = CandidateRuntime(
             task=Task(kind=TaskKind.NAVIGATE_ADJACENT, target_x=blocked_x, target_y=blocked_y, reason=candidate.why),
             follow_up_task=Task(kind=TaskKind.INTERACT, reason=candidate.why),
+        )
+        return candidate
+
+    def _build_all_npc_candidates(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+        goal: NavigationGoal,
+        *,
+        priority_boost: int = 0,
+    ) -> list[CandidateNextStep]:
+        """Build a candidate for every reachable NPC in the room.
+
+        Returns up to 3 NPC candidates sorted by distance so the LLM can
+        choose which NPC to approach.  When an interaction doesn't advance
+        the story the cooldown on ``_interacted_tiles`` naturally filters
+        that NPC out on the next cycle, surfacing the remaining ones.
+        """
+        if state.navigation is None or state.x is None or state.y is None:
+            return []
+        nav_grid = self._planning_navigation_grid(state)
+        if nav_grid is None:
+            return []
+        npc_set = self._npc_tile_set(state)
+        blocked_set = self._blocked_coordinates(state.navigation)
+
+        # Collect the best approach for each distinct NPC tile.
+        npc_approaches: list[tuple[int, int, int, int, int]] = []  # (distance, adj_x, adj_y, npc_x, npc_y)
+        for npc_x, npc_y in npc_set:
+            if (npc_x, npc_y) not in blocked_set:
+                continue
+            best_for_npc: tuple[int, int, int] | None = None
+            for dx, dy in DIRECTION_DELTAS:
+                adj_x, adj_y = npc_x + dx, npc_y + dy
+                if not nav_grid.is_walkable(adj_x, adj_y):
+                    continue
+                # Respect interaction cooldown
+                if state.map_id is not None:
+                    approach_key = (state.map_id, adj_x, adj_y)
+                    last_turn = self._interacted_tiles.get(approach_key)
+                    if last_turn is not None and (self.completed_turns - last_turn) < self._interaction_cooldown:
+                        continue
+                route = self._planning_find_path(state, adj_x, adj_y, nav_grid=nav_grid)
+                if route is None:
+                    continue
+                distance = len(route)
+                if best_for_npc is None or distance < best_for_npc[0]:
+                    best_for_npc = (distance, adj_x, adj_y)
+            if best_for_npc is not None:
+                npc_approaches.append((best_for_npc[0], best_for_npc[1], best_for_npc[2], npc_x, npc_y))
+
+        npc_approaches.sort()  # closest first
+        candidates: list[CandidateNextStep] = []
+        for rank, (distance, adj_x, adj_y, npc_x, npc_y) in enumerate(npc_approaches[:3]):
+            # Highest priority for closest, decreasing for farther NPCs
+            priority = 48 + priority_boost - rank * 4 - min(distance, 6)
+            is_adjacent = distance == 0
+            if is_adjacent:
+                candidate = CandidateNextStep(
+                    id=f"talk_npc_{npc_x}_{npc_y}",
+                    type="MOVE_ADJACENT_TO_INTERACTABLE",
+                    target=ObjectiveTarget(kind="npc", map_id=state.map_id, map_name=state.map_name, x=npc_x, y=npc_y),
+                    why=f"Talk to NPC at ({npc_x}, {npc_y}) — already adjacent.",
+                    priority=priority + 10,
+                    expected_success_signal="Text opens with story dialogue",
+                    objective_id=objective_id,
+                    distance=0,
+                )
+                self._candidate_runtime[candidate.id] = CandidateRuntime(
+                    action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=f"talk to NPC at ({npc_x}, {npc_y})"),
+                )
+            else:
+                candidate = CandidateNextStep(
+                    id=f"talk_npc_{npc_x}_{npc_y}",
+                    type="EXPLORE_FOR_NPC",
+                    target=ObjectiveTarget(
+                        kind="npc",
+                        map_id=state.map_id,
+                        map_name=state.map_name,
+                        x=npc_x,
+                        y=npc_y,
+                        detail=f"walk to ({adj_x}, {adj_y}) then talk",
+                    ),
+                    why=f"Walk to NPC at ({npc_x}, {npc_y}), {distance} steps away, and talk.",
+                    priority=priority,
+                    expected_success_signal="Text opens with story dialogue",
+                    objective_id=objective_id,
+                    distance=distance,
+                )
+                self._candidate_runtime[candidate.id] = CandidateRuntime(
+                    task=Task(kind=TaskKind.NAVIGATE_ADJACENT, target_x=npc_x, target_y=npc_y, reason=candidate.why),
+                    follow_up_task=Task(kind=TaskKind.INTERACT, reason=f"talk to NPC at ({npc_x}, {npc_y})"),
+                )
+            candidates.append(candidate)
+        return candidates
+
+    def _build_room_exploration_candidate(
+        self,
+        state: StructuredGameState,
+        objective_id: str,
+    ) -> CandidateNextStep | None:
+        """Walk to the farthest reachable tile to explore the room."""
+        if state.navigation is None or state.x is None or state.y is None:
+            return None
+        nav_grid = self._planning_navigation_grid(state)
+        if nav_grid is None:
+            return None
+        best_frontier: tuple[int, int, int] | None = None
+        for coordinate in state.navigation.walkable:
+            if (coordinate.x, coordinate.y) == (state.x, state.y):
+                continue
+            if not nav_grid.is_walkable(coordinate.x, coordinate.y):
+                continue
+            route = self._planning_find_path(state, coordinate.x, coordinate.y, nav_grid=nav_grid)
+            if route is None or len(route) == 0:
+                continue
+            distance = len(route)
+            if best_frontier is None or distance > best_frontier[0]:
+                best_frontier = (distance, coordinate.x, coordinate.y)
+
+        if best_frontier is None:
+            return None
+        distance, target_x, target_y = best_frontier
+        candidate = CandidateNextStep(
+            id=f"npc_search_{target_x}_{target_y}",
+            type="EXPLORE_FOR_NPC",
+            target=ObjectiveTarget(
+                kind="npc_search",
+                map_id=state.map_id,
+                map_name=state.map_name,
+                x=target_x,
+                y=target_y,
+                detail="room frontier exploration",
+            ),
+            why="No NPC directly reachable; exploring the room to find an approach path.",
+            priority=38,
+            expected_success_signal="New tiles become accessible or an NPC becomes reachable",
+            objective_id=objective_id,
+            distance=distance,
+        )
+        self._candidate_runtime[candidate.id] = CandidateRuntime(
+            task=Task(kind=TaskKind.NAVIGATE_TO, target_x=target_x, target_y=target_y, reason=candidate.why),
         )
         return candidate
 
@@ -3053,7 +3254,14 @@ class ClosedLoopRunner:
         nav_grid = self._planning_navigation_grid(state)
         if nav_grid is None:
             return False
+        # Check confirmed NPC positions first
+        npc_set = self._npc_tile_set(state)
         blocked_set = self._blocked_coordinates(state.navigation)
+        for npc_x, npc_y in npc_set:
+            for dx, dy in DIRECTION_DELTAS:
+                if nav_grid.is_walkable(npc_x + dx, npc_y + dy):
+                    return True
+        # Fallback: isolated blocked tile heuristic
         for dx, dy in DIRECTION_DELTAS:
             blocked_coordinate = (state.x + dx, state.y + dy)
             if blocked_coordinate in blocked_set and self._blocked_neighbor_count(blocked_coordinate, blocked_set) == 0:

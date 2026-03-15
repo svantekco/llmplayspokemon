@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.state import NavigationSnapshot
+from pokemon_agent.models.state import NPCSprite
 from pokemon_agent.models.state import WorldCoordinate
 
 MOVE_DELTAS: tuple[tuple[ActionType, int, int], ...] = (
@@ -120,6 +121,7 @@ def build_navigation_snapshot_from_collision(
     screen_origin_x: int | None = None,
     screen_origin_y: int | None = None,
     collision_hash: str | None = None,
+    npc_positions: list[NPCSprite] | None = None,
 ) -> NavigationSnapshot | None:
     if player_x is None or player_y is None:
         return None
@@ -200,6 +202,7 @@ def build_navigation_snapshot_from_collision(
         visible_world_edges=visible_world_edges,
         screen_origin_x=origin_x,
         screen_origin_y=origin_y,
+        npc_positions=list(npc_positions or []),
     )
 
 

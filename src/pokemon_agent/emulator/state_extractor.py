@@ -9,6 +9,7 @@ from pokemon_agent.emulator.text_reader import detect_yes_no_prompt
 from pokemon_agent.models.state import BattleContext
 from pokemon_agent.models.state import InventoryItem
 from pokemon_agent.models.state import GameMode
+from pokemon_agent.models.state import NPCSprite
 from pokemon_agent.models.state import PartyMember
 from pokemon_agent.models.state import StructuredGameState
 
@@ -51,6 +52,7 @@ class PokemonRedStateExtractor:
         tile_hash = self._hash_grid(game_area)
         collision_hash = self._hash_grid(collision_area)
         map_context = ram_context.get("map", {})
+        npc_sprites = self._build_npc_sprites(ram_context)
         navigation = None
         if mode == GameMode.OVERWORLD:
             navigation = build_navigation_snapshot_from_collision(
@@ -62,6 +64,7 @@ class PokemonRedStateExtractor:
                 screen_origin_x=map_context.get("screen_origin_x") if isinstance(map_context, dict) else None,
                 screen_origin_y=map_context.get("screen_origin_y") if isinstance(map_context, dict) else None,
                 collision_hash=collision_hash,
+                npc_positions=npc_sprites,
             )
         bootstrap_phase = self._detect_bootstrap_phase(
             step=step,
@@ -136,6 +139,7 @@ class PokemonRedStateExtractor:
             text_box_open=text_box_open,
             battle_state=self._battle_state(battle),
             navigation=navigation,
+            npcs=npc_sprites,
             party=party,
             inventory=inventory,
             story_flags=story_flags,
@@ -180,6 +184,9 @@ class PokemonRedStateExtractor:
 
     def _build_inventory(self, ram_context: dict[str, object]) -> list[InventoryItem]:
         return [InventoryItem.model_validate(item) for item in ram_context.get("inventory", [])]
+
+    def _build_npc_sprites(self, ram_context: dict[str, object]) -> list[NPCSprite]:
+        return [NPCSprite.model_validate(sprite) for sprite in ram_context.get("sprites", [])]
 
     def _infer_mode(self, battle_flag: int, menu_open: bool, text_box_open: bool) -> GameMode:
         if battle_flag:

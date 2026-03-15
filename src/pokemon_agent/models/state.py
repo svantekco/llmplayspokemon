@@ -59,6 +59,14 @@ class BattleContext(BaseModel):
         return getattr(self, key, default)
 
 
+class NPCSprite(BaseModel):
+    sprite_index: int
+    tile_x: int
+    tile_y: int
+    picture_id: int = 0
+    text_id: int = 0
+
+
 class WorldCoordinate(BaseModel):
     x: int
     y: int
@@ -79,6 +87,7 @@ class NavigationSnapshot(BaseModel):
     visible_world_edges: list[str] = Field(default_factory=list)
     screen_origin_x: int | None = None
     screen_origin_y: int | None = None
+    npc_positions: list[NPCSprite] = Field(default_factory=list)
 
 
 class StructuredGameState(BaseModel):
@@ -94,6 +103,7 @@ class StructuredGameState(BaseModel):
     text_box_open: bool = False
     battle_state: BattleContext | None = None
     navigation: NavigationSnapshot | None = None
+    npcs: list[NPCSprite] = Field(default_factory=list)
     party: list[PartyMember] = Field(default_factory=list)
     inventory: list[InventoryItem] = Field(default_factory=list)
     story_flags: list[str] = Field(default_factory=list)
