@@ -1255,6 +1255,15 @@ class ClosedLoopRunner:
                 continue
             approach = self._approach_for_transition_tile(state, edge.x, edge.y)
             if approach is None:
+                # Approach blocked — if the player is already very close,
+                # generate a low-priority nudge candidate that moves toward the
+                # warp tile so the navigation window shifts to reveal a valid
+                # approach on the next turn.
+                if edge.x is not None and edge.y is not None and state.x is not None and state.y is not None:
+                    if abs(state.x - edge.x) + abs(state.y - edge.y) <= 3:
+                        nudge = self._build_nudge_toward_warp(state, edge, objective_id, destination_matches)
+                        if nudge is not None:
+                            ranked.append(nudge)
                 continue
             approach_x, approach_y, follow_up_action, distance = approach
             priority = 84 if destination_matches else 72
@@ -1570,10 +1579,12 @@ class ClosedLoopRunner:
         if source_x is None or source_y is None:
             return None
         walkable_set = {(coord.x, coord.y) for coord in state.navigation.walkable}
-        # When the warp tile itself is walkable (e.g. a door mat), the warp
-        # only triggers when walking south onto it.  Strongly penalise any
-        # other approach direction so the engine exits through the door
-        # instead of oscillating between adjacent carpet tiles.
+        # When the warp tile itself is walkable (e.g. a door mat or stair
+        # landing), we can navigate directly onto it — stepping on it triggers
+        # the warp.  We still check cardinal-approach tiles first so the engine
+        # keeps the correct exit direction for oscillating door mats (MOVE_DOWN
+        # preferred), but if none of those work we fall back to direct
+        # navigation onto the warp tile itself.
         source_is_walkable = (source_x, source_y) in walkable_set
         best: tuple[tuple[int, int, str], tuple[int, int, ActionType, int]] | None = None
         for move_action, dx, dy in (
@@ -1598,7 +1609,81 @@ class ClosedLoopRunner:
             rank = (distance + direction_penalty, direction_penalty, move_action.value)
             if best is None or rank < best[0]:
                 best = (rank, payload)
-        return None if best is None else best[1]
+
+        if best is not None:
+            return best[1]
+
+        # No adjacent approach tile is reachable — but if the warp tile itself
+        # is walkable (e.g. a staircase landing) we can navigate directly onto
+        # it.  The last move action in the route to the tile acts as the
+        # follow-up, which is all that is needed to trigger the warp.
+        if source_is_walkable:
+            route = self._find_path_with_temporary_blockers(state, source_x, source_y)
+            if route is not None and len(route) > 0:
+                return (source_x, source_y, route[-1], len(route))
+
+        return None
+
+    def _build_nudge_toward_warp(
+        self,
+        state: StructuredGameState,
+        edge,
+        objective_id: str,
+        destination_matches: bool,
+    ) -> tuple[tuple[int, int, int, int, str], CandidateNextStep, CandidateRuntime] | None:
+        """Return a low-priority candidate that moves the player one step
+        toward a known warp tile when the normal approach computation fails.
+        This shifts the navigation window so a proper approach can be found
+        on the next turn (fixes the case where the player is right next to a
+        staircase but the approach tile falls outside the current screen)."""
+        if state.navigation is None or state.x is None or state.y is None:
+            return None
+        if edge.x is None or edge.y is None:
+            return None
+        # Pick the closest walkable neighbour to the warp that differs from
+        # the player's current position.
+        walkable = [(c.x, c.y) for c in state.navigation.walkable if (c.x, c.y) != (state.x, state.y)]
+        if not walkable:
+            return None
+        target_x, target_y = min(
+            walkable,
+            key=lambda t: (abs(t[0] - edge.x) + abs(t[1] - edge.y),
+                           abs(t[0] - state.x) + abs(t[1] - state.y)),
+        )
+        route = find_path(state.navigation, state.x, state.y, target_x, target_y)
+        if route is None:
+            return None
+        priority = 68 if destination_matches else 56
+        slug = self._slugify(edge.destination_symbol or f"warp_{edge.x}_{edge.y}")
+        candidate = CandidateNextStep(
+            id=f"nudge_warp_{slug}_{edge.x}_{edge.y}",
+            type="ENTER_CONNECTOR",
+            target=ObjectiveTarget(
+                kind="connector",
+                map_id=state.map_id,
+                map_name=state.map_name,
+                x=target_x,
+                y=target_y,
+                detail=f"nudge toward {edge.destination_name or 'warp'}",
+            ),
+            why=f"Move closer to the {edge.destination_name or 'warp'} connector to reveal its approach tile.",
+            priority=priority,
+            expected_success_signal="The approach tile for the connector becomes reachable",
+            objective_id=objective_id,
+            distance=len(route),
+            advances_target=destination_matches,
+        )
+        runtime = CandidateRuntime(
+            target_x=target_x,
+            target_y=target_y,
+            follow_up_action=None,
+            step_budget=len(route) + 2,
+        )
+        return (
+            (1, -priority, len(route), 0 if destination_matches else 1, candidate.id),
+            candidate,
+            runtime,
+        )
 
     def _candidate_for_adjacent_interactable(
         self,
