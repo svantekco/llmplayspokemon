@@ -8,6 +8,7 @@ from PIL import Image
 
 from pokemon_agent.agent.engine import ClosedLoopRunner
 from pokemon_agent.agent.engine import PlanningResult
+from pokemon_agent.agent.context_manager import ActionTrace
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_collision
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_tiles
 from pokemon_agent.agent.memory_manager import MemoryManager
@@ -20,6 +21,8 @@ from pokemon_agent.data.walkthrough import Milestone
 from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
+from pokemon_agent.models.action import ExecutorStatus
+from pokemon_agent.models.action import StepResult
 from pokemon_agent.models.action import Task
 from pokemon_agent.models.action import TaskKind
 from pokemon_agent.models.memory import ConnectorStatus, DiscoveredConnector, DiscoveredMap
@@ -149,6 +152,128 @@ class _MultiRouteMock(MockEmulatorAdapter):
         self.state.map_id = "mock_town"
         self.state.x = 7
         self.state.y = 5
+        self._sync_navigation()
+
+
+class _HouseConnectorMock(MockEmulatorAdapter):
+    def __init__(self, *, allow_push: bool = True) -> None:
+        self.allow_push = allow_push
+        super().__init__()
+        self.maps = {
+            "Red's House 2F": {
+                "map_id": 0x26,
+                "size": (8, 8),
+                "blocked": set(),
+                "npc": None,
+                "step_on_warp": {(7, 1): ("Red's House 1F", 7, 1)},
+                "push_warp": {},
+            },
+            "Red's House 1F": {
+                "map_id": 0x25,
+                "size": (8, 8),
+                "blocked": set(),
+                "npc": None,
+                "step_on_warp": {(7, 1): ("Red's House 2F", 7, 1)},
+                "push_warp": {
+                    (2, 7): (ActionType.MOVE_DOWN, "Pallet Town", 5, 5),
+                    (3, 7): (ActionType.MOVE_DOWN, "Pallet Town", 5, 5),
+                },
+            },
+            "Pallet Town": {
+                "map_id": 0x00,
+                "size": (20, 18),
+                "blocked": set(),
+                "npc": None,
+                "step_on_warp": {},
+                "push_warp": {},
+            },
+        }
+        self.state.map_name = "Red's House 2F"
+        self.state.map_id = 0x26
+        self.state.x = 6
+        self.state.y = 1
+        self.state.facing = "RIGHT"
+        self.state.mode = GameMode.OVERWORLD
+        self.state.text_box_open = False
+        self.state.menu_open = False
+        self.state.battle_state = None
+        self.state.metadata = {"last_button": None, "script_state": "connectors"}
+        self._sync_navigation()
+
+    def _move(self, action_type: ActionType) -> None:
+        if self.state.menu_open or self.state.text_box_open or self.state.battle_state:
+            return
+
+        deltas = {
+            ActionType.MOVE_UP: (0, -1, "UP"),
+            ActionType.MOVE_DOWN: (0, 1, "DOWN"),
+            ActionType.MOVE_LEFT: (-1, 0, "LEFT"),
+            ActionType.MOVE_RIGHT: (1, 0, "RIGHT"),
+        }
+        dx, dy, facing = deltas[action_type]
+        self.state.facing = facing
+        current_map = self.maps[self.state.map_name]
+        current_position = (self.state.x or 0, self.state.y or 0)
+        push_warp = current_map.get("push_warp", {}).get(current_position)
+        if self.allow_push and push_warp is not None and push_warp[0] == action_type:
+            self._warp(push_warp[1], push_warp[2], push_warp[3])
+            return
+
+        target_x = current_position[0] + dx
+        target_y = current_position[1] + dy
+        width, height = current_map["size"]
+        if target_x < 0 or target_y < 0 or target_x >= width or target_y >= height:
+            return
+        if (target_x, target_y) in current_map["blocked"]:
+            return
+
+        self.state.x = target_x
+        self.state.y = target_y
+        step_on_warp = current_map.get("step_on_warp", {}).get((target_x, target_y))
+        if step_on_warp is not None:
+            self._warp(step_on_warp[0], step_on_warp[1], step_on_warp[2])
+
+    def _warp(self, map_name: str, x: int, y: int) -> None:
+        self.state.map_name = map_name
+        self.state.map_id = self.maps[map_name]["map_id"]
+        self.state.x = x
+        self.state.y = y
+        self.state.mode = GameMode.OVERWORLD
+
+    def _sync_navigation(self) -> None:
+        if self.state.mode != GameMode.OVERWORLD:
+            self.state.navigation = None
+            return
+        current_map = self.maps[self.state.map_name]
+        width, height = current_map["size"]
+        blocked = sorted(current_map["blocked"])
+        collision_hash = json.dumps(
+            {
+                "blocked": blocked,
+                "step_on_warp": sorted(current_map.get("step_on_warp", {})),
+                "push_warp": sorted(current_map.get("push_warp", {})),
+                "allow_push": self.allow_push,
+            },
+            sort_keys=True,
+        )
+        self.state.navigation = build_navigation_snapshot_from_tiles(
+            width=width,
+            height=height,
+            player_x=self.state.x,
+            player_y=self.state.y,
+            blocked_tiles=blocked,
+            collision_hash=collision_hash,
+        )
+
+
+class _StubbornDoorMock(_HouseConnectorMock):
+    def __init__(self) -> None:
+        super().__init__(allow_push=False)
+        self.state.map_name = "Red's House 1F"
+        self.state.map_id = 0x25
+        self.state.x = 2
+        self.state.y = 7
+        self.state.facing = "DOWN"
         self._sync_navigation()
 
 
@@ -523,6 +648,48 @@ def _seed_discovered_route(runner: ClosedLoopRunner) -> None:
     )
 
 
+def _seed_house_stairs_only(runner: ClosedLoopRunner) -> None:
+    world_map = runner.memory.memory.long_term.world_map
+    world_map.maps["Red's House 2F"] = DiscoveredMap(
+        map_name="Red's House 2F",
+        map_id=0x26,
+        connectors=["Red's House 2F::tile::7:1"],
+    )
+    world_map.maps["Red's House 1F"] = DiscoveredMap(
+        map_name="Red's House 1F",
+        map_id=0x25,
+        connectors=["Red's House 1F::tile::7:1"],
+    )
+    world_map.connectors["Red's House 2F::tile::7:1"] = DiscoveredConnector(
+        id="Red's House 2F::tile::7:1",
+        source_map="Red's House 2F",
+        source_x=7,
+        source_y=1,
+        kind="warp",
+        status=ConnectorStatus.CONFIRMED,
+        approach_x=6,
+        approach_y=1,
+        transition_action=ActionType.MOVE_RIGHT,
+        destination_map="Red's House 1F",
+        destination_x=7,
+        destination_y=1,
+    )
+    world_map.connectors["Red's House 1F::tile::7:1"] = DiscoveredConnector(
+        id="Red's House 1F::tile::7:1",
+        source_map="Red's House 1F",
+        source_x=7,
+        source_y=1,
+        kind="warp",
+        status=ConnectorStatus.CONFIRMED,
+        approach_x=6,
+        approach_y=1,
+        transition_action=ActionType.MOVE_RIGHT,
+        destination_map="Red's House 2F",
+        destination_x=7,
+        destination_y=1,
+    )
+
+
 def test_closed_loop_runner_executes_one_mock_turn():
     emulator = MockEmulatorAdapter()
     runner = _build_runner(emulator)
@@ -576,6 +743,27 @@ def test_runner_keeps_captured_screen_raw_when_live_overlay_mutates_frame():
     assert result.screen_image is not None
     assert result.screen_image.getpixel((1, 1)) == (32, 48, 96, 255)
     assert emulator.frame.getpixel((1, 1)) == (255, 0, 0, 255)
+
+
+def test_resolve_turn_plan_falls_back_after_repeated_executor_blocking():
+    emulator = MockEmulatorAdapter()
+    runner = _build_runner(emulator)
+    runner._plan_action = lambda _state: PlanningResult(
+        task=Task(kind=TaskKind.ENTER_CONNECTOR, connector_id="missing", reason="blocked connector"),
+        planner_source="auto_candidate",
+    )
+    runner.executor.begin = lambda task, state, follow_up_task=None: StepResult(
+        status=ExecutorStatus.BLOCKED,
+        blocked_reason="No connector approach found",
+    )
+
+    before, planning = runner._resolve_turn_plan()
+
+    assert before.map_name == emulator.state.map_name
+    assert planning.action is not None
+    assert planning.used_fallback is True
+    assert planning.planner_source == "fallback"
+    assert planning.raw_response == "planner retry exhaustion: No connector approach found"
 
 
 def test_runner_checkpoint_round_trip(tmp_path: Path):
@@ -757,6 +945,35 @@ def test_runner_uses_llm_for_opening_get_starter_objective():
     assert llm.current_milestone["id"] == "get_starter"
     assert llm.current_milestone["target_map"] == "Oak's Lab"
     assert "Professor Oak" in llm.current_milestone["description"]
+
+
+def test_runner_uses_llm_immediately_after_bootstrap_even_with_prior_llm_calls():
+    emulator = MockEmulatorAdapter()
+    llm = _CaptureMilestoneLLM()
+    runner = _build_runner(emulator, llm_client=llm)
+    runner.telemetry.llm_calls = 4
+    runner.context_manager.action_traces.append(
+        ActionTrace(
+            turn_index=1,
+            action="PRESS_A",
+            repeat=1,
+            reason="deterministic startup bootstrap",
+            progress_classification="major_progress",
+            map_name="Intro Cutscene",
+            position={"x": None, "y": None},
+            event_summaries=["Advanced dialogue"],
+            stuck_score=0,
+            used_fallback=False,
+            llm_attempted=False,
+            planner_source="bootstrap",
+        )
+    )
+
+    result = runner.run_turn(2)
+
+    assert llm.calls >= 2
+    assert result.llm_attempted is True
+    assert result.planner_source == "llm"
 
 
 def test_runner_opens_menu_proactively_for_required_hm(monkeypatch) -> None:
@@ -1064,6 +1281,341 @@ def test_engine_moves_toward_direct_warp_landmark_when_target_map_is_offscreen()
     assert goal.target_landmark_id == "pallet_town_oak_s_lab"
     assert candidates[0].id.startswith("landmark_window_pallet_town_oak_s_lab")
     assert candidates[0].why == "Move toward the canonical Oak's Lab entrance to reveal its connector."
+
+
+def test_recover_plan_completion_reverts_to_default_story_plan_without_llm() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Go downstairs and exit your house to find Professor Oak.",
+            mid_term_goal="Complete the Pokemon League challenge by collecting badges.",
+            long_term_goal="Become the Champion.",
+            current_strategy="Use the stairs to recover.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="recover",
+            target_map_name="Red's House 1F",
+            success_signal="Successfully warping to Red's House 1F.",
+            confidence=1.0,
+        ),
+        valid_for_milestone_id="get_starter",
+        valid_for_map_name="Red's House 2F",
+        replan_reason="stuck_recovery",
+    )
+
+    state = StructuredGameState(
+        map_name="Red's House 1F",
+        map_id=0x25,
+        x=7,
+        y=1,
+        facing="DOWN",
+        mode=GameMode.OVERWORLD,
+        step=100,
+    )
+
+    runner._ensure_objective_plan(state)
+
+    plan = runner.memory.memory.long_term.objective_plan
+    assert plan is not None
+    assert plan.internal_plan.plan_type in {"go_to_landmark", "go_to_map"}
+    assert plan.internal_plan.target_map_name == "Oak's Lab"
+    assert "Oak's Lab" in plan.human_plan.short_term_goal
+    assert "Go downstairs" not in plan.human_plan.short_term_goal
+    assert plan.valid_for_map_name == "Red's House 1F"
+
+
+def test_engine_refreshes_opening_target_after_reaching_reds_house_1f() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    _seed_house_stairs_only(runner)
+    state = StructuredGameState(
+        map_name="Red's House 1F",
+        map_id=0x25,
+        x=7,
+        y=1,
+        facing="DOWN",
+        mode=GameMode.OVERWORLD,
+        step=100,
+        navigation=build_navigation_snapshot_from_tiles(
+            width=8,
+            height=8,
+            player_x=7,
+            player_y=1,
+            blocked_tiles=[(2, 7), (3, 7), (7, 1)],
+            collision_hash="reds-house-1f",
+        ),
+    )
+
+    goal = runner._sync_navigation_goal(state)
+    candidates = runner._build_candidate_steps(state)
+
+    assert goal is not None
+    assert goal.final_target_map_name == "Oak's Lab"
+    assert goal.target_map_name == "Oak's Lab"
+    assert goal.next_map_name == "Pallet Town"
+    assert all(candidate.id != "connector_red_s_house_1f_tile_7_1" for candidate in candidates)
+    assert all("Red's House 2F" not in candidate.why for candidate in candidates)
+
+
+def test_engine_ignores_stale_local_objective_plan_after_coming_downstairs() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    _seed_house_stairs_only(runner)
+    runner._previous_map_name = "Red's House 2F"
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Exit the current bedroom and descend to the first floor of Red's House.",
+            mid_term_goal="Navigate from Red's House 2F to Oak's Lab in Pallet Town.",
+            long_term_goal="Receive your first Pokemon from Professor Oak to begin your journey.",
+            current_strategy="Continue navigating from Red's House 2F to Red's House 1F by using the stairs.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="REDS_HOUSE_1F",
+            success_signal="Map change to Red's House 1F.",
+            stop_when="Player is on Red's House 1F.",
+            confidence=1.0,
+            notes="Seeded stale local target copied from the session failure.",
+        ),
+        valid_for_milestone_id="get_starter",
+        valid_for_map_name="Red's House 2F",
+        replan_reason="stale_turn_boundary",
+    )
+    state = StructuredGameState(
+        map_name="Red's House 1F",
+        map_id=0x25,
+        x=7,
+        y=1,
+        facing="DOWN",
+        mode=GameMode.OVERWORLD,
+        step=101,
+        navigation=build_navigation_snapshot_from_tiles(
+            width=8,
+            height=8,
+            player_x=7,
+            player_y=1,
+            blocked_tiles=[(2, 7), (3, 7), (7, 1)],
+            collision_hash="reds-house-1f-stale-plan",
+        ),
+    )
+
+    goal = runner._sync_navigation_goal(state)
+    candidates = runner._build_candidate_steps(state)
+
+    assert goal is not None
+    assert goal.source == "objective"
+    assert goal.target_map_name == "Oak's Lab"
+    assert goal.final_target_map_name == "Oak's Lab"
+    assert goal.next_map_name == "Pallet Town"
+    assert candidates[0].id != "connector_red_s_house_1f_tile_7_1"
+    assert all(candidate.id != "connector_red_s_house_1f_tile_7_1" for candidate in candidates)
+    assert all("Red's House 2F" not in candidate.why for candidate in candidates)
+
+
+def test_engine_caps_long_routes_to_four_connectors() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Head east toward Cerulean City.",
+            mid_term_goal="Follow the shortest route across the early gyms.",
+            long_term_goal="Reach Cerulean City.",
+            current_strategy="Use deterministic connector routing.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Cerulean City",
+            success_signal="Arrive in Cerulean City.",
+            confidence=0.9,
+        ),
+        valid_for_milestone_id="test_long_route",
+        valid_for_map_name="Pallet Town",
+    )
+    state = StructuredGameState(
+        map_name="Pallet Town",
+        map_id=0x00,
+        x=5,
+        y=5,
+        facing="UP",
+        mode=GameMode.OVERWORLD,
+        step=100,
+    )
+
+    goal = runner._sync_navigation_goal(state)
+
+    assert goal is not None
+    assert goal.target_map_name == "Pewter City"
+    assert goal.final_target_map_name == "Cerulean City"
+    assert goal.next_map_name == "Route 1"
+    assert goal.target_landmark_id is None
+
+
+def test_engine_recomputes_capped_route_after_intermediate_progress() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Head east toward Cerulean City.",
+            mid_term_goal="Follow the shortest route across the early gyms.",
+            long_term_goal="Reach Cerulean City.",
+            current_strategy="Use deterministic connector routing.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Cerulean City",
+            success_signal="Arrive in Cerulean City.",
+            confidence=0.9,
+        ),
+        valid_for_milestone_id="test_long_route",
+        valid_for_map_name="Pallet Town",
+    )
+    state = StructuredGameState(
+        map_name="Pewter City",
+        map_id=0x02,
+        x=10,
+        y=10,
+        facing="UP",
+        mode=GameMode.OVERWORLD,
+        step=120,
+    )
+
+    goal = runner._sync_navigation_goal(state)
+
+    assert goal is not None
+    assert goal.target_map_name == "Cerulean City"
+    assert goal.final_target_map_name == "Cerulean City"
+    assert goal.next_map_name == "Route 3"
+
+
+def test_engine_keeps_local_target_on_oaks_lab_when_story_interaction_is_nearby() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    state = StructuredGameState(
+        map_name="Oak's Lab",
+        map_id=0x28,
+        x=4,
+        y=6,
+        facing="UP",
+        mode=GameMode.OVERWORLD,
+        step=100,
+        navigation=build_navigation_snapshot_from_tiles(
+            width=6,
+            height=8,
+            player_x=4,
+            player_y=6,
+            blocked_tiles=[(4, 5)],
+            collision_hash="oak-lab-near-oak",
+        ),
+    )
+
+    goal = runner._sync_navigation_goal(state)
+
+    assert goal is not None
+    assert goal.target_map_name == "Oak's Lab"
+    assert goal.final_target_map_name == "Oak's Lab"
+    assert goal.next_map_name is None
+    assert goal.objective_kind == "talk_to_required_npc"
+
+
+def test_engine_resolves_static_door_connector_metadata() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+
+    connector = runner._connector_by_id("static:PALLET_TOWN:3:7")
+
+    assert isinstance(connector, DiscoveredConnector)
+    assert connector.source_map == "Red's House 1F"
+    assert connector.source_x == 3
+    assert connector.source_y == 7
+    assert connector.activation_mode == "push"
+    assert connector.transition_action == ActionType.MOVE_DOWN
+    assert connector.destination_map == "Pallet Town"
+
+
+def test_runner_handles_stair_then_push_door_connectors_end_to_end() -> None:
+    emulator = _HouseConnectorMock()
+    runner = _build_runner(emulator, llm_client=_ChooseCandidateLLM(index=0))
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Go downstairs.",
+            mid_term_goal="Reach the first floor.",
+            long_term_goal="Leave the house.",
+            current_strategy="Use the stairs.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Red's House 1F",
+            success_signal="Map changes to Red's House 1F.",
+            confidence=1.0,
+        ),
+        valid_for_milestone_id="connector_test",
+        valid_for_map_name="Red's House 2F",
+    )
+
+    first = runner.run_turn(1)
+
+    assert first.action.action == ActionType.MOVE_RIGHT
+    assert first.after.map_name == "Red's House 1F"
+
+    emulator.state.x = 2
+    emulator.state.y = 6
+    emulator.state.facing = "DOWN"
+    emulator._sync_navigation()
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Exit through the front door.",
+            mid_term_goal="Reach Pallet Town.",
+            long_term_goal="Leave the house.",
+            current_strategy="Walk onto the door tile, then push through it.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Pallet Town",
+            success_signal="Map changes to Pallet Town.",
+            confidence=1.0,
+        ),
+        valid_for_milestone_id="connector_test",
+        valid_for_map_name="Red's House 1F",
+    )
+
+    second = runner.run_turn(2)
+    third = runner.run_turn(3)
+
+    assert second.action.action == ActionType.MOVE_DOWN
+    assert second.after.map_name == "Red's House 1F"
+    assert third.planner_source == "executor"
+    assert third.action.action == ActionType.MOVE_DOWN
+    assert third.after.map_name == "Pallet Town"
+
+
+def test_runner_tries_press_a_once_after_repeated_push_failures() -> None:
+    emulator = _StubbornDoorMock()
+    runner = _build_runner(emulator, llm_client=_ChooseCandidateLLM(index=0))
+    runner.memory.memory.long_term.objective_plan = ObjectivePlanEnvelope(
+        human_plan=HumanObjectivePlan(
+            short_term_goal="Exit through the front door.",
+            mid_term_goal="Reach Pallet Town.",
+            long_term_goal="Leave the house.",
+            current_strategy="Push through the door, then try interacting once if needed.",
+        ),
+        internal_plan=InternalObjectivePlan(
+            plan_type="go_to_map",
+            target_map_name="Pallet Town",
+            success_signal="Map changes to Pallet Town.",
+            confidence=1.0,
+        ),
+        valid_for_milestone_id="connector_test",
+        valid_for_map_name="Red's House 1F",
+    )
+
+    first = runner.run_turn(1)
+    second = runner.run_turn(2)
+    third = runner.run_turn(3)
+    fourth = runner.run_turn(4)
+
+    assert [first.action.action, second.action.action, third.action.action] == [
+        ActionType.MOVE_DOWN,
+        ActionType.MOVE_DOWN,
+        ActionType.PRESS_A,
+    ]
+    assert first.after.map_name == "Red's House 1F"
+    assert second.after.map_name == "Red's House 1F"
+    assert third.after.map_name == "Red's House 1F"
+    assert fourth.planner_source != "executor"
 
 
 def test_engine_reroutes_after_failed_first_step_with_temporary_blocker() -> None:

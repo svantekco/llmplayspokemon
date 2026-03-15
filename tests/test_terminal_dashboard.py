@@ -118,6 +118,67 @@ def test_dashboard_renders_state_turns_and_llm_details():
     assert "Leave Pallet Town and head toward Route 1." in rendered
     assert "Reach Viridian City and continue the opening route." in rendered
     assert "Planner Payload" not in rendered
+
+
+def test_dashboard_renders_final_pathfinding_target_when_route_is_capped():
+    console = Console(record=True, width=140, height=80)
+    state = StructuredGameState(
+        map_name="Pallet Town",
+        map_id=0x00,
+        x=5,
+        y=5,
+        facing="UP",
+        mode=GameMode.OVERWORLD,
+        navigation=NavigationSnapshot(
+            min_x=0,
+            min_y=0,
+            max_x=9,
+            max_y=9,
+            player=WorldCoordinate(x=5, y=5),
+            walkable=[WorldCoordinate(x=5, y=5), WorldCoordinate(x=5, y=4)],
+            blocked=[WorldCoordinate(x=4, y=5)],
+            collision_hash="pallet-town",
+        ),
+        step=20,
+    )
+    dashboard = TerminalDashboard(
+        planner="auto_candidate",
+        continuous=False,
+        target_turns=4,
+        checkpoint_dir="/tmp/session",
+        console=console,
+    )
+    dashboard.current_state = state
+    dashboard.summary = {
+        "turns": 1,
+        "fallback_turns": 0,
+        "prompt_chars": 0,
+        "approx_prompt_tokens": 0,
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_total_tokens": 0,
+        "llm_calls": 0,
+        "turns_per_call": 0.0,
+        "objective_switch_rate": 0.0,
+        "short_term_goal": "Cross the early-game route safely.",
+        "mid_term_goal": "Reach Pewter City before continuing east.",
+        "long_term_goal": "Reach Cerulean City.",
+        "current_strategy": "Chunk long travel into a nearby subtarget.",
+        "pathfinding_route": ["PALLET_TOWN", "ROUTE_1", "VIRIDIAN_CITY", "ROUTE_2", "PEWTER_CITY"],
+        "pathfinding_route_available": True,
+        "pathfinding_target_symbol": "PEWTER_CITY",
+        "pathfinding_final_target_symbol": "CERULEAN_CITY",
+        "pathfinding_next_symbol": "ROUTE_1",
+        "pathfinding_next_hop_kind": "boundary",
+    }
+    dashboard.status = "Running"
+
+    console.print(dashboard.render())
+    rendered = console.export_text()
+
+    assert "PEWTER_CITY" in rendered
+    assert "CERULEAN_CITY" in rendered
+    assert "Final" in rendered
     assert "Planning State" not in rendered
 
 

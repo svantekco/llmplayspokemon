@@ -12,6 +12,7 @@ from pokemon_agent.data.walkthrough import get_current_milestone
 from pokemon_agent.data.walkthrough import milestone_for_completion_flag
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.events import EventRecord, EventType
+from pokemon_agent.models.memory import DiscoveredConnector
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.planner import Objective
 from pokemon_agent.models.planner import ObjectiveHorizon
@@ -40,6 +41,8 @@ class MemoryManager:
         action: ActionDecision,
         progress: ProgressResult,
         stuck_state: StuckState | None = None,
+        *,
+        active_connector: DiscoveredConnector | None = None,
     ) -> list[EventRecord]:
         events: list[EventRecord] = []
         observe_state(self.memory.long_term.world_map, previous)
@@ -56,7 +59,13 @@ class MemoryManager:
             )
             if current.map_id is not None:
                 self.memory.long_term.known_locations[str(current.map_id)] = current.map_name
-            connector = confirm_transition(self.memory.long_term.world_map, previous, action, current)
+            connector = confirm_transition(
+                self.memory.long_term.world_map,
+                previous,
+                action,
+                current,
+                active_connector=active_connector,
+            )
             if connector is not None:
                 events.append(
                     EventRecord(

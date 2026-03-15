@@ -272,6 +272,8 @@ class DebugOverlayWriter:
                     f"Next Hop: {goal.next_hop_kind or '-'} -> {goal.next_map_name or '-'}",
                 ]
             )
+            if goal.final_target_map_name and goal.final_target_map_name != goal.target_map_name:
+                lines.append(f"Final Target: {goal.final_target_map_name}")
         if turn.objective_plan is not None:
             lines.extend(
                 [

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
 from pokemon_agent.agent.navigation import NavigationGrid
@@ -18,6 +19,19 @@ from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import StructuredGameState
 
 
+@dataclass(slots=True)
+class ConnectorExecutionState:
+    connector_id: str | None
+    activation_mode: str
+    source_x: int | None
+    source_y: int | None
+    approach_x: int | None
+    approach_y: int | None
+    transition_action: ActionType | None
+    failed_transition_attempts: int = 0
+    tried_interact_fallback: bool = False
+
+
 class Executor:
     def __init__(
         self,
@@ -34,6 +48,7 @@ class Executor:
         self._nav_grid = NavigationGrid()
         self._pending_blocked_reason: str | None = None
         self._last_action_mode: str | None = None
+        self._connector_state: ConnectorExecutionState | None = None
 
     def is_active(self) -> bool:
         return self._task is not None or self._pending_blocked_reason is not None
@@ -62,6 +77,7 @@ class Executor:
         self._started_map_key = self._state_map_key(state)
         self._pending_blocked_reason = None
         self._last_action_mode = None
+        self._connector_state = None
         self._nav_grid = NavigationGrid(state.navigation)
         return self.step(state)
 
@@ -97,20 +113,26 @@ class Executor:
 
         return StepResult(status=ExecutorStatus.DONE)
 
-    def report_move_failed(self, state: StructuredGameState, action: ActionDecision) -> None:
+    def report_failure(self, state: StructuredGameState, action: ActionDecision) -> bool:
         if self._task is None:
-            return
+            return False
+        if self._task.kind == TaskKind.ENTER_CONNECTOR and self._report_connector_failure(state, action):
+            return False
         if self._last_action_mode != "move":
-            return
+            return False
         if state.x is None or state.y is None:
-            return
+            return False
         blocked_coordinate = self._advance_position(state.x, state.y, action.action)
         if blocked_coordinate is None:
-            return
+            return False
         self._nav_grid.mark_blocked(*blocked_coordinate)
         self._retries += 1
         if self._retries >= self._max_retries:
             self._pending_blocked_reason = f"Movement to {blocked_coordinate} failed repeatedly"
+        return True
+
+    def report_move_failed(self, state: StructuredGameState, action: ActionDecision) -> bool:
+        return self.report_failure(state, action)
 
     def abort(self) -> None:
         self._task = None
@@ -119,6 +141,7 @@ class Executor:
         self._started_map_key = None
         self._pending_blocked_reason = None
         self._last_action_mode = None
+        self._connector_state = None
         self._nav_grid.clear_blocked()
 
     def export_state(self) -> dict[str, object] | None:
@@ -131,6 +154,7 @@ class Executor:
             "started_map_key": self._started_map_key,
             "blocked_tiles": sorted([list(item) for item in self._nav_grid._blocked]),
             "pending_blocked_reason": self._pending_blocked_reason,
+            "connector_state": self._export_connector_state(),
         }
 
     def restore_state(self, payload: dict[str, object] | None) -> None:
@@ -144,6 +168,7 @@ class Executor:
         self._retries = int(payload.get("retries", 0))
         self._started_map_key = payload.get("started_map_key")
         self._pending_blocked_reason = payload.get("pending_blocked_reason")
+        self._connector_state = self._restore_connector_state(payload.get("connector_state"))
         for item in payload.get("blocked_tiles", []):
             if isinstance(item, (list, tuple)) and len(item) == 2:
                 self._nav_grid.mark_blocked(int(item[0]), int(item[1]))
@@ -225,6 +250,20 @@ class Executor:
 
     def _step_enter_connector(self, state: StructuredGameState, task: Task) -> StepResult:
         connector = self._lookup_connector(task.connector_id)
+        connector_state = self._ensure_connector_state(task, connector)
+        activation_mode = connector_state.activation_mode if connector_state is not None else self._connector_activation_mode(connector)
+        if (
+            activation_mode == "push"
+            and connector is not None
+            and connector.source_side is None
+            and connector_state is not None
+            and connector_state.source_x is not None
+            and connector_state.source_y is not None
+            and connector_state.transition_action is not None
+        ):
+            return self._step_push_connector(state, task, connector_state)
+        if activation_mode == "interact":
+            return self._step_interact_connector(state, task, connector_state)
         approach = self._approach_for_connector(state, task, connector)
         if approach is None:
             self._task = None
@@ -243,6 +282,63 @@ class Executor:
                 suggested_path=suggested_path,
             )
         return self._step_navigate_to(state, task, approach_x, approach_y)
+
+    def _step_push_connector(
+        self,
+        state: StructuredGameState,
+        task: Task,
+        connector_state: ConnectorExecutionState | None,
+    ) -> StepResult:
+        if connector_state is None or connector_state.source_x is None or connector_state.source_y is None or connector_state.transition_action is None:
+            self._task = None
+            return StepResult(status=ExecutorStatus.BLOCKED, blocked_reason="No push connector metadata found")
+        if state.x is None or state.y is None:
+            self._task = None
+            return StepResult(status=ExecutorStatus.BLOCKED, blocked_reason="Missing player coordinates")
+        if (state.x, state.y) != (connector_state.source_x, connector_state.source_y):
+            return self._step_navigate_to(state, task, connector_state.source_x, connector_state.source_y)
+        if connector_state.failed_transition_attempts >= 2:
+            expected_facing = facing_name_for_action(connector_state.transition_action)
+            if state.facing != expected_facing:
+                return self._emit_action(
+                    connector_state.transition_action,
+                    task.reason or "face connector",
+                    mode="face",
+                )
+            if not connector_state.tried_interact_fallback:
+                return self._emit_action(ActionType.PRESS_A, task.reason or "enter connector", mode="connector_interact")
+            self._task = None
+            return StepResult(status=ExecutorStatus.BLOCKED, blocked_reason="Connector activation failed after move and PRESS_A fallback")
+        blocked_coordinate = self._advance_position(state.x, state.y, connector_state.transition_action)
+        suggested_path = [] if blocked_coordinate is None else [blocked_coordinate]
+        return self._emit_action(
+            connector_state.transition_action,
+            task.reason or "enter connector",
+            mode="connector_transition",
+            suggested_path=suggested_path,
+        )
+
+    def _step_interact_connector(
+        self,
+        state: StructuredGameState,
+        task: Task,
+        connector_state: ConnectorExecutionState | None,
+    ) -> StepResult:
+        if state.x is None or state.y is None:
+            self._task = None
+            return StepResult(status=ExecutorStatus.BLOCKED, blocked_reason="Missing player coordinates")
+        approach_x = connector_state.approach_x if connector_state is not None else None
+        approach_y = connector_state.approach_y if connector_state is not None else None
+        if approach_x is not None and approach_y is not None and (state.x, state.y) != (approach_x, approach_y):
+            return self._step_navigate_to(state, task, approach_x, approach_y)
+        source_x = connector_state.source_x if connector_state is not None else None
+        source_y = connector_state.source_y if connector_state is not None else None
+        if source_x is not None and source_y is not None and abs(state.x - source_x) + abs(state.y - source_y) == 1:
+            face_action = facing_action_for_target(state.x, state.y, source_x, source_y)
+            expected_facing = facing_name_for_action(face_action)
+            if face_action is not None and state.facing != expected_facing:
+                return self._emit_action(face_action, task.reason or "face connector", mode="face")
+        return self._emit_action(ActionType.PRESS_A, task.reason or "enter connector", mode="connector_interact")
 
     def _step_walk_boundary(self, state: StructuredGameState, task: Task) -> StepResult:
         assert task.direction is not None
@@ -402,6 +498,109 @@ class Executor:
         if connector_id is None or self._connector_lookup is None:
             return None
         return self._connector_lookup(connector_id)
+
+    def _ensure_connector_state(
+        self,
+        task: Task,
+        connector: DiscoveredConnector | None,
+    ) -> ConnectorExecutionState | None:
+        activation_mode = self._connector_activation_mode(connector)
+        source_x = connector.source_x if connector is not None else task.target_x
+        source_y = connector.source_y if connector is not None else task.target_y
+        approach_x = connector.approach_x if connector is not None else None
+        approach_y = connector.approach_y if connector is not None else None
+        transition_action = connector.transition_action if connector is not None else None
+        if (
+            self._connector_state is not None
+            and self._connector_state.connector_id == task.connector_id
+            and self._connector_state.activation_mode == activation_mode
+            and self._connector_state.source_x == source_x
+            and self._connector_state.source_y == source_y
+            and self._connector_state.transition_action == transition_action
+        ):
+            if self._connector_state.approach_x is None:
+                self._connector_state.approach_x = approach_x
+            if self._connector_state.approach_y is None:
+                self._connector_state.approach_y = approach_y
+            return self._connector_state
+        self._connector_state = ConnectorExecutionState(
+            connector_id=task.connector_id,
+            activation_mode=activation_mode,
+            source_x=source_x,
+            source_y=source_y,
+            approach_x=approach_x,
+            approach_y=approach_y,
+            transition_action=transition_action,
+        )
+        return self._connector_state
+
+    def _connector_activation_mode(self, connector: DiscoveredConnector | None) -> str:
+        if connector is not None and connector.activation_mode in {"step_on", "push", "interact"}:
+            return connector.activation_mode
+        if connector is not None and connector.transition_action == ActionType.PRESS_A:
+            return "interact"
+        return "step_on"
+
+    def _report_connector_failure(self, state: StructuredGameState, action: ActionDecision) -> bool:
+        if self._connector_state is None or state.x is None or state.y is None:
+            return False
+        if self._connector_state.activation_mode == "push":
+            if (
+                self._last_action_mode == "connector_transition"
+                and action.action == self._connector_state.transition_action
+                and (state.x, state.y) == (self._connector_state.source_x, self._connector_state.source_y)
+            ):
+                self._connector_state.failed_transition_attempts += 1
+                return True
+            if self._last_action_mode == "face" and action.action == self._connector_state.transition_action:
+                return True
+            if self._last_action_mode == "connector_interact" and action.action == ActionType.PRESS_A:
+                self._connector_state.tried_interact_fallback = True
+                self._pending_blocked_reason = "Connector activation failed after move and PRESS_A fallback"
+                return True
+            return False
+        if self._connector_state.activation_mode == "interact" and self._last_action_mode == "connector_interact" and action.action == ActionType.PRESS_A:
+            self._pending_blocked_reason = "Connector interaction failed"
+            return True
+        return False
+
+    def _export_connector_state(self) -> dict[str, object] | None:
+        if self._connector_state is None:
+            return None
+        transition_action = self._connector_state.transition_action
+        return {
+            "connector_id": self._connector_state.connector_id,
+            "activation_mode": self._connector_state.activation_mode,
+            "source_x": self._connector_state.source_x,
+            "source_y": self._connector_state.source_y,
+            "approach_x": self._connector_state.approach_x,
+            "approach_y": self._connector_state.approach_y,
+            "transition_action": None if transition_action is None else transition_action.value,
+            "failed_transition_attempts": self._connector_state.failed_transition_attempts,
+            "tried_interact_fallback": self._connector_state.tried_interact_fallback,
+        }
+
+    def _restore_connector_state(self, payload: object) -> ConnectorExecutionState | None:
+        if not isinstance(payload, dict):
+            return None
+        transition_value = payload.get("transition_action")
+        transition_action = None
+        if isinstance(transition_value, str):
+            try:
+                transition_action = ActionType(transition_value)
+            except ValueError:
+                transition_action = None
+        return ConnectorExecutionState(
+            connector_id=payload.get("connector_id") if isinstance(payload.get("connector_id"), str) else None,
+            activation_mode=str(payload.get("activation_mode") or "step_on"),
+            source_x=payload.get("source_x") if isinstance(payload.get("source_x"), int) else None,
+            source_y=payload.get("source_y") if isinstance(payload.get("source_y"), int) else None,
+            approach_x=payload.get("approach_x") if isinstance(payload.get("approach_x"), int) else None,
+            approach_y=payload.get("approach_y") if isinstance(payload.get("approach_y"), int) else None,
+            transition_action=transition_action,
+            failed_transition_attempts=int(payload.get("failed_transition_attempts", 0)),
+            tried_interact_fallback=bool(payload.get("tried_interact_fallback", False)),
+        )
 
     def _action_for_direction(self, direction: str) -> ActionType | None:
         mapping = {

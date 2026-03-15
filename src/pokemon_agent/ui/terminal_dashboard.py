@@ -140,6 +140,7 @@ class TerminalDashboard:
     def _render_pathfinding_route(self) -> Panel:
         route = [str(item) for item in self.summary.get("pathfinding_route", []) if item]
         target = self.summary.get("pathfinding_target_symbol")
+        final_target = self.summary.get("pathfinding_final_target_symbol")
         next_symbol = self.summary.get("pathfinding_next_symbol")
         next_hop_kind = self.summary.get("pathfinding_next_hop_kind")
         route_available = bool(self.summary.get("pathfinding_route_available"))
@@ -156,6 +157,8 @@ class TerminalDashboard:
         details.add_row("Route", route_text)
         if target:
             details.add_row("Target", str(target))
+        if final_target and final_target != target:
+            details.add_row("Final", str(final_target))
         if next_symbol:
             next_label = str(next_symbol)
             if next_hop_kind:

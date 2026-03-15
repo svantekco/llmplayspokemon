@@ -40,6 +40,8 @@ from pokemon_agent.models.action import StepResult
 from pokemon_agent.models.action import Task
 from pokemon_agent.models.action import TaskKind
 from pokemon_agent.models.events import EventRecord
+from pokemon_agent.models.memory import ConnectorStatus
+from pokemon_agent.models.memory import DiscoveredConnector
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.memory import NavigationGoal
 from pokemon_agent.models.planner import CandidateNextStep
@@ -69,6 +71,21 @@ NAVIGATION_CANDIDATE_TYPES = {
     "EXPLORE_WINDOW",
 }
 YES_NO_CANDIDATE_TYPES = {"SELECT_YES", "SELECT_NO"}
+MAX_ROUTE_CONNECTOR_HOPS = 4
+STORY_INTERACTION_KEYWORDS = (
+    "talk",
+    "speak",
+    "choose",
+    "receive",
+    "deliver",
+    "clerk",
+    "give",
+    "take",
+    "hand",
+    "battle",
+    "parcel",
+    "pokedex",
+)
 
 
 @dataclass(slots=True)
@@ -244,6 +261,7 @@ class ClosedLoopRunner:
         navigation_goal_snapshot = copy.deepcopy(self.memory.memory.long_term.navigation_goal)
         objective_plan_snapshot = copy.deepcopy(self.memory.memory.long_term.objective_plan)
         executor_task_snapshot = copy.deepcopy(planning.executor_task)
+        active_connector_snapshot = self._connector_for_task(executor_task_snapshot)
         if planning.action is None:
             raise RuntimeError("Planning did not yield an executable action")
         action = self.validator.validate(planning.action, before)
@@ -264,16 +282,17 @@ class ClosedLoopRunner:
             self._clear_temporary_blocked_tiles(before)
             self._clear_temporary_blocked_tiles(after)
             self.executor.abort()
-        if (
-            progress_result.classification == "no_effect"
-            and action.action in {ActionType.MOVE_UP, ActionType.MOVE_RIGHT, ActionType.MOVE_DOWN, ActionType.MOVE_LEFT}
-            and before.map_id == after.map_id
-            and before.map_name == after.map_name
-            and before.x == after.x
-            and before.y == after.y
-        ):
-            self.executor.report_move_failed(before, action)
-            self._record_failed_move_blocker(before, after, action, progress_result, turn_index)
+        if progress_result.classification == "no_effect":
+            should_record_blocker = self.executor.report_failure(before, action)
+            if (
+                should_record_blocker
+                and action.action in {ActionType.MOVE_UP, ActionType.MOVE_RIGHT, ActionType.MOVE_DOWN, ActionType.MOVE_LEFT}
+                and before.map_id == after.map_id
+                and before.map_name == after.map_name
+                and before.x == after.x
+                and before.y == after.y
+            ):
+                self._record_failed_move_blocker(before, after, action, progress_result, turn_index)
         # Record player position when a text box opens (sign/NPC interaction detected).
         if (
             not before.text_box_open
@@ -285,7 +304,14 @@ class ClosedLoopRunner:
             key = (before.map_id, before.x, before.y)
             self._interacted_tiles[key] = turn_index
         self._update_navigation_goal_after_turn(after, progress_result, planning)
-        events = self.memory.update_from_transition(before, after, action, progress_result, stuck_state)
+        events = self.memory.update_from_transition(
+            before,
+            after,
+            action,
+            progress_result,
+            stuck_state,
+            active_connector=active_connector_snapshot,
+        )
         self.context_manager.record_turn(
             turn_index=turn_index,
             action=action,
@@ -330,8 +356,11 @@ class ClosedLoopRunner:
         return [self.run_turn(turn_index) for turn_index in range(1, turns + 1)]
 
     def _resolve_turn_plan(self) -> tuple[StructuredGameState, PlanningResult]:
+        blocked_reasons: list[str] = []
+        latest_state: StructuredGameState | None = None
         for _ in range(8):
             state = self.emulator.get_structured_state()
+            latest_state = state
             if self.executor.is_active():
                 task_snapshot = self.executor.current_task()
                 step = self.executor.step(state)
@@ -349,12 +378,15 @@ class ClosedLoopRunner:
                         return state, planning
                     continue
                 if step.status == ExecutorStatus.BLOCKED:
+                    if step.blocked_reason:
+                        blocked_reasons.append(step.blocked_reason)
                     self.executor.abort()
                     continue
                 continue
 
             planning = self._plan_action(state)
             live_state = self.emulator.get_structured_state()
+            latest_state = live_state
             if planning.action is not None:
                 planning.suggested_path = self._suggested_path_for_action(live_state, planning.action)
                 return live_state, planning
@@ -378,10 +410,22 @@ class ClosedLoopRunner:
                     return live_state, interrupt_planning
                 continue
             if step.status == ExecutorStatus.BLOCKED:
+                if step.blocked_reason:
+                    blocked_reasons.append(step.blocked_reason)
                 self.executor.abort()
                 continue
 
-        raise RuntimeError("Unable to resolve an action for the current turn")
+        fallback_state = latest_state or self.emulator.get_structured_state()
+        blocked_reason = blocked_reasons[-1] if blocked_reasons else "planner retry budget exhausted"
+        fallback_reason = f"planner retry exhaustion: {blocked_reason}"
+        fallback = self.validator.fallback(fallback_state, self.stuck.state, fallback_reason)
+        result = PlanningResult(
+            action=self.validator.validate(fallback, fallback_state),
+            raw_response=fallback_reason,
+            used_fallback=True,
+            planner_source="fallback",
+        )
+        return fallback_state, self._with_objective_planner_metadata(result)
 
     def _plan_action(self, state: StructuredGameState) -> PlanningResult:
         self._objective_plan_messages = []
@@ -516,10 +560,18 @@ class ClosedLoopRunner:
         reason = self._objective_plan_replan_reason(state)
         if reason is None:
             return
+        milestone = self._current_milestone_for_state(state)
+        existing_plan = self.memory.memory.long_term.objective_plan
+        if (
+            existing_plan is not None
+            and existing_plan.internal_plan.plan_type == "recover"
+            and reason in {"plan_complete", "recover_context_changed"}
+        ):
+            self.memory.memory.long_term.objective_plan = self._default_objective_plan(state, milestone, reason)
+            return
         if self.llm_client is None:
             self.memory.memory.long_term.objective_plan = None
             return
-        milestone = self._current_milestone_for_state(state)
         try:
             snapshot = self.context_manager.build_objective_snapshot(
                 state,
@@ -655,11 +707,19 @@ class ClosedLoopRunner:
             return "stuck_recovery"
         if self._objective_plan_complete(state, plan.internal_plan):
             return "plan_complete"
+        if (
+            plan.internal_plan.plan_type == "recover"
+            and plan.valid_for_map_name
+            and not map_matches(state.map_name, plan.valid_for_map_name)
+        ):
+            return "recover_context_changed"
         if not self._objective_plan_is_compilable(state, plan.internal_plan):
             return "plan_uncompilable"
         return None
 
     def _objective_plan_complete(self, state: StructuredGameState, plan: InternalObjectivePlan) -> bool:
+        if plan.plan_type == "recover" and plan.target_map_name:
+            return map_matches(state.map_name, plan.target_map_name)
         if plan.plan_type == "go_to_map" and plan.target_map_name:
             return map_matches(state.map_name, plan.target_map_name)
         if plan.plan_type == "go_to_landmark":
@@ -856,11 +916,14 @@ class ClosedLoopRunner:
             return {}
         current_symbol = self.static_world_graph.canonical_symbol(goal.current_map_name) or goal.current_map_name
         target_symbol = self.static_world_graph.canonical_symbol(goal.target_map_name) or goal.target_map_name
+        final_target_map_name = goal.final_target_map_name or goal.target_map_name
+        final_target_symbol = self.static_world_graph.canonical_symbol(final_target_map_name) or final_target_map_name
         next_symbol = self.static_world_graph.canonical_symbol(goal.next_map_name) or goal.next_map_name
         summary: dict[str, Any] = {
             "pathfinding_route": [item for item in [current_symbol] if item],
             "pathfinding_route_available": False,
             "pathfinding_target_symbol": target_symbol,
+            "pathfinding_final_target_symbol": final_target_symbol,
             "pathfinding_next_symbol": next_symbol,
             "pathfinding_next_hop_kind": goal.next_hop_kind,
         }
@@ -1311,7 +1374,10 @@ class ClosedLoopRunner:
                     continue
             if not destination_matches and story_score == 0 and not prefer_story_matches and goal is not None and goal.next_hop_kind == "warp":
                 continue
-            approach = self._approach_for_transition_tile(state, edge.x, edge.y)
+            static_connector = self._synthesize_static_connector(edge)
+            if static_connector is None:
+                continue
+            approach = self._approach_for_connector(state, static_connector)
             if approach is None:
                 # Approach blocked — if the player is already very close,
                 # generate a low-priority nudge candidate that moves toward the
@@ -1348,7 +1414,7 @@ class ClosedLoopRunner:
             runtime = CandidateRuntime(
                 task=Task(
                     kind=TaskKind.ENTER_CONNECTOR,
-                    connector_id=f"static:{edge.destination_symbol}:{edge.x}:{edge.y}",
+                    connector_id=self._static_connector_id(edge),
                     target_x=edge.x,
                     target_y=edge.y,
                     reason=candidate.why,
@@ -1975,7 +2041,7 @@ class ClosedLoopRunner:
         return (candidates[0].priority - candidates[1].priority) >= 12
 
     def _should_force_opening_objective_llm(self, state: StructuredGameState) -> bool:
-        if self.llm_client is None or self.telemetry.llm_calls > 0:
+        if self.llm_client is None:
             return False
         if state.is_bootstrap():
             return False
@@ -1987,7 +2053,14 @@ class ClosedLoopRunner:
             current_map_name=state.map_name,
             badges=state.badges,
         )
-        return milestone.id == "get_starter"
+        if milestone.id != "get_starter":
+            return False
+        return self.telemetry.llm_calls == 0 or self._just_exited_bootstrap()
+
+    def _just_exited_bootstrap(self) -> bool:
+        if not self.context_manager.action_traces:
+            return False
+        return self.context_manager.action_traces[-1].planner_source == "bootstrap"
 
     def _compile_candidate(
         self,
@@ -2086,7 +2159,103 @@ class ClosedLoopRunner:
         )
 
     def _connector_by_id(self, connector_id: str) -> object | None:
-        return self.memory.memory.long_term.world_map.connectors.get(connector_id)
+        connector = self.memory.memory.long_term.world_map.connectors.get(connector_id)
+        if connector is not None:
+            return connector
+        return self._static_connector_by_id(connector_id)
+
+    def _static_connector_by_id(self, connector_id: str | None) -> DiscoveredConnector | None:
+        parsed = self._parse_static_connector_id(connector_id)
+        if parsed is None:
+            return None
+        source_symbol, destination_symbol, source_x, source_y = parsed
+        edge = self._find_static_warp_edge(source_symbol, destination_symbol, source_x, source_y)
+        if edge is None:
+            return None
+        return self._synthesize_static_connector(edge)
+
+    def _parse_static_connector_id(self, connector_id: str | None) -> tuple[str | None, str | None, int, int] | None:
+        if not connector_id or not connector_id.startswith("static:"):
+            return None
+        parts = connector_id.split(":")
+        if len(parts) == 4:
+            _prefix, destination_symbol, source_x, source_y = parts
+            source_symbol = None
+        elif len(parts) == 5:
+            _prefix, source_symbol, destination_symbol, source_x, source_y = parts
+        else:
+            return None
+        try:
+            return source_symbol, destination_symbol or None, int(source_x), int(source_y)
+        except ValueError:
+            return None
+
+    def _find_static_warp_edge(
+        self,
+        source_symbol: str | None,
+        destination_symbol: str | None,
+        source_x: int,
+        source_y: int,
+    ) -> WorldGraphEdge | None:
+        if source_symbol:
+            edge = self.static_world_graph.get_warp_at(source_symbol, source_x, source_y)
+            if edge is not None and (destination_symbol is None or edge.destination_symbol == destination_symbol):
+                return edge
+        for graph_map in self.static_world_graph.maps():
+            edge = self.static_world_graph.get_warp_at(graph_map.symbol, source_x, source_y)
+            if edge is None:
+                continue
+            if destination_symbol is not None and edge.destination_symbol != destination_symbol:
+                continue
+            return edge
+        return None
+
+    def _synthesize_static_connector(self, edge: WorldGraphEdge) -> DiscoveredConnector | None:
+        if edge.x is None or edge.y is None:
+            return None
+        boundary_side = self._static_warp_boundary_side(edge)
+        activation_mode = "push" if boundary_side is not None else "step_on"
+        transition_action = self._action_for_side(boundary_side) if boundary_side is not None else None
+        return DiscoveredConnector(
+            id=f"{edge.source_name}::tile::{edge.x}:{edge.y}",
+            source_map=edge.source_name,
+            source_x=edge.x,
+            source_y=edge.y,
+            kind="warp",
+            activation_mode=activation_mode,
+            status=ConnectorStatus.CONFIRMED,
+            approach_x=edge.x if activation_mode == "push" else None,
+            approach_y=edge.y if activation_mode == "push" else None,
+            transition_action=transition_action,
+            destination_map=edge.destination_name,
+        )
+
+    def _static_warp_boundary_side(self, edge: WorldGraphEdge) -> str | None:
+        if edge.x is None or edge.y is None:
+            return None
+        graph_map = self.static_world_graph.get_map_by_id(edge.source_symbol)
+        if graph_map is None:
+            return None
+        max_x = max(0, graph_map.width * 2 - 1)
+        max_y = max(0, graph_map.height * 2 - 1)
+        if edge.y <= 0:
+            return "north"
+        if edge.x >= max_x:
+            return "east"
+        if edge.y >= max_y:
+            return "south"
+        if edge.x <= 0:
+            return "west"
+        return None
+
+    def _static_connector_id(self, edge: WorldGraphEdge) -> str:
+        return f"static:{edge.destination_symbol}:{edge.x}:{edge.y}"
+
+    def _connector_for_task(self, task: Task | None) -> DiscoveredConnector | None:
+        if task is None or task.kind != TaskKind.ENTER_CONNECTOR or task.connector_id is None:
+            return None
+        connector = self._connector_by_id(task.connector_id)
+        return connector if isinstance(connector, DiscoveredConnector) else None
 
     def _connector_id_for_candidate(self, candidate: CandidateNextStep) -> str | None:
         runtime = self._candidate_runtime_for(candidate)
@@ -2528,6 +2697,32 @@ class ClosedLoopRunner:
         }
         return mapping.get(action)
 
+    def _capped_route_target(self, current_map_name: str | None, final_target_map_name: str | None) -> str | None:
+        if not current_map_name or not final_target_map_name:
+            return final_target_map_name
+        route = self.static_world_graph.find_route(current_map_name, final_target_map_name)
+        if route is None or len(route.edges) <= MAX_ROUTE_CONNECTOR_HOPS:
+            return final_target_map_name
+        return route.maps[MAX_ROUTE_CONNECTOR_HOPS].name
+
+    def _requires_current_map_story_interaction(self, state: StructuredGameState, milestone) -> bool:
+        if not state.map_name:
+            return False
+        connections = exits_from(state.map_name)
+        if not connections or any(connection.direction != "warp" for connection in connections):
+            return False
+        canonical_name = self.static_world_graph.canonical_name(state.map_name) or state.map_name
+        normalized_map = " ".join(re.findall(r"[a-z0-9]+", canonical_name.lower()))
+        if not normalized_map:
+            return False
+        for line in (milestone.description, *milestone.route_hints, *milestone.sub_steps):
+            normalized_line = " ".join(re.findall(r"[a-z0-9]+", line.lower()))
+            if normalized_map not in normalized_line:
+                continue
+            if any(keyword in normalized_line for keyword in STORY_INTERACTION_KEYWORDS):
+                return True
+        return False
+
     def _sync_navigation_goal(self, state: StructuredGameState) -> NavigationGoal | None:
         if state.is_bootstrap():
             self.memory.memory.long_term.navigation_goal = None
@@ -2543,59 +2738,19 @@ class ClosedLoopRunner:
             compiled_goal = self._sync_navigation_goal_from_objective_plan(state, milestone, objective_plan.internal_plan)
             if compiled_goal is not None:
                 return compiled_goal
-        target_landmark = self._story_landmark_for_milestone(milestone)
         goal = self.memory.memory.long_term.navigation_goal
-        if goal is not None and goal.source != "objective":
-            target_map = goal.target_map_name
-        else:
-            target_map = self._current_story_target(state, milestone)
-        if target_map is None:
-            if goal is not None:
-                goal.target_map_name = milestone.target_map_name
-                goal.target_landmark_id = None if target_landmark is None else target_landmark.id
-                goal.target_landmark_type = None if target_landmark is None else target_landmark.type
-                goal.current_map_name = state.map_name
-                should_interact = self._should_story_interact_here(state, milestone, milestone.target_map_name)
-                if target_landmark is not None and map_matches(state.map_name, milestone.target_map_name):
-                    goal.engine_mode = "progression"
-                    goal.objective_kind = "reach_landmark"
-                else:
-                    goal.engine_mode = "progression" if should_interact else "exploration"
-                    goal.objective_kind = "talk_to_required_npc" if should_interact else "explore_for_matching_connector"
-                goal.next_map_name = None
-                goal.next_hop_kind = None
-                goal.next_hop_side = None
-                goal.target_connector_id = None
-                goal.last_confirmed_step = state.step
-            else:
-                should_interact = self._should_story_interact_here(state, milestone, milestone.target_map_name)
-                goal = NavigationGoal(
-                    target_map_name=milestone.target_map_name,
-                    target_landmark_id=None if target_landmark is None else target_landmark.id,
-                    target_landmark_type=None if target_landmark is None else target_landmark.type,
-                    source="objective",
-                    objective_kind=(
-                        "reach_landmark"
-                        if target_landmark is not None and map_matches(state.map_name, milestone.target_map_name)
-                        else "talk_to_required_npc"
-                        if should_interact
-                        else "explore_for_matching_connector"
-                    ),
-                    engine_mode=(
-                        "progression"
-                        if target_landmark is not None and map_matches(state.map_name, milestone.target_map_name)
-                        else "progression"
-                        if should_interact
-                        else "exploration"
-                    ),
-                    current_map_name=state.map_name,
-                    started_step=state.step,
-                    last_confirmed_step=state.step,
-                )
-                self.memory.memory.long_term.navigation_goal = goal
-            return goal
+        final_target_map_name = milestone.target_map_name
+        logical_target_map_name = self._current_story_target(state, milestone)
+        target_map_name = final_target_map_name if logical_target_map_name is None else logical_target_map_name
+        if logical_target_map_name is not None and not map_matches(state.map_name, logical_target_map_name):
+            target_map_name = self._capped_route_target(state.map_name, logical_target_map_name) or logical_target_map_name
+        target_landmark = (
+            self._story_landmark_for_milestone(milestone)
+            if map_matches(target_map_name, milestone.target_map_name)
+            else None
+        )
 
-        hop = None if map_matches(state.map_name, target_map) else next_hop_toward(state.map_name, target_map)
+        hop = None if map_matches(state.map_name, target_map_name) else next_hop_toward(state.map_name, target_map_name)
         objective_kind = "explore_for_matching_connector"
         engine_mode = "exploration"
         next_map_name = None
@@ -2609,16 +2764,22 @@ class ClosedLoopRunner:
             objective_kind = "reach_boundary_side" if next_hop_kind == "boundary" else "explore_for_matching_connector"
             if next_hop_kind == "warp" and next_map_name is not None:
                 target_landmark = self._landmark_for_destination_on_current_map(state.map_name, next_map_name) or target_landmark
-        elif target_landmark is not None and map_matches(state.map_name, milestone.target_map_name):
+        elif target_landmark is not None and map_matches(state.map_name, target_map_name):
             objective_kind = "reach_landmark"
             engine_mode = "progression"
-        elif self._should_story_interact_here(state, milestone, target_map):
+        elif self._should_story_interact_here(state, milestone, target_map_name):
             objective_kind = "talk_to_required_npc"
             engine_mode = "progression"
 
-        if goal is None or (goal.source == "objective" and goal.target_map_name != milestone.target_map_name):
+        if (
+            goal is None
+            or goal.source != "objective"
+            or goal.target_map_name != target_map_name
+            or goal.final_target_map_name != final_target_map_name
+        ):
             goal = NavigationGoal(
-                target_map_name=milestone.target_map_name,
+                target_map_name=target_map_name,
+                final_target_map_name=final_target_map_name,
                 target_landmark_id=None if target_landmark is None else target_landmark.id,
                 target_landmark_type=None if target_landmark is None else target_landmark.type,
                 source="objective",
@@ -2626,6 +2787,8 @@ class ClosedLoopRunner:
             )
             self.memory.memory.long_term.navigation_goal = goal
         goal.current_map_name = state.map_name
+        goal.target_map_name = target_map_name
+        goal.final_target_map_name = final_target_map_name
         goal.target_landmark_id = None if target_landmark is None else target_landmark.id
         goal.target_landmark_type = None if target_landmark is None else target_landmark.type
         goal.objective_kind = objective_kind
@@ -2634,6 +2797,8 @@ class ClosedLoopRunner:
         goal.next_hop_kind = next_hop_kind
         goal.next_hop_side = next_hop_side
         goal.last_confirmed_step = state.step
+        if goal.next_hop_kind != "warp":
+            goal.target_connector_id = None
         if goal.target_connector_id and goal.next_map_name is not None:
             connector = self.memory.memory.long_term.world_map.connectors.get(goal.target_connector_id)
             if connector is None or (connector.destination_map and not map_matches(connector.destination_map, goal.next_map_name)):
@@ -2660,8 +2825,24 @@ class ClosedLoopRunner:
             self.memory.memory.long_term.navigation_goal = None
             return None
 
-        target_landmark = self.static_world_graph.get_landmark(plan.target_landmark_id)
-        target_map_name = plan.target_map_name or (target_landmark.map_name if target_landmark is not None else milestone.target_map_name)
+        final_target_landmark = self.static_world_graph.get_landmark(plan.target_landmark_id)
+        final_target_map_name = plan.target_map_name or (
+            final_target_landmark.map_name if final_target_landmark is not None else milestone.target_map_name
+        )
+        # If a go_to_* plan has already reached its local/intermediate map, do
+        # not let that stale target mask the next story hop for another turn.
+        if (
+            plan.plan_type in {"go_to_map", "go_to_landmark"}
+            and final_target_map_name
+            and map_matches(state.map_name, final_target_map_name)
+            and not map_matches(state.map_name, milestone.target_map_name)
+        ):
+            self.memory.memory.long_term.navigation_goal = None
+            return None
+        target_map_name = final_target_map_name
+        if plan.plan_type in {"go_to_map", "go_to_landmark"} and not map_matches(state.map_name, final_target_map_name):
+            target_map_name = self._capped_route_target(state.map_name, final_target_map_name) or final_target_map_name
+        target_landmark = final_target_landmark if map_matches(target_map_name, final_target_map_name) else None
         goal = self.memory.memory.long_term.navigation_goal
 
         hop = None if map_matches(state.map_name, target_map_name) else next_hop_toward(state.map_name, target_map_name)
@@ -2687,9 +2868,15 @@ class ClosedLoopRunner:
         else:
             engine_mode = "exploration"
 
-        if goal is None or goal.source != "objective_plan" or goal.target_map_name != target_map_name:
+        if (
+            goal is None
+            or goal.source != "objective_plan"
+            or goal.target_map_name != target_map_name
+            or goal.final_target_map_name != final_target_map_name
+        ):
             goal = NavigationGoal(
                 target_map_name=target_map_name,
+                final_target_map_name=final_target_map_name,
                 source="objective_plan",
                 started_step=state.step,
             )
@@ -2697,6 +2884,7 @@ class ClosedLoopRunner:
 
         goal.current_map_name = state.map_name
         goal.target_map_name = target_map_name
+        goal.final_target_map_name = final_target_map_name
         goal.target_landmark_id = None if target_landmark is None else target_landmark.id
         goal.target_landmark_type = None if target_landmark is None else target_landmark.type
         goal.objective_kind = objective_kind
@@ -2705,6 +2893,8 @@ class ClosedLoopRunner:
         goal.next_hop_kind = next_hop_kind
         goal.next_hop_side = next_hop_side
         goal.last_confirmed_step = state.step
+        if goal.next_hop_kind != "warp":
+            goal.target_connector_id = None
 
         if goal.target_connector_id and goal.next_map_name is not None:
             connector = self.memory.memory.long_term.world_map.connectors.get(goal.target_connector_id)
@@ -2757,39 +2947,37 @@ class ClosedLoopRunner:
                 goal.failed_sides = [item for item in goal.failed_sides if item != goal.next_hop_side]
 
     def _current_story_target(self, state: StructuredGameState, milestone) -> str | None:
-        if self._is_story_relevant_interior(state):
-            return state.map_name
-        preferred_destination = self._preferred_destination_from_milestone(state)
-        if preferred_destination and not map_matches(state.map_name, preferred_destination):
-            return preferred_destination
         if map_matches(state.map_name, milestone.target_map_name):
-            return preferred_destination
+            return None
+        if self._requires_current_map_story_interaction(state, milestone):
+            return state.map_name
         return milestone.target_map_name
 
     def _preferred_destination_from_milestone(self, state: StructuredGameState) -> str | None:
+        milestone = get_current_milestone(
+            state.story_flags,
+            [item.name for item in state.inventory],
+            current_map_name=state.map_name,
+            badges=state.badges,
+        )
         story_text = self._milestone_story_text(state)
-        best: tuple[int, str] | None = None
+        best: tuple[tuple[int, int, int, int, str], str] | None = None
         for connection in exits_from(state.map_name):
             if connection.to_map == state.map_name:
                 continue
-            if self._previous_map_name is not None and connection.to_map == self._previous_map_name:
-                continue
+            route = self.static_world_graph.find_route(connection.to_map, milestone.target_map_name)
+            route_length = 999 if route is None else len(route.edges)
             score = self._map_text_score(connection.to_map, story_text)
-            if score <= 0:
-                continue
-            candidate = (score, connection.to_map)
-            if best is None or candidate > best:
-                best = candidate
-        if best is None and self._previous_map_name is not None:
-            for connection in exits_from(state.map_name):
-                if connection.to_map == state.map_name:
-                    continue
-                score = self._map_text_score(connection.to_map, story_text)
-                if score <= 0:
-                    continue
-                candidate = (score, connection.to_map)
-                if best is None or candidate > best:
-                    best = candidate
+            backtrack = bool(self._previous_map_name and map_matches(connection.to_map, self._previous_map_name))
+            rank = (
+                0 if map_matches(connection.to_map, milestone.target_map_name) else 1,
+                route_length,
+                0 if score > 0 else 1,
+                1 if backtrack else 0,
+                connection.to_map,
+            )
+            if best is None or rank < best[0]:
+                best = (rank, connection.to_map)
         return None if best is None else best[1]
 
     def _story_landmark_for_milestone(self, milestone) -> Landmark | None:
@@ -2892,15 +3080,16 @@ class ClosedLoopRunner:
             return True
         if map_matches(state.map_name, milestone.target_map_name):
             return True
-        return self._is_story_relevant_interior(state)
+        return self._requires_current_map_story_interaction(state, milestone)
 
     def _is_story_relevant_interior(self, state: StructuredGameState) -> bool:
-        if not state.map_name or not self._has_nearby_interactable(state):
-            return False
-        connections = exits_from(state.map_name)
-        if not connections or any(connection.direction != "warp" for connection in connections):
-            return False
-        return self._map_text_score(state.map_name, self._milestone_story_text(state)) > 0
+        milestone = get_current_milestone(
+            state.story_flags,
+            [item.name for item in state.inventory],
+            current_map_name=state.map_name,
+            badges=state.badges,
+        )
+        return self._requires_current_map_story_interaction(state, milestone)
 
     @staticmethod
     def _action_for_side(side: str | None) -> ActionType | None:

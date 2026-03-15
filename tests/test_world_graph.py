@@ -7,7 +7,7 @@ from pokemon_agent.agent.validator import ActionValidator
 from pokemon_agent.models.planner import HumanObjectivePlan, InternalObjectivePlan, ObjectivePlanEnvelope
 from pokemon_agent.models.memory import MemoryState, NavigationGoal
 from pokemon_agent.models.state import GameMode, NavigationSnapshot, StructuredGameState, WorldCoordinate
-from pokemon_agent.navigation.world_graph import load_world_graph
+from pokemon_agent.navigation.world_graph import load_world_graph, map_matches
 
 
 class _StubEmulator:
@@ -23,6 +23,12 @@ def test_world_graph_routes_early_game_city_path() -> None:
 
     assert route is not None
     assert route.summary() == ["PALLET_TOWN", "ROUTE_1", "VIRIDIAN_CITY"]
+
+
+def test_map_matches_accepts_symbolic_and_display_names() -> None:
+    assert map_matches("Red's House 1F", "REDS_HOUSE_1F")
+    assert map_matches("Oak's Lab", "OAKS_LAB")
+    assert map_matches("Mr. Fuji's House", "MR_FUJIS_HOUSE")
 
 
 def test_world_graph_resolves_viridian_city_pokecenter_warp() -> None:
@@ -153,3 +159,43 @@ def test_context_manager_adds_canonical_navigation_grounding() -> None:
     assert canonical["target_landmark"]["id"] == "viridian_city_pokecenter"
     assert canonical["nearest_pokecenter"]["landmark_id"] == "viridian_city_pokecenter"
     assert canonical["route_summary"] == ["ROUTE_1", "VIRIDIAN_CITY"]
+
+
+def test_context_manager_exposes_effective_and_final_navigation_targets() -> None:
+    memory_state = MemoryState()
+    memory_state.long_term.navigation_goal = NavigationGoal(
+        target_map_name="Pewter City",
+        final_target_map_name="Cerulean City",
+        current_map_name="Pallet Town",
+        next_map_name="Route 1",
+        next_hop_kind="boundary",
+        engine_mode="progression",
+    )
+    state = StructuredGameState(
+        map_name="Pallet Town",
+        map_id=0x00,
+        x=5,
+        y=5,
+        mode=GameMode.OVERWORLD,
+        navigation=NavigationSnapshot(
+            min_x=0,
+            min_y=0,
+            max_x=9,
+            max_y=9,
+            player=WorldCoordinate(x=5, y=5),
+            walkable=[WorldCoordinate(x=5, y=5), WorldCoordinate(x=5, y=4)],
+            blocked=[WorldCoordinate(x=6, y=5)],
+            collision_hash="pallet-town",
+        ),
+    )
+
+    snapshot = ContextManager().build_snapshot(state, memory_state)
+    context = snapshot.payload["context"]
+    canonical = context["overworld_context"]["canonical_navigation"]
+    local_objective = context["local_objective"]
+
+    assert local_objective["target_map"] == "Pewter City"
+    assert local_objective["final_target_map"] == "Cerulean City"
+    assert canonical["target_map"] == "PEWTER_CITY"
+    assert canonical["final_target_map"] == "CERULEAN_CITY"
+    assert canonical["route_summary"] == ["PALLET_TOWN", "ROUTE_1", "VIRIDIAN_CITY", "ROUTE_2", "PEWTER_CITY"]

@@ -434,7 +434,15 @@ def _normalize_name(value: str) -> str:
     return "_".join(re.findall(r"[a-z0-9]+", value.lower()))
 
 
+def _compact_name(value: str) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+
 def _map_matches(current_map_name: str, target_map_name: str) -> bool:
+    current_compact = _compact_name(current_map_name)
+    target_compact = _compact_name(target_map_name)
+    if current_compact and current_compact == target_compact:
+        return True
     current_tokens = _tokenize_name(current_map_name)
     target_tokens = _tokenize_name(target_map_name)
     if not current_tokens or not target_tokens:

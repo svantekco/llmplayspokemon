@@ -173,3 +173,56 @@ def test_executor_steps_off_walkable_connector_tile_to_reapproach() -> None:
     assert result.action is not None
     assert result.action.action == ActionType.MOVE_DOWN
     assert result.suggested_path == [(6, 2)]
+
+
+def test_executor_push_connector_retries_move_then_press_a_without_marking_blockers() -> None:
+    connector = DiscoveredConnector(
+        id="door",
+        source_map="Red's House 1F",
+        source_x=3,
+        source_y=7,
+        kind="warp",
+        activation_mode="push",
+        approach_x=3,
+        approach_y=7,
+        transition_action=ActionType.MOVE_DOWN,
+    )
+    executor = Executor(lambda connector_id: connector if connector_id == "door" else None)
+    task = Task(
+        kind=TaskKind.ENTER_CONNECTOR,
+        connector_id="door",
+        target_x=3,
+        target_y=7,
+        reason="leave the house",
+    )
+
+    first = executor.begin(task, _state(x=3, y=6, width=8, height=8, facing="DOWN"))
+    assert first.status == ExecutorStatus.STEPPING
+    assert first.action is not None
+    assert first.action.action == ActionType.MOVE_DOWN
+
+    source_state = _state(x=3, y=7, width=8, height=8, facing="DOWN")
+    second = executor.step(source_state)
+    assert second.status == ExecutorStatus.STEPPING
+    assert second.action is not None
+    assert second.action.action == ActionType.MOVE_DOWN
+
+    assert executor.report_failure(source_state, second.action) is False
+    assert executor.blocked_tiles() == set()
+
+    third = executor.step(source_state)
+    assert third.status == ExecutorStatus.STEPPING
+    assert third.action is not None
+    assert third.action.action == ActionType.MOVE_DOWN
+
+    assert executor.report_failure(source_state, third.action) is False
+    assert executor.blocked_tiles() == set()
+
+    fourth = executor.step(source_state)
+    assert fourth.status == ExecutorStatus.STEPPING
+    assert fourth.action is not None
+    assert fourth.action.action == ActionType.PRESS_A
+
+    executor.report_failure(source_state, fourth.action)
+    blocked = executor.step(source_state)
+    assert blocked.status == ExecutorStatus.BLOCKED

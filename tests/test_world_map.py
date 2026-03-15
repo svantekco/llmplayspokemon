@@ -175,3 +175,49 @@ def test_confirm_transition_uses_tile_connector_for_canonical_edge_warp() -> Non
     assert connector.kind == "warp"
     assert connector.status == ConnectorStatus.CONFIRMED
     assert connector.destination_map == "Red's House 1F"
+
+
+def test_confirm_transition_uses_active_connector_for_push_doors() -> None:
+    world_map = WorldMapMemory()
+    active_connector = DiscoveredConnector(
+        id="static:PALLET_TOWN:3:7",
+        source_map="Red's House 1F",
+        source_x=3,
+        source_y=7,
+        kind="warp",
+        activation_mode="push",
+        approach_x=3,
+        approach_y=7,
+        transition_action=ActionType.MOVE_DOWN,
+        destination_map="Pallet Town",
+    )
+
+    connector = confirm_transition(
+        world_map,
+        previous=StructuredGameState(
+            map_name="Red's House 1F",
+            map_id="REDS_HOUSE_1F",
+            x=3,
+            y=7,
+            mode=GameMode.OVERWORLD,
+            step=20,
+        ),
+        action=ActionDecision(action=ActionType.MOVE_DOWN, reason="Push through the door"),
+        current=StructuredGameState(
+            map_name="Pallet Town",
+            map_id="PALLET_TOWN",
+            x=5,
+            y=5,
+            mode=GameMode.OVERWORLD,
+            step=21,
+        ),
+        active_connector=active_connector,
+    )
+
+    assert connector is not None
+    assert connector.id == "Red's House 1F::tile::3:7"
+    assert connector.source_x == 3
+    assert connector.source_y == 7
+    assert connector.activation_mode == "push"
+    assert connector.transition_action == ActionType.MOVE_DOWN
+    assert connector.destination_map == "Pallet Town"

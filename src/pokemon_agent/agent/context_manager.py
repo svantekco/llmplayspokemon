@@ -340,6 +340,7 @@ class ContextManager:
         return {
             "kind": goal.objective_kind,
             "target_map": goal.target_map_name,
+            "final_target_map": goal.final_target_map_name or goal.target_map_name,
             "target_landmark_id": goal.target_landmark_id,
             "target_landmark_type": goal.target_landmark_type,
             "current_map": goal.current_map_name,
@@ -403,6 +404,7 @@ class ContextManager:
             current_map = self.static_world_graph.get_map_by_name(state.map_name)
         current_map_symbol = None if current_map is None else current_map.symbol
         target_map_symbol = None
+        final_target_map_symbol = None
         target_landmark_payload = None
         route_summary = None
         neighbors: list[str] = []
@@ -425,6 +427,8 @@ class ContextManager:
 
         if goal is not None:
             target_map_symbol = self.static_world_graph.canonical_symbol(goal.target_map_name) or goal.target_map_name
+            final_target_map_name = goal.final_target_map_name or goal.target_map_name
+            final_target_map_symbol = self.static_world_graph.canonical_symbol(final_target_map_name) or final_target_map_name
             target_landmark = self.static_world_graph.get_landmark(goal.target_landmark_id)
             if target_landmark is not None:
                 target_landmark_payload = {
@@ -443,6 +447,7 @@ class ContextManager:
             "route_summary": route_summary,
             "target_landmark": target_landmark_payload,
             "target_map": target_map_symbol,
+            "final_target_map": final_target_map_symbol,
         }
 
     def _build_dialogue_context(self, state: StructuredGameState) -> dict[str, Any]:

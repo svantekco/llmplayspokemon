@@ -32,6 +32,7 @@ class DiscoveredConnector(BaseModel):
     source_x: int | None = None
     source_y: int | None = None
     kind: str = "unknown"
+    activation_mode: str | None = None
     status: ConnectorStatus = ConnectorStatus.SUSPECTED
     approach_x: int | None = None
     approach_y: int | None = None
@@ -54,6 +55,7 @@ class DiscoveredMap(BaseModel):
 
 class NavigationGoal(BaseModel):
     target_map_name: str
+    final_target_map_name: str | None = None
     target_landmark_id: str | None = None
     target_landmark_type: str | None = None
     source: str = "objective"

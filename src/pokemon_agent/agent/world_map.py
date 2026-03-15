@@ -88,6 +88,8 @@ def confirm_transition(
     previous: StructuredGameState,
     action: ActionDecision,
     current: StructuredGameState,
+    *,
+    active_connector: DiscoveredConnector | None = None,
 ) -> DiscoveredConnector | None:
     if previous.map_name == current.map_name:
         return None
@@ -101,7 +103,28 @@ def confirm_transition(
     delta = MOVE_DELTAS.get(action.action)
     source_x = None if previous.x is None or delta is None else previous.x + delta[0]
     source_y = None if previous.y is None or delta is None else previous.y + delta[1]
-    kind, connector_side = _transition_connector_spec(previous.map_id or previous.map_name, side, source_x, source_y)
+    kind, connector_side, activation_mode = _transition_connector_spec(previous.map_id or previous.map_name, side, source_x, source_y)
+    approach_x = previous.x
+    approach_y = previous.y
+    if active_connector is not None:
+        if active_connector.source_x is not None:
+            source_x = active_connector.source_x
+            connector_side = active_connector.source_side
+        if active_connector.source_y is not None:
+            source_y = active_connector.source_y
+            connector_side = active_connector.source_side
+        if active_connector.source_side is not None:
+            connector_side = active_connector.source_side
+        if active_connector.kind and active_connector.kind != "unknown":
+            kind = active_connector.kind
+        if active_connector.activation_mode is not None:
+            activation_mode = active_connector.activation_mode
+        if active_connector.approach_x is not None:
+            approach_x = active_connector.approach_x
+        if active_connector.approach_y is not None:
+            approach_y = active_connector.approach_y
+    if action.action == ActionType.PRESS_A:
+        activation_mode = "interact"
 
     connector = _match_connector(
         world_map,
@@ -125,8 +148,9 @@ def confirm_transition(
     connector.destination_map = current.map_name
     connector.destination_x = current.x
     connector.destination_y = current.y
-    connector.approach_x = previous.x
-    connector.approach_y = previous.y
+    connector.activation_mode = activation_mode
+    connector.approach_x = approach_x
+    connector.approach_y = approach_y
     connector.transition_action = action.action
     connector.confirmed_step = current.step
     if connector.discovered_step is None:
@@ -196,6 +220,9 @@ def summarize_navigation_goal(
         "kind": goal.objective_kind,
         "engine_mode": goal.engine_mode,
     }
+    final_target_map = goal.final_target_map_name or goal.target_map_name
+    if final_target_map != goal.target_map_name:
+        summary["final_target_map"] = final_target_map
     if goal.next_map_name is not None:
         summary["next_map"] = goal.next_map_name
     if goal.next_hop_kind is not None:
@@ -367,6 +394,7 @@ def _create_connector(
     source_y: int | None,
     kind: str,
     step: int | None,
+    activation_mode: str | None = None,
 ) -> DiscoveredConnector:
     return DiscoveredConnector(
         id=_connector_id(source_map, side, source_x, source_y),
@@ -375,6 +403,7 @@ def _create_connector(
         source_x=source_x,
         source_y=source_y,
         kind=kind,
+        activation_mode=activation_mode or _connector_activation_mode(source_map, side, source_x, source_y, kind),
         discovered_step=step,
     )
 
@@ -398,6 +427,8 @@ def _register_connector(world_map: WorldMapMemory, discovered_map: DiscoveredMap
             existing.discovered_step = connector.discovered_step
         if connector.status == ConnectorStatus.CONFIRMED:
             existing.status = ConnectorStatus.CONFIRMED
+        if connector.activation_mode is not None:
+            existing.activation_mode = connector.activation_mode
         if existing.approach_x is None:
             existing.approach_x = connector.approach_x
         if existing.approach_y is None:
@@ -438,17 +469,29 @@ def _build_reverse_connector(connector: DiscoveredConnector, current: Structured
     if connector.destination_map is None or connector.approach_x is None or connector.approach_y is None:
         return None
     reverse_action = OPPOSITE_ACTION.get(connector.transition_action) if connector.transition_action is not None else None
-    reverse_side = None if connector.kind == "warp" else OPPOSITE_SIDE.get(connector.source_side or "") or None
+    reverse_kind, reverse_side, reverse_activation_mode = _transition_connector_spec(
+        current.map_id or current.map_name,
+        None,
+        current.x,
+        current.y,
+    )
+    if reverse_kind == "unknown":
+        reverse_kind = connector.kind
+    if reverse_side is None and connector.kind != "warp":
+        reverse_side = OPPOSITE_SIDE.get(connector.source_side or "") or None
+    reverse_approach_x = current.x if reverse_activation_mode in {"push", "interact"} else None
+    reverse_approach_y = current.y if reverse_activation_mode in {"push", "interact"} else None
     reverse = DiscoveredConnector(
         id=_connector_id(current.map_name, reverse_side, current.x, current.y),
         source_map=current.map_name,
         source_side=reverse_side,
         source_x=current.x,
         source_y=current.y,
-        kind=connector.kind,
+        kind=reverse_kind,
+        activation_mode=reverse_activation_mode,
         status=ConnectorStatus.CONFIRMED,
-        approach_x=current.x,
-        approach_y=current.y,
+        approach_x=reverse_approach_x,
+        approach_y=reverse_approach_y,
         transition_action=reverse_action,
         destination_map=connector.source_map,
         destination_x=connector.approach_x,
@@ -525,10 +568,55 @@ def _transition_connector_spec(
     side: str | None,
     source_x: int | None,
     source_y: int | None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     if source_x is not None and source_y is not None and _STATIC_WORLD_GRAPH.get_warp_at(map_ref, source_x, source_y) is not None:
-        return "warp", None
-    return _kind_for_transition(side, source_x, source_y), side
+        return "warp", None, _connector_activation_mode(map_ref, None, source_x, source_y, "warp")
+    kind = _kind_for_transition(side, source_x, source_y)
+    return kind, side, _connector_activation_mode(map_ref, side, source_x, source_y, kind)
+
+
+def _connector_activation_mode(
+    map_ref: int | str | None,
+    side: str | None,
+    source_x: int | None,
+    source_y: int | None,
+    kind: str,
+) -> str | None:
+    if kind == "boundary":
+        return None
+    if kind == "door":
+        return "push"
+    if kind == "stairs":
+        return "step_on"
+    if kind == "warp":
+        return "push" if _connector_boundary_side(map_ref, side, source_x, source_y) is not None else "step_on"
+    if source_x is None and source_y is None:
+        return "interact"
+    return None
+
+
+def _connector_boundary_side(
+    map_ref: int | str | None,
+    side: str | None,
+    source_x: int | None,
+    source_y: int | None,
+) -> str | None:
+    if source_x is None or source_y is None:
+        return side
+    graph_map = _STATIC_WORLD_GRAPH.get_map_by_id(map_ref)
+    if graph_map is None:
+        return side
+    max_x = max(0, graph_map.width * 2 - 1)
+    max_y = max(0, graph_map.height * 2 - 1)
+    if source_y <= 0:
+        return "north"
+    if source_x >= max_x:
+        return "east"
+    if source_y >= max_y:
+        return "south"
+    if source_x <= 0:
+        return "west"
+    return side
 
 
 def _canonical_connector_hints(map_ref: int | str | None) -> tuple[set[tuple[int, int]], set[str]]:
