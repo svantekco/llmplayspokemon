@@ -8,6 +8,7 @@ from PIL import Image
 
 from pokemon_agent.agent.engine import ClosedLoopRunner
 from pokemon_agent.agent.context_manager import ActionTrace
+from pokemon_agent.agent.navigation import advance_position
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_collision
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_tiles
 from pokemon_agent.agent.memory_manager import MemoryManager
@@ -25,7 +26,7 @@ from pokemon_agent.models.action import ExecutorStatus
 from pokemon_agent.models.action import StepResult
 from pokemon_agent.models.action import Task
 from pokemon_agent.models.action import TaskKind
-from pokemon_agent.models.memory import ConnectorStatus, DiscoveredConnector, DiscoveredMap
+from pokemon_agent.models.memory import ConnectorStatus, DiscoveredConnector, DiscoveredMap, NavigationGoal
 from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import HumanObjectivePlan
 from pokemon_agent.models.planner import InternalObjectivePlan
@@ -562,7 +563,7 @@ def test_runner_reports_activity_updates_during_turn():
     assert result.turn_index == 1
     assert "Planning turn" in phases
     assert "Reading emulator state" in phases
-    assert "Evaluating candidates" in phases
+    assert "Refreshing objectives" in phases
     assert "Executing action" in phases
     assert phases[-1] == "Turn complete"
 
@@ -783,10 +784,10 @@ def test_closed_loop_runner_executes_one_mock_turn():
     result = runner.run_turn(1)
 
     assert result.llm_attempted is False
-    assert result.planner_source in {"auto_candidate", "fallback"}
+    assert result.planner_source == "overworld_controller"
     assert result.action.action in {ActionType.PRESS_A, ActionType.MOVE_UP}
     assert result.progress.classification in {"interaction_success", "movement_success"}
-    assert result.prompt_metrics is not None
+    assert result.prompt_metrics is None
 
 
 def test_runner_publishes_and_clears_live_overlay_around_action():
@@ -984,10 +985,8 @@ def test_runner_keeps_executor_task_active_without_repeat_llm_calls():
 
     first = runner.run_turn(1)
 
-    # Route draining executes the full cached path (+ follow-up) in one turn,
-    # so the LLM is only called once for the initial decision.
-    assert llm.calls >= 2  # objective planner + action planner
-    assert first.planner_source == "llm"
+    assert llm.calls == 1
+    assert first.planner_source == "overworld_controller"
     assert runner.summary()["llm_calls"] == 1
 
 
@@ -998,9 +997,9 @@ def test_runner_calls_llm_only_when_multiple_candidates_exist():
 
     result = runner.run_turn(1)
 
-    assert llm.calls >= 2
+    assert llm.calls == 1
     assert result.llm_attempted is True
-    assert result.planner_source == "llm"
+    assert result.planner_source == "overworld_controller"
     assert result.prompt_metrics is not None
 
 
@@ -1031,10 +1030,10 @@ def test_runner_uses_llm_for_first_controllable_reds_house_2f_turn():
 
     result = runner.run_turn(1)
 
-    assert llm.calls >= 2
+    assert llm.calls == 1
     assert llm.objective_calls == 1
     assert result.llm_attempted is True
-    assert result.planner_source == "llm"
+    assert result.planner_source == "overworld_controller"
     assert llm.current_milestone["id"] == "get_starter"
     assert llm.current_milestone["target_map"] == "Oak's Lab"
     assert "Professor Oak" in llm.current_milestone["description"]
@@ -1066,9 +1065,9 @@ def test_runner_uses_llm_immediately_after_bootstrap_when_player_reaches_reds_ho
 
     result = runner.run_turn(2)
 
-    assert llm.calls >= 2
+    assert llm.calls == 1
     assert result.llm_attempted is True
-    assert result.planner_source == "llm"
+    assert result.planner_source == "overworld_controller"
 
 
 def test_runner_opens_menu_proactively_for_required_hm(monkeypatch) -> None:
@@ -1094,7 +1093,7 @@ def test_runner_opens_menu_proactively_for_required_hm(monkeypatch) -> None:
 
     result = runner.run_turn(1)
 
-    assert result.planner_source == "auto_candidate"
+    assert result.planner_source == "overworld_controller"
     assert result.action.action == ActionType.PRESS_START
 
 
@@ -1117,7 +1116,7 @@ def test_runner_prefers_local_recovery_over_press_start_when_stuck_in_overworld(
 
     result = runner.run_turn(1)
 
-    assert result.planner_source == "auto_candidate"
+    assert result.planner_source == "overworld_controller"
     assert result.action.action == ActionType.PRESS_A
 
 
@@ -1133,7 +1132,7 @@ def test_runner_resolves_yes_no_text_with_dialogue_controller():
     assert first.llm_attempted is True
     assert first.planner_source == "dialogue_controller"
     assert first.action.action == ActionType.PRESS_A
-    assert second.planner_source in {"auto_candidate", "fallback", "llm"}
+    assert second.planner_source in {"overworld_controller", "auto_candidate", "fallback", "llm"}
     assert emulator.state.metadata["selected"] in {"YES", "NO"}
 
 
@@ -1158,8 +1157,8 @@ def test_runner_falls_back_when_llm_response_is_invalid():
     result = runner.run_turn(1)
 
     assert llm.calls >= 1
-    assert result.used_fallback is True
-    assert result.planner_source == "fallback"
+    assert result.used_fallback is False
+    assert result.planner_source == "overworld_controller"
     assert result.llm_attempted is True
 
 
@@ -1169,15 +1168,16 @@ def test_runner_restores_cached_route_from_checkpoint(tmp_path: Path):
     runner = _build_runner(emulator, llm_client=llm)
 
     first = runner.run_turn(1)
-    assert runner.executor.is_active() is True
+    assert runner.executor.is_active() is False
     runner.save_checkpoint(tmp_path)
 
     restored_llm = _ChooseCandidateLLM(index=0)
     restored_runner = _build_runner(_NoNpcMock(), llm_client=restored_llm)
     payload = restored_runner.load_checkpoint(tmp_path)
 
-    assert first.planner_source == "llm"
-    assert payload["executor_state"] is not None
+    assert first.planner_source == "overworld_controller"
+    assert "navigator_state" in payload
+    assert payload["executor_state"] is None
     assert payload["objective_plan"] is not None
 
 
@@ -1189,25 +1189,34 @@ def test_runner_replans_when_route_is_invalidated():
     first = runner.run_turn(1)
     second = runner.run_turn(2)
 
-    assert first.planner_source == "llm"
-    assert llm.calls >= 2
-    assert second.planner_source in {"executor", "llm", "auto_candidate"}
+    assert first.planner_source == "overworld_controller"
+    assert llm.calls >= 1
+    assert second.planner_source == "overworld_controller"
 
 
 def test_runner_rechecks_navigation_goal_after_map_change():
     emulator = _MultiRouteMock()
-    llm = _ChooseCandidateLLM(index=0)
-    runner = _build_runner(emulator, llm_client=llm)
+    runner = _build_runner(emulator)
     _seed_discovered_route(runner)
+    runner.memory.memory.long_term.navigation_goal = NavigationGoal(
+        target_map_name="Route 2",
+        final_target_map_name="Route 2",
+        current_map_name="Mock Town",
+        next_map_name="Route 1",
+        next_hop_kind="boundary",
+        next_hop_side="east",
+        source="objective_plan",
+    )
+    runner._sync_navigation_goal = lambda _state: runner.memory.memory.long_term.navigation_goal
 
     first = runner.run_turn(1)
     second = runner.run_turn(2)
 
-    assert first.planner_source in {"llm", "auto_candidate"}
+    assert first.planner_source == "overworld_controller"
     assert first.after.map_name == "Mock Town"
     assert second.before.map_name == "Mock Town"
     assert second.after.map_name == "Route 1"
-    assert second.planner_source in {"executor", "llm", "auto_candidate"}
+    assert second.planner_source == "overworld_controller"
     assert second.action.action in {
         ActionType.MOVE_UP,
         ActionType.MOVE_RIGHT,
@@ -1672,7 +1681,7 @@ def test_runner_handles_stair_then_push_door_connectors_end_to_end() -> None:
 
     assert second.action.action == ActionType.MOVE_DOWN
     assert second.after.map_name == "Red's House 1F"
-    assert third.planner_source == "executor"
+    assert third.planner_source == "overworld_controller"
     assert third.action.action == ActionType.MOVE_DOWN
     assert third.after.map_name == "Pallet Town"
 
@@ -1710,7 +1719,7 @@ def test_runner_tries_press_a_once_after_repeated_push_failures() -> None:
     assert first.after.map_name == "Red's House 1F"
     assert second.after.map_name == "Red's House 1F"
     assert third.after.map_name == "Red's House 1F"
-    assert fourth.planner_source != "executor"
+    assert fourth.planner_source == "overworld_controller"
 
 
 def test_engine_reroutes_after_failed_first_step_with_temporary_blocker() -> None:
@@ -1811,7 +1820,7 @@ def test_engine_static_last_map_exit_stays_boundary_push() -> None:
     assert connector.transition_action == ActionType.MOVE_DOWN
 
 
-def test_engine_planner_transition_routing_respects_executor_blocked_tiles() -> None:
+def test_engine_planner_transition_routing_respects_navigator_blocked_tiles() -> None:
     runner = _build_runner(MockEmulatorAdapter())
     navigation = build_navigation_snapshot_from_tiles(
         width=8,
@@ -1843,7 +1852,8 @@ def test_engine_planner_transition_routing_respects_executor_blocked_tiles() -> 
     assert first.action is not None
     assert first.action.action == ActionType.MOVE_UP
 
-    runner.executor.report_move_failed(state, first.action)
+    blocked_coordinate = advance_position(state.x, state.y, first.action.action)
+    runner.navigator.mark_blocked(state, blocked_coordinate.x, blocked_coordinate.y, turn_index=1)
 
     approach = runner._approach_for_transition_tile(state, 7, 1)
     assert approach is not None

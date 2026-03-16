@@ -14,9 +14,9 @@ from pokemon_agent.agent.controllers.battle import BattleController
 from pokemon_agent.agent.controllers.cutscene import CutsceneController
 from pokemon_agent.agent.controllers.dialogue import DialogueController
 from pokemon_agent.agent.controllers.menu import MenuController
+from pokemon_agent.agent.controllers.overworld import OverworldController
 from pokemon_agent.agent.controllers.protocol import NavigationTarget
 from pokemon_agent.agent.controllers.protocol import TurnContext
-from pokemon_agent.agent.controllers.stubs import StubOverworldController
 from pokemon_agent.agent.controllers.stubs import StubUnknownController
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.executor import Executor
@@ -24,6 +24,7 @@ from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRou
 from pokemon_agent.agent.menu_manager import MenuManager
 from pokemon_agent.agent.mode_dispatcher import ModeDispatcher
 from pokemon_agent.agent.memory_manager import MemoryManager
+from pokemon_agent.agent.navigator import Navigator
 from pokemon_agent.agent.navigation import advance_position
 from pokemon_agent.agent.navigation import find_path
 from pokemon_agent.agent.navigation import NavigationGrid
@@ -38,9 +39,6 @@ from pokemon_agent.agent.world_map import describe_connector
 from pokemon_agent.agent.world_map import observe_state
 from pokemon_agent.agent.world_map import shortest_confirmed_path
 from pokemon_agent.agent.world_map import world_map_stats
-from pokemon_agent.data.map_connections import exits_from
-from pokemon_agent.data.map_connections import map_matches
-from pokemon_agent.data.map_connections import next_hop_toward
 from pokemon_agent.data.walkthrough import get_current_milestone
 from pokemon_agent.emulator.base import EmulatorAdapter
 from pokemon_agent.models.action import ActionDecision
@@ -70,6 +68,7 @@ from pokemon_agent.models.state import StructuredGameState
 from pokemon_agent.navigation.world_graph import Landmark
 from pokemon_agent.navigation.world_graph import WorldGraphEdge
 from pokemon_agent.navigation.world_graph import load_world_graph
+from pokemon_agent.navigation.world_graph import map_matches
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -98,6 +97,12 @@ STORY_INTERACTION_KEYWORDS = (
     "parcel",
     "pokedex",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RouteHop:
+    to_map: str
+    direction: str
 
 
 @dataclass(slots=True)
@@ -223,6 +228,9 @@ class ClosedLoopRunner:
         self._candidate_runtime: dict[str, CandidateRuntime] = {}
         self.menu_manager = MenuManager()
         self.static_world_graph = load_world_graph()
+        self._rebuild_overworld_stack()
+        # Keep the legacy executor available as a compatibility adapter for any
+        # remaining task-based plans outside the overworld controller path.
         self.executor = Executor(self._connector_by_id)
         self._last_entry_direction: str | None = None
         self._previous_map_name: str | None = None
@@ -235,8 +243,6 @@ class ClosedLoopRunner:
         # Used to suppress re-interacting with the same sign/object within a cooldown window.
         self._interacted_tiles: dict[tuple[str | int, int, int], int] = {}
         self._interaction_cooldown: int = 20
-        self._temporary_blocked_tiles: dict[tuple[str | int, int, int], int] = {}
-        self._temporary_blocked_ttl: int = 6
         self._activity_callback: Callable[[str, str | None], None] | None = None
         self.dispatcher = self._build_mode_dispatcher()
 
@@ -261,13 +267,24 @@ class ClosedLoopRunner:
             battle_complete = lambda messages, purpose: self._complete_with_window_pump(messages, purpose=purpose)
         return ModeDispatcher(
             {
-                GameMode.OVERWORLD: StubOverworldController(self._plan_overworld_mode),
+                GameMode.OVERWORLD: self.overworld_controller,
                 GameMode.MENU: MenuController(menu_manager=self.menu_manager),
                 GameMode.TEXT: DialogueController(),
                 GameMode.BATTLE: BattleController(battle_complete),
                 GameMode.CUTSCENE: CutsceneController(),
                 GameMode.UNKNOWN: StubUnknownController(self._plan_unknown_mode),
             }
+        )
+
+    def _rebuild_overworld_stack(self) -> None:
+        self.navigator = Navigator(self.static_world_graph, self.memory.memory.long_term.world_map)
+        self.overworld_controller = OverworldController(
+            self.navigator,
+            self.memory.memory.long_term.world_map,
+            static_world_graph=self.static_world_graph,
+            goal_getter=lambda: self.memory.memory.long_term.navigation_goal,
+            landmark_for_destination=self._landmark_for_destination_on_current_map,
+            utility_action_getter=self._deterministic_overworld_utility_action,
         )
 
     def _build_turn_context(self, state: StructuredGameState) -> TurnContext:
@@ -331,6 +348,30 @@ class ClosedLoopRunner:
             reason="; ".join(part for part in reason_parts if part),
         )
 
+    def _deterministic_overworld_utility_action(
+        self,
+        state: StructuredGameState,
+        context: TurnContext,
+    ) -> PlanningResult | None:
+        objective_id = context.objective.id if context.objective is not None else "overworld_controller"
+        candidates = self.menu_manager.build_candidates(state, objective_id)
+        runtime = self.menu_manager.runtime_map()
+        ranked: list[tuple[tuple[int, str], ActionDecision]] = []
+        for candidate in candidates:
+            runtime_entry = runtime.get(candidate.id)
+            if runtime_entry is None or runtime_entry.action is None:
+                continue
+            action = runtime_entry.action.model_copy(deep=True)
+            if action.action != ActionType.PRESS_START:
+                continue
+            if not action.reason:
+                action.reason = candidate.why
+            ranked.append(((-candidate.priority, candidate.id), action))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item: item[0])
+        return PlanningResult(action=ranked[0][1], planner_source="overworld_controller")
+
     def run_turn(self, turn_index: int) -> TurnResult:
         self._report_activity("Planning turn", f"Turn #{turn_index}")
         self._prune_temporary_blocked_tiles(turn_index)
@@ -340,7 +381,11 @@ class ClosedLoopRunner:
         navigation_goal_snapshot = copy.deepcopy(self.memory.memory.long_term.navigation_goal)
         objective_plan_snapshot = copy.deepcopy(self.memory.memory.long_term.objective_plan)
         executor_task_snapshot = copy.deepcopy(planning.executor_task)
-        active_connector_snapshot = self._connector_for_task(executor_task_snapshot)
+        active_connector_snapshot = (
+            copy.deepcopy(self.overworld_controller.active_connector())
+            if planning.planner_source == "overworld_controller"
+            else self._connector_for_task(executor_task_snapshot)
+        )
         if planning.action is None:
             raise RuntimeError("Planning did not yield an executable action")
         action = self.validator.validate(planning.action, before)
@@ -363,18 +408,16 @@ class ClosedLoopRunner:
             self._interacted_tiles.clear()
             self._clear_temporary_blocked_tiles(before)
             self._clear_temporary_blocked_tiles(after)
+            self.overworld_controller.reset()
             self.executor.abort()
         if progress_result.classification == "no_effect":
-            should_record_blocker = self.executor.report_failure(before, action)
-            if (
-                should_record_blocker
-                and action.action in {ActionType.MOVE_UP, ActionType.MOVE_RIGHT, ActionType.MOVE_DOWN, ActionType.MOVE_LEFT}
-                and before.map_id == after.map_id
-                and before.map_name == after.map_name
-                and before.x == after.x
-                and before.y == after.y
-            ):
-                self._record_failed_move_blocker(before, after, action, progress_result, turn_index)
+            if planning.planner_source == "overworld_controller":
+                self.overworld_controller.report_failure(
+                    before,
+                    action,
+                    turn_index=turn_index,
+                )
+            self.executor.report_failure(before, action)
         # Record player position when a text box opens (sign/NPC interaction detected).
         if (
             not before.text_box_open
@@ -522,6 +565,7 @@ class ClosedLoopRunner:
         self._report_activity("Refreshing objectives", state.map_name)
         observe_state(self.memory.memory.long_term.world_map, state)
         self._ensure_objective_plan(state)
+        self._sync_navigation_goal(state)
         return self._with_objective_planner_metadata(self.dispatcher.dispatch(state, self._build_turn_context(state)))
 
     def _reset_objective_planner_metadata(self) -> None:
@@ -984,6 +1028,8 @@ class ClosedLoopRunner:
             "telemetry": self.telemetry.to_dict(),
             "context_state": self.context_manager.export_state(),
             "executor_state": self.executor.export_state(),
+            "navigator_state": self.navigator.export_state(),
+            "overworld_state": self.overworld_controller.export_state(),
             "objective_plan": (
                 self.memory.memory.long_term.objective_plan.model_dump(mode="json")
                 if self.memory.memory.long_term.objective_plan is not None
@@ -1001,6 +1047,8 @@ class ClosedLoopRunner:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.emulator.load_state(emulator_state_path)
         self.memory.memory = MemoryState.model_validate(payload["memory"])
+        self._rebuild_overworld_stack()
+        self.dispatcher = self._build_mode_dispatcher()
         stuck_payload = payload["stuck_state"]
         restored = StuckState(
             score=stuck_payload["score"],
@@ -1034,6 +1082,8 @@ class ClosedLoopRunner:
         self.completed_turns = int(payload.get("completed_turns", 0))
         self.context_manager.restore_state(payload.get("context_state"))
         self.executor.restore_state(payload.get("executor_state"))
+        self.navigator.restore_state(payload.get("navigator_state"))
+        self.overworld_controller.restore_state(payload.get("overworld_state"))
         objective_payload = payload.get("objective_plan")
         self.memory.memory.long_term.objective_plan = (
             ObjectivePlanEnvelope.model_validate(objective_payload) if objective_payload else None
@@ -1552,11 +1602,6 @@ class ClosedLoopRunner:
             return None
         grid = NavigationGrid(state.navigation)
         for blocked_x, blocked_y in self._temporary_blocked_tiles_for_state(state):
-            grid.mark_blocked(blocked_x, blocked_y)
-        map_key = self._state_map_key(state)
-        if map_key is None or self.executor.map_key() != map_key:
-            return grid
-        for blocked_x, blocked_y in self.executor.blocked_tiles():
             grid.mark_blocked(blocked_x, blocked_y)
         return grid
 
@@ -2820,14 +2865,7 @@ class ClosedLoopRunner:
         return find_path(adjusted_navigation, state.x, state.y, target_x, target_y)
 
     def _temporary_blocked_tiles_for_state(self, state: StructuredGameState) -> set[tuple[int, int]]:
-        map_key = self._state_map_key(state)
-        if map_key is None:
-            return set()
-        return {
-            (x, y)
-            for candidate_map_key, x, y in self._temporary_blocked_tiles
-            if candidate_map_key == map_key
-        }
+        return self.navigator.blocked_tiles_for_state(state)
 
     def _record_failed_move_blocker(
         self,
@@ -2847,28 +2885,20 @@ class ClosedLoopRunner:
             return
         if after.x != before.x or after.y != before.y:
             return
-        map_key = self._state_map_key(before)
-        if map_key is None:
-            return
         blocked_coordinate = advance_position(before.x, before.y, action.action)
-        self._temporary_blocked_tiles[(map_key, blocked_coordinate.x, blocked_coordinate.y)] = turn_index + self._temporary_blocked_ttl
+        self.navigator.mark_blocked(
+            before,
+            blocked_coordinate.x,
+            blocked_coordinate.y,
+            turn_index=turn_index,
+        )
 
     def _prune_temporary_blocked_tiles(self, turn_index: int) -> None:
-        self._temporary_blocked_tiles = {
-            key: expires_at
-            for key, expires_at in self._temporary_blocked_tiles.items()
-            if expires_at >= turn_index
-        }
+        self.navigator.prune_blocked(turn_index)
 
     def _clear_temporary_blocked_tiles(self, state: StructuredGameState) -> None:
         map_key = self._state_map_key(state)
-        if map_key is None:
-            return
-        self._temporary_blocked_tiles = {
-            key: expires_at
-            for key, expires_at in self._temporary_blocked_tiles.items()
-            if key[0] != map_key
-        }
+        self.navigator.clear_map(map_key)
 
     def _state_map_key(self, state: StructuredGameState) -> str | int | None:
         return state.map_id if state.map_id is not None else (state.map_name or None)
@@ -2970,10 +3000,38 @@ class ClosedLoopRunner:
             return final_target_map_name
         return route.maps[MAX_ROUTE_CONNECTOR_HOPS].name
 
+    def _graph_exits_from(self, map_name: str | None) -> list[RouteHop]:
+        if not map_name:
+            return []
+        graph_map = self.static_world_graph.get_map_by_name(map_name)
+        if graph_map is None:
+            return []
+        exits: list[RouteHop] = []
+        for edge in self.static_world_graph.neighbors(graph_map.symbol):
+            direction = edge.direction or edge.kind
+            if edge.destination_name is None or direction is None:
+                continue
+            exits.append(RouteHop(to_map=edge.destination_name, direction=direction))
+        return exits
+
+    def _next_hop_toward(self, from_map: str | None, to_map: str | None) -> RouteHop | None:
+        if not from_map or not to_map:
+            return None
+        route = self.static_world_graph.find_route(from_map, to_map)
+        if route is None or not route.edges:
+            return None
+        edge = route.edges[0]
+        if edge.destination_name is None:
+            return None
+        return RouteHop(
+            to_map=edge.destination_name,
+            direction=edge.direction or edge.kind,
+        )
+
     def _requires_current_map_story_interaction(self, state: StructuredGameState, milestone) -> bool:
         if not state.map_name:
             return False
-        connections = exits_from(state.map_name)
+        connections = self._graph_exits_from(state.map_name)
         if not connections or any(connection.direction != "warp" for connection in connections):
             return False
         canonical_name = self.static_world_graph.canonical_name(state.map_name) or state.map_name
@@ -3015,7 +3073,7 @@ class ClosedLoopRunner:
             else None
         )
 
-        hop = None if map_matches(state.map_name, target_map_name) else next_hop_toward(state.map_name, target_map_name)
+        hop = None if map_matches(state.map_name, target_map_name) else self._next_hop_toward(state.map_name, target_map_name)
         objective_kind = "explore_for_matching_connector"
         engine_mode = "exploration"
         next_map_name = None
@@ -3110,7 +3168,7 @@ class ClosedLoopRunner:
         target_landmark = final_target_landmark if map_matches(target_map_name, final_target_map_name) else None
         goal = self.memory.memory.long_term.navigation_goal
 
-        hop = None if map_matches(state.map_name, target_map_name) else next_hop_toward(state.map_name, target_map_name)
+        hop = None if map_matches(state.map_name, target_map_name) else self._next_hop_toward(state.map_name, target_map_name)
         objective_kind = "explore_for_matching_connector"
         engine_mode = "progression"
         next_map_name = None
@@ -3227,7 +3285,7 @@ class ClosedLoopRunner:
         )
         story_text = self._milestone_story_text(state)
         best: tuple[tuple[int, int, int, int, str], str] | None = None
-        for connection in exits_from(state.map_name):
+        for connection in self._graph_exits_from(state.map_name):
             if connection.to_map == state.map_name:
                 continue
             route = self.static_world_graph.find_route(connection.to_map, milestone.target_map_name)

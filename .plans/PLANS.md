@@ -573,6 +573,9 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Removed `engine.py` candidate-building branches for text, menu, and battle so the legacy candidate pipeline is now overworld-only.
 - 2026-03-16: Added controller-focused regression coverage for dialogue, menu, cutscene, battle, and updated engine expectations for the new planner sources.
 - 2026-03-16: Verified the phase-2-focused slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_mode_dispatcher.py tests/test_dialogue_controller.py tests/test_menu_controller.py tests/test_cutscene_controller.py tests/test_battle_controller.py tests/test_engine.py -q -s` (69 passed).
+- 2026-03-16: Implemented Phase 3 with a shared `Navigator`, a real `OverworldController`, dispatcher wiring for `OVERWORLD`, navigator-backed blocked-tile tracking in `engine.py`, and direct `world_graph` usage in place of `map_connections.py`.
+- 2026-03-16: Added navigator/overworld regression coverage and updated engine expectations for deterministic overworld turns, controller-owned connector entry, and reduced overworld LLM/executor usage.
+- 2026-03-16: Verified the phase-3 navigation slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_engine.py tests/test_navigator.py tests/test_overworld_controller.py tests/test_mode_dispatcher.py tests/test_navigation.py tests/test_world_map.py tests/test_executor.py -q -s` (77 passed).
 
 ## Decision log
 
@@ -580,12 +583,17 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Added battle strategy caching in `BattleController` keyed to the current opposing Pokemon (`kind/species/level`) so per-turn battle execution stays deterministic and LLM usage is capped to strategy refresh points.
 - 2026-03-16: Treated trivial wild encounters as heuristic-only in `BattleController`; they now skip battle-strategy LLM calls entirely and use deterministic run/attack behavior.
 - 2026-03-16: Moved objective-planner metadata attachment up to the dispatcher path in `engine.py` so deterministic controllers still surface objective-planner telemetry when they do not make their own LLM call.
+- 2026-03-16: Kept `Executor` as a legacy task adapter for residual task-based paths, but removed it from the normal overworld planning path so navigation decisions now come from `OverworldController` first.
+- 2026-03-16: Added a narrow deterministic utility-action hook to `OverworldController` for `PRESS_START`-style overworld actions (for example required HM prep) instead of routing those cases back through the candidate planner.
+- 2026-03-16: Anchored push-style connector execution on the known approach tile when connector discovery mutates noisy source coordinates, preserving correct door/boundary traversal without restoring executor ownership.
 
 ## Discoveries / surprises log
 
 - 2026-03-16: Battle submenu tracking must be updated after computing the next action, not before; pre-setting the submenu caused main-menu coordinates to be misread as bag/fight cursor positions.
 - 2026-03-16: Pytest capture is unstable in this environment unless `TMPDIR=/tmp` is set and stdout capture is disabled (`-s`), so verification commands for this milestone were run that way.
 - 2026-03-16: The broader suite still has unrelated red tests in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`. Those failures were present outside the phase-2 controller slice and were left out of scope for this milestone.
+- 2026-03-16: `observe_state()` can enrich confirmed connectors with inaccurate source coordinates on mocked maps; using the known approach tile as the push anchor avoids spurious reroutes while keeping successful connector confirmation intact.
+- 2026-03-16: A full `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest -q -s` run after phase 3 still shows unrelated failures in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`; the phase-3 navigation slice itself passes.
 
 ## Appendix: file-by-file change map
 

@@ -19,7 +19,6 @@ src/pokemon_agent/agent/stuck_detector.py
 src/pokemon_agent/agent/validator.py
 src/pokemon_agent/agent/world_map.py
 src/pokemon_agent/data/__init__.py
-src/pokemon_agent/data/map_connections.py
 src/pokemon_agent/data/map_names.py
 src/pokemon_agent/data/pokemon_red_battle_data.py
 src/pokemon_agent/data/walkthrough.py
