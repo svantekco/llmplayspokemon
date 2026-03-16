@@ -98,8 +98,10 @@ The target end state: the agent can play through the game with the LLM called on
 | Dialogue advancement (PRESS_A) | ✓ | |
 | Yes/No dialogue choices (heal, shop) | ✓ | |
 | Story-branching dialogue choices | | ✓ |
-| Battle move selection | ✓ | |
-| Battle strategy (switch, item, run) | ✓ (heuristic) | fallback |
+| Battle strategy (per encounter) | | ✓ (1 call per encounter/new opponent) |
+| Battle move execution (per turn) | ✓ (follows strategy) | |
+| Catch decision (wild encounters) | | ✓ (part of strategy call) |
+| Trivial wild battles (level gap > 5) | ✓ (run or one-shot) | |
 | Menu navigation to target | ✓ | |
 | Shop/heal/service flows | ✓ | |
 | "What to do next" (objective) | | ✓ |
@@ -177,27 +179,31 @@ class TurnContext:
 
 ### Phase 2: Deterministic Controllers
 
-**Goal:** Replace candidate-based LLM selection for dialogue, battle, and menu with deterministic controllers.
+**Goal:** Replace per-turn LLM candidate selection for dialogue, battle, menu, and cutscene with controllers that use deterministic execution. Battle gets one LLM strategy call per encounter (or per new opposing Pokemon in trainer fights) for strategic decisions like move priority, switching, catching, and running.
 
-**Why:** These modes have known-correct behavior that never needs LLM involvement. Routing them through candidates wastes tokens and introduces failure modes.
+**Why:** These modes should not route every action through the LLM. Dialogue/menu/cutscene are fully deterministic. Battle benefits from one strategic LLM call but per-turn menu navigation is deterministic. This eliminates ~90% of non-overworld LLM calls.
 
 **Code changes:**
-- `DialogueController`: PRESS_A for text advancement, deterministic yes/no for known patterns, flag unknown choices for LLM
-- `BattleController`: best-move selection via type chart + power, switching heuristic, run-from-wild logic
+- `DialogueController`: PRESS_A for text advancement, deterministic yes/no for known patterns
+- `BattleController`: two-layer design — one LLM call per encounter sets `BattleStrategy` (move priority, switch policy, catch/run decision), then deterministic turn-by-turn execution. Falls back to pure heuristic when LLM unavailable. Trivial wilds (level gap > 5, no catch interest) skip LLM entirely.
 - `MenuController`: deterministic menu navigation using cursor position + target item
+- `CutsceneController`: PRESS_A
 
 **Files affected:**
 - NEW: `src/pokemon_agent/agent/controllers/dialogue.py`
 - NEW: `src/pokemon_agent/agent/controllers/battle.py`
 - NEW: `src/pokemon_agent/agent/controllers/menu.py`
+- NEW: `src/pokemon_agent/agent/controllers/cutscene.py`
 - MODIFY: `src/pokemon_agent/agent/battle_manager.py` (extract logic, may be deleted)
 - MODIFY: `src/pokemon_agent/agent/menu_manager.py` (extract logic, may be deleted)
 
 **Acceptance criteria:**
 - Dialogue controller advances text without LLM
-- Battle controller selects moves without LLM
-- Menu controller navigates to target without LLM
-- All 54+ existing tests pass
+- Battle controller makes ≤1 LLM call per encounter; all per-turn actions deterministic
+- Battle controller works in pure-heuristic mode without LLM
+- Trivial wild encounters use no LLM calls
+- Menu controller exits menus without LLM
+- All existing tests pass
 
 ### Phase 3: Overworld Controller + Navigation Cleanup
 

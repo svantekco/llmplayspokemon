@@ -2,23 +2,23 @@
 
 ## Objective
 
-Replace LLM-based candidate selection for dialogue, battle, menu, and cutscene modes with deterministic controllers that always produce the correct action without an LLM call.
+Replace per-turn LLM candidate selection for dialogue, battle, menu, and cutscene modes with controllers that use deterministic execution. Battle gets **one LLM strategy call per encounter** (or per new opposing Pokemon in trainer battles) to set high-level strategy, then executes that strategy deterministically turn-by-turn.
 
 ## Why this milestone exists
 
-These four game modes have known-correct deterministic behavior. Routing them through the candidate → LLM pipeline wastes API tokens, adds latency, and introduces failure modes. This is the single highest-leverage change for reducing LLM dependency.
+These four game modes should not route every action through the LLM candidate pipeline. Dialogue and menus are fully deterministic. Battle benefits from one strategic LLM call (gym leaders, catch decisions) but the per-turn menu navigation is deterministic. This is the single highest-leverage change for reducing LLM dependency.
 
 ## Scope
 
 - `DialogueController`: advance text, deterministic yes/no, flag unknown choices
-- `BattleController`: move selection via type chart + power, switch/run heuristics
+- `BattleController`: one LLM call per encounter for strategy, then deterministic execution
 - `MenuController`: cursor-based menu navigation to target
 - `CutsceneController`: PRESS_A or wait
 - Remove candidate building for these modes from engine.py
 
 ## Non-goals
 
-- Perfect battle strategy (good enough heuristic > optimal play)
+- Full battle simulator (no damage prediction, no speed calc)
 - Full menu state machine (basic cursor navigation is sufficient)
 - Story-branching dialogue (flag for LLM, don't solve now)
 - Shop/heal automation (deferred to later; close menu for now)
@@ -57,33 +57,88 @@ Yes/No deterministic rules (extracted from existing engine.py):
 
 ### BattleController (`controllers/battle.py`)
 
-Core logic (extracted and simplified from `battle_manager.py`):
+**Two-layer design: LLM strategy + deterministic execution.**
+
+#### Layer 1: Strategy (one LLM call per encounter / per new opposing Pokemon)
+
+When a battle starts or a new opposing Pokemon appears, the controller calls the LLM once to get a `BattleStrategy`:
+
+```python
+@dataclass
+class BattleStrategy:
+    lead_pokemon: str | None          # switch to this if not already active
+    preferred_moves: list[str]        # ordered move preferences ["THUNDERBOLT", "QUICK_ATTACK"]
+    switch_threshold_hp_pct: int      # switch if HP drops below this %
+    switch_target: str | None         # who to switch to if threshold hit
+    use_items: bool                   # whether to heal with potions
+    should_catch: bool                # for wild encounters: try to catch?
+    should_run: bool                  # for trivial wilds: just run
+    notes: str                        # LLM reasoning (for debug logging)
+```
+
+The LLM prompt includes:
+- Current party (species, level, HP, moves with PP, types)
+- Current inventory (balls, potions)
+- Opposing Pokemon (species, level, estimated HP %, types)
+- Whether this is wild, trainer, gym leader, or rival
+- Current roster gaps ("no Water type in party" etc.)
+
+**Trivial-wild skip:** If the encounter is a wild Pokemon with level ≤ (player avg level - 5) and the player has no catch interest (species already in party, no balls, etc.), skip the LLM call entirely and use a hardcoded "run or one-shot with best move" strategy.
+
+**Catch decision:** The LLM evaluates whether to catch based on:
+- Is this species already in the party?
+- Does the party have coverage gaps this species would fill?
+- Does the player have Poke Balls?
+- Is the opponent's HP low enough to catch reliably?
+- Is this a rare/useful species for upcoming challenges?
+
+#### Layer 2: Execution (fully deterministic, every turn)
+
 ```python
 def step(self, state, context):
     battle = state.battle_state
     if battle is None:
-        return ActionDecision(action=ActionType.PRESS_A, reason="no battle context")
+        return PlanningResult(action=ActionDecision(action=ActionType.PRESS_A, reason="no battle context"))
 
-    # Navigate to correct submenu first
-    menu_nav = self._navigate_to_submenu(battle, target_submenu)
-    if menu_nav is not None:
-        return menu_nav
+    # On new battle or new opponent: get strategy (may call LLM)
+    if self._needs_new_strategy(battle):
+        self._strategy = self._get_strategy(state, context)
 
-    # In fight submenu: select best move
-    if self._in_fight_menu(battle):
-        move_idx = self._best_move_index(battle)
-        return self._navigate_to_move(battle, move_idx)
+    # Determine target action from strategy
+    target = self._resolve_target_action(battle, self._strategy)
 
-    # Main menu: select FIGHT
-    return self._navigate_to_fight(battle)
+    # Navigate battle menu deterministically to execute target
+    return PlanningResult(action=self._navigate_menu_to(battle, target))
 ```
 
-Move selection:
+Target action resolution (deterministic, from strategy):
+- If `strategy.should_run` → RUN
+- If `strategy.should_catch` and have balls → BAG → ball
+- If `strategy.lead_pokemon` != active Pokemon → POKEMON → switch
+- If HP < `strategy.switch_threshold_hp_pct` and `strategy.use_items` and have potion → BAG → potion
+- If HP < `strategy.switch_threshold_hp_pct` and `strategy.switch_target` → POKEMON → switch
+- Otherwise → FIGHT → first available move from `strategy.preferred_moves` with PP > 0
+- Fallback (no PP left, no strategy match) → best move by `power × type × STAB`
+
+#### LLM call budget
+
+| Scenario | LLM calls | Current system |
+|---|---|---|
+| Trivial wild (level gap > 5) | 0 | 3-8 |
+| Wild worth evaluating | 1 | 3-8 |
+| Trainer (3 Pokemon) | up to 3 | 10-25 |
+| Gym leader (4-6 Pokemon) | up to 6 | 15-40+ |
+
+#### Fallback when LLM unavailable
+
+If `llm_client` is None (fallback planner mode), skip the LLM call and use pure heuristic:
 - Score = power × type_effectiveness × STAB_bonus
 - If best score == 0 (no damaging moves): use first move with PP
-- Wild + overleveled: prefer RUN
-- HP < 25% + potion available: prefer ITEM (heal)
+- Wild + overleveled: RUN
+- HP < 25% + potion available: heal
 - All fainted: wait for whiteout
+
+This keeps the controller functional without LLM access.
 
 ### MenuController (`controllers/menu.py`)
 
@@ -114,10 +169,11 @@ def step(self, state, context):
 - Stateless (no internal state needed)
 
 ### BattleController
-- Input: `StructuredGameState` with `battle_state is not None`
-- Output: `ActionDecision` (direction to navigate battle menu, or PRESS_A to confirm)
-- Contract: tracks current battle submenu position across calls
-- State: current submenu (MAIN/FIGHT/POKEMON/BAG), target action
+- Input: `StructuredGameState` with `battle_state is not None`; optional `llm_client` for strategy calls
+- Output: `PlanningResult` (direction to navigate battle menu, or PRESS_A to confirm)
+- Contract: one LLM call per encounter/per new opposing Pokemon for strategy; all per-turn actions deterministic
+- State: `BattleStrategy` (set once per encounter, updated on new opponent), current submenu tracking
+- LLM-free fallback: pure heuristic strategy when `llm_client` is None
 
 ### MenuController
 - Input: `StructuredGameState` with `menu_open=True`
@@ -132,15 +188,34 @@ def step(self, state, context):
 
 ## Data model changes
 
-No new models. Controllers use existing `ActionDecision` and `StructuredGameState`.
+Controllers use existing `ActionDecision` and `StructuredGameState`.
 
-The `BattleController` may define an internal `BattlePhase` enum:
+### New: `BattleStrategy`
+```python
+@dataclass
+class BattleStrategy:
+    lead_pokemon: str | None
+    preferred_moves: list[str]
+    switch_threshold_hp_pct: int
+    switch_target: str | None
+    use_items: bool
+    should_catch: bool
+    should_run: bool
+    notes: str
+```
+- Owner: `BattleController` (set via LLM or heuristic fallback)
+- Lifetime: one per encounter, refreshed when opposing Pokemon changes
+- Not persisted to checkpoints (battles don't span checkpoints)
+
+### Internal: `BattlePhase`
 ```python
 class BattlePhase(Enum):
-    SELECT_ACTION = "select_action"  # main menu
-    SELECT_MOVE = "select_move"      # fight submenu
-    SELECT_POKEMON = "select_pokemon" # switch submenu
-    AWAITING_RESULT = "awaiting"     # animation/result
+    NEED_STRATEGY = "need_strategy"    # awaiting LLM or heuristic strategy
+    SELECT_ACTION = "select_action"    # main menu
+    SELECT_MOVE = "select_move"        # fight submenu
+    SELECT_POKEMON = "select_pokemon"  # switch submenu
+    SELECT_ITEM = "select_item"        # bag submenu
+    AWAITING_RESULT = "awaiting"       # animation/result
 ```
 
 ## Migration plan
@@ -162,10 +237,13 @@ Order: DialogueController first (simplest), then CutsceneController (trivial), t
 - No text box (transitional) → returns PRESS_A
 
 ### BattleController tests
-- Wild battle, 4 moves → selects highest-scoring move
-- Type advantage matchup → correct effectiveness multiplier
-- Low HP + potion → selects heal item
-- Wild + overleveled → selects RUN
+- Trivial wild (level gap > 5) → no LLM call, runs or one-shots
+- Wild with catch interest → LLM called once, strategy includes should_catch
+- Trainer battle → LLM called once for strategy, deterministic execution follows
+- New opposing Pokemon → LLM called again for updated strategy
+- LLM unavailable → falls back to heuristic (power × type × STAB)
+- Strategy preferred_moves respected in order (skip moves with 0 PP)
+- HP below switch_threshold → switches or heals per strategy
 - Menu navigation: cursor at FIGHT, target FIGHT → PRESS_A
 - Menu navigation: cursor at ITEM, target FIGHT → correct navigation
 
@@ -182,6 +260,9 @@ Order: DialogueController first (simplest), then CutsceneController (trivial), t
 ## Risks and edge cases
 
 - **Battle menu position may be None.** If RAM read fails, the controller can't navigate the menu. Fallback: PRESS_A (safe default — confirms current selection).
+- **LLM strategy may be bad.** The LLM might recommend a move that doesn't exist or a switch to a fainted Pokemon. Mitigate: validate strategy against actual party/moves before executing; fall back to heuristic for invalid entries.
+- **LLM latency in battle.** One call per encounter adds ~1-3 seconds. Acceptable since battles take many turns anyway.
+- **"Trivial wild" threshold may be wrong.** Level gap of 5 might skip encounters that are worth catching. Mitigate: also check if species is not already in party and balls are available before skipping.
 - **Yes/no keyword matching may miss edge cases.** Some dialogues don't contain expected keywords. Fallback: default to YES (most game prompts are positive — heal, accept, etc.).
 - **Menu controller closing menus may interrupt intended menu use.** If the objective requires menu interaction (HM use), the close-menu default is wrong. Mitigate: check `context.objective` for menu-related goals.
 - **Battle type chart may be incomplete.** Current `TYPE_EFFECTIVENESS` dict in battle_manager.py may miss matchups. Will be fixed properly in Phase 4 with ROM import.
@@ -189,12 +270,14 @@ Order: DialogueController first (simplest), then CutsceneController (trivial), t
 ## Acceptance criteria
 
 1. DialogueController advances text without LLM in all text states
-2. BattleController selects moves without LLM in all battle states
-3. MenuController exits menus without LLM
-4. CutsceneController advances cutscenes without LLM
-5. No LLM calls occur for TEXT, BATTLE, MENU, or CUTSCENE modes
-6. All existing tests pass
-7. Each controller has its own unit test file with ≥ 5 test cases
+2. BattleController makes at most one LLM call per encounter (or per new opposing Pokemon); all per-turn actions are deterministic
+3. BattleController works in pure-heuristic mode when LLM is unavailable
+4. Trivial wild encounters skip the LLM call entirely
+5. MenuController exits menus without LLM
+6. CutsceneController advances cutscenes without LLM
+7. No per-turn LLM calls occur for TEXT, MENU, or CUTSCENE modes
+8. All existing tests pass
+9. Each controller has its own unit test file with ≥ 5 test cases
 
 ## Rollback / fallback notes
 
@@ -220,11 +303,11 @@ Each controller is independent. If one controller introduces regressions:
    - Tests: trivial test
 
 3. **Step 2.3: Create BattleController**
-   - Action: Extract battle_manager logic into controller, add submenu navigation
+   - Action: Implement two-layer battle controller: LLM strategy call (one per encounter/new opponent) + deterministic menu execution. Include trivial-wild skip (no LLM), catch decision support, and pure-heuristic fallback when LLM unavailable.
    - Files: `controllers/battle.py`
    - Dependencies: Phase 1 complete
-   - Done: selects moves, handles switching, run, items
-   - Tests: `test_battle_controller.py` with type chart coverage
+   - Done: one LLM call sets `BattleStrategy`; per-turn step() is deterministic; works without LLM
+   - Tests: `test_battle_controller.py` — trivial wild skip, strategy execution, LLM fallback, catch decision, new-opponent refresh
 
 4. **Step 2.4: Create MenuController**
    - Action: Implement close-menu default with objective awareness
