@@ -8,6 +8,8 @@ import re
 from typing import Any
 
 from pokemon_agent.agent.context_manager import measure_prompt
+from pokemon_agent.agent.game_knowledge import GameKnowledge
+from pokemon_agent.agent.game_knowledge import load_game_knowledge
 from pokemon_agent.agent.controllers.protocol import TurnContext
 from pokemon_agent.agent.llm_client import CompletionResponse
 from pokemon_agent.agent.llm_client import LLMUsage
@@ -15,7 +17,6 @@ from pokemon_agent.agent.planning_types import PlanningResult
 from pokemon_agent.data.pokemon_red_battle_data import POKE_BALL_ITEM_NAMES
 from pokemon_agent.data.pokemon_red_battle_data import POTION_ITEM_NAMES
 from pokemon_agent.data.pokemon_red_battle_data import SPECIES_TYPE_MAP
-from pokemon_agent.data.pokemon_red_battle_data import TYPE_EFFECTIVENESS
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.action import ActionType
 from pokemon_agent.models.state import BattleContext
@@ -94,8 +95,9 @@ BattleCompletion = Callable[[list[dict[str, str]], str], CompletionResponse]
 
 
 class BattleController:
-    def __init__(self, complete: BattleCompletion | None = None) -> None:
+    def __init__(self, complete: BattleCompletion | None = None, knowledge: GameKnowledge | None = None) -> None:
         self._complete = complete
+        self._knowledge = knowledge or load_game_knowledge()
         self._strategy: BattleStrategy | None = None
         self._strategy_key: tuple[str | None, str | None, int | None] | None = None
         self._submenu = "MAIN"
@@ -533,7 +535,7 @@ class BattleController:
             return 1.0
         multiplier = 1.0
         for defender_type in set(defender_types):
-            multiplier *= TYPE_EFFECTIVENESS.get((move_type, defender_type), 1.0)
+            multiplier *= self._knowledge.type_effectiveness(move_type, defender_type)
         return multiplier
 
     def _species_types(self, species_name: str | None) -> tuple[str, str] | None:

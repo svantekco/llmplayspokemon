@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import re
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -59,7 +61,11 @@ CAVE_TOKENS = {"CAVE", "CAVERN", "TUNNEL", "DIGLETTS", "MOON", "ROCK"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pret-dir", required=True, type=Path, help="Path to a temporary pret/pokered checkout.")
+    parser.add_argument(
+        "--pret-dir",
+        type=Path,
+        help="Path to an existing pret/pokered checkout. If omitted, the script clones a temporary checkout and removes it afterwards.",
+    )
     parser.add_argument(
         "--world-graph-out",
         type=Path,
@@ -72,63 +78,129 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "src/pokemon_agent/generated/landmarks.json",
         help="Output path for the generated landmarks JSON.",
     )
+    parser.add_argument(
+        "--map-objects-out",
+        type=Path,
+        default=PROJECT_ROOT / "src/pokemon_agent/generated/map_objects.json",
+        help="Output path for the generated map objects JSON.",
+    )
+    parser.add_argument(
+        "--type-chart-out",
+        type=Path,
+        default=PROJECT_ROOT / "src/pokemon_agent/generated/type_chart.json",
+        help="Output path for the generated type chart JSON.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    pret_dir = args.pret_dir.resolve()
-    if not pret_dir.exists():
-        raise SystemExit(f"PRET checkout not found: {pret_dir}")
+    with _pret_checkout(args.pret_dir) as pret_dir:
+        name_labels = _parse_name_labels(pret_dir / "data/maps/names.asm")
+        indoor_group_anchors = _parse_indoor_group_anchors(pret_dir / "data/maps/town_map_entries.asm", name_labels)
+        maps = _parse_map_constants(pret_dir / "constants/map_constants.asm")
+        header_data = _parse_headers(pret_dir / "data/maps/headers")
+        object_data = _parse_objects(pret_dir / "data/maps/objects")
 
-    name_labels = _parse_name_labels(pret_dir / "data/maps/names.asm")
-    indoor_group_anchors = _parse_indoor_group_anchors(pret_dir / "data/maps/town_map_entries.asm", name_labels)
-    maps = _parse_map_constants(pret_dir / "constants/map_constants.asm")
-    header_data = _parse_headers(pret_dir / "data/maps/headers")
-    object_data = _parse_objects(pret_dir / "data/maps/objects")
+        for symbol, payload in maps.items():
+            map_id = payload["id"]
+            payload["name"] = POKEMON_RED_MAP_NAMES.get(map_id, _humanize_symbol(symbol))
+            payload["slug"] = _slug(payload["name"])
+            payload["anchor_name"] = indoor_group_anchors.get(payload.get("group"))
+            payload["file"] = None
+            payload["tileset"] = None
+            payload["connections"] = []
+            payload["warps"] = []
+            payload["bg_events"] = []
+            payload["object_events"] = []
+            payload["is_unused"] = symbol.startswith(UNUSED_SYMBOL_PREFIX)
+            payload["is_multiplayer"] = symbol in MULTIPLAYER_SYMBOLS
+            payload["is_copy"] = symbol.endswith(COPY_SUFFIXES) or "COPY" in symbol
+            payload["routing_enabled"] = not payload["is_unused"] and not payload["is_multiplayer"]
 
-    for symbol, payload in maps.items():
-        map_id = payload["id"]
-        payload["name"] = POKEMON_RED_MAP_NAMES.get(map_id, _humanize_symbol(symbol))
-        payload["slug"] = _slug(payload["name"])
-        payload["anchor_name"] = indoor_group_anchors.get(payload.get("group"))
-        payload["file"] = None
-        payload["tileset"] = None
-        payload["connections"] = []
-        payload["warps"] = []
-        payload["bg_events"] = []
-        payload["object_events"] = []
-        payload["is_unused"] = symbol.startswith(UNUSED_SYMBOL_PREFIX)
-        payload["is_multiplayer"] = symbol in MULTIPLAYER_SYMBOLS
-        payload["is_copy"] = symbol.endswith(COPY_SUFFIXES) or "COPY" in symbol
-        payload["routing_enabled"] = not payload["is_unused"] and not payload["is_multiplayer"]
+        for symbol, payload in header_data.items():
+            if symbol not in maps:
+                continue
+            maps[symbol]["file"] = payload["file"]
+            maps[symbol]["tileset"] = payload["tileset"]
+            maps[symbol]["connections"] = payload["connections"]
 
-    for symbol, payload in header_data.items():
-        if symbol not in maps:
-            continue
-        maps[symbol]["file"] = payload["file"]
-        maps[symbol]["tileset"] = payload["tileset"]
-        maps[symbol]["connections"] = payload["connections"]
+        for symbol, payload in object_data.items():
+            if symbol not in maps:
+                continue
+            maps[symbol]["warps"] = payload["warps"]
+            maps[symbol]["bg_events"] = payload["bg_events"]
+            maps[symbol]["object_events"] = payload["object_events"]
 
-    for symbol, payload in object_data.items():
-        if symbol not in maps:
-            continue
-        maps[symbol]["warps"] = payload["warps"]
-        maps[symbol]["bg_events"] = payload["bg_events"]
-        maps[symbol]["object_events"] = payload["object_events"]
+        _resolve_last_map_warps(maps)
 
-    _resolve_last_map_warps(maps)
+        world_graph = _build_world_graph(maps, pret_dir)
+        landmarks = _build_landmarks(maps, world_graph)
+        generated_at = str(world_graph["meta"]["generated_at"])
+        pret_commit = str(world_graph["meta"]["pret_commit"])
+        tileset_ids, tileset_order = _parse_sequential_constants(pret_dir / "constants/tileset_constants.asm")
+        sprite_ids, _ = _parse_sequential_constants(pret_dir / "constants/sprite_constants.asm")
+        tileset_blocksets = _parse_tileset_blocksets(pret_dir / "gfx/tilesets.asm")
+        warp_tile_ids = _parse_warp_tile_ids(
+            pret_dir / "data/tilesets/warp_tile_ids.asm",
+            tileset_order=tileset_order,
+        )
+        door_tile_ids = _parse_door_tile_ids(pret_dir / "data/tilesets/door_tile_ids.asm")
+        special_warps = _parse_special_warps(pret_dir / "data/maps/special_warps.asm", maps)
+        map_objects = _build_map_objects(
+            maps,
+            pret_dir,
+            generated_at=generated_at,
+            pret_commit=pret_commit,
+            sprite_ids=sprite_ids,
+            tileset_ids=tileset_ids,
+            tileset_blocksets=tileset_blocksets,
+            warp_tile_ids=warp_tile_ids,
+            door_tile_ids=door_tile_ids,
+            special_warps=special_warps,
+        )
+        type_chart = _build_type_chart(
+            pret_dir / "data/types/type_matchups.asm",
+            pret_dir / "constants/type_constants.asm",
+            generated_at=generated_at,
+            pret_commit=pret_commit,
+        )
 
-    world_graph = _build_world_graph(maps, pret_dir)
-    landmarks = _build_landmarks(maps, world_graph)
+        for output in (
+            args.world_graph_out,
+            args.landmarks_out,
+            args.map_objects_out,
+            args.type_chart_out,
+        ):
+            output.parent.mkdir(parents=True, exist_ok=True)
 
-    args.world_graph_out.parent.mkdir(parents=True, exist_ok=True)
-    args.landmarks_out.parent.mkdir(parents=True, exist_ok=True)
-    args.world_graph_out.write_text(json.dumps(world_graph, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    args.landmarks_out.write_text(json.dumps(landmarks, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"Wrote {args.world_graph_out}")
-    print(f"Wrote {args.landmarks_out}")
+        args.world_graph_out.write_text(json.dumps(world_graph, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        args.landmarks_out.write_text(json.dumps(landmarks, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        args.map_objects_out.write_text(json.dumps(map_objects, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        args.type_chart_out.write_text(json.dumps(type_chart, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Wrote {args.world_graph_out}")
+        print(f"Wrote {args.landmarks_out}")
+        print(f"Wrote {args.map_objects_out}")
+        print(f"Wrote {args.type_chart_out}")
     return 0
+
+
+@contextmanager
+def _pret_checkout(provided_dir: Path | None) -> Path:
+    if provided_dir is not None:
+        pret_dir = provided_dir.resolve()
+        if not pret_dir.exists():
+            raise SystemExit(f"PRET checkout not found: {pret_dir}")
+        yield pret_dir
+        return
+
+    with TemporaryDirectory(prefix="pret-pokered-") as temp_dir:
+        clone_dir = Path(temp_dir) / "pokered"
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/pret/pokered", str(clone_dir)],
+            check=True,
+        )
+        yield clone_dir
 
 
 def _parse_map_constants(path: Path) -> dict[str, dict[str, Any]]:
@@ -203,41 +275,58 @@ def _parse_objects(directory: Path) -> dict[str, dict[str, Any]]:
                 section = "object_events"
                 continue
             if section == "warps":
-                warp_match = re.match(r"\s*warp_event\s+(\d+),\s*(\d+),\s*(\w+),\s*(\d+)", line)
-                if warp_match:
-                    x, y, destination_symbol, destination_warp_id = warp_match.groups()
+                if re.match(r"\s*warp_event\s+", line):
+                    parts = [part.strip() for part in re.sub(r"^\s*warp_event\s+", "", line).split(",")]
+                    if len(parts) < 4:
+                        continue
+                    x_token, y_token, destination_symbol, destination_warp_id_token = parts[:4]
+                    x = _parse_int_token(x_token)
+                    y = _parse_int_token(y_token)
+                    destination_warp_id = _parse_int_token(destination_warp_id_token)
+                    if x is None or y is None or destination_warp_id is None:
+                        continue
                     warps.append(
                         {
                             "index": len(warps) + 1,
-                            "x": int(x),
-                            "y": int(y),
+                            "x": x,
+                            "y": y,
                             "destination_symbol": destination_symbol,
-                            "destination_warp_id": int(destination_warp_id),
+                            "destination_warp_id": destination_warp_id,
                         }
                     )
             elif section == "bg_events":
-                bg_match = re.match(r"\s*bg_event\s+(\d+),\s*(\d+),\s*(\w+)", line)
-                if bg_match:
-                    x, y, text_id = bg_match.groups()
-                    bg_events.append({"index": len(bg_events) + 1, "x": int(x), "y": int(y), "text_id": text_id})
+                if re.match(r"\s*bg_event\s+", line):
+                    parts = [part.strip() for part in re.sub(r"^\s*bg_event\s+", "", line).split(",")]
+                    if len(parts) < 3:
+                        continue
+                    x = _parse_int_token(parts[0])
+                    y = _parse_int_token(parts[1])
+                    if x is None or y is None:
+                        continue
+                    bg_events.append({"index": len(bg_events) + 1, "x": x, "y": y, "text_id": parts[2]})
             elif section == "object_events":
-                object_match = re.match(
-                    r"\s*object_event\s+(\d+),\s*(\d+),\s*(\w+),\s*(\w+),\s*(\w+),\s*(\w+)(?:,\s*(\w+))?(?:,\s*(\d+))?",
-                    line,
-                )
-                if object_match:
-                    x, y, sprite, movement, facing, text_id, arg7, arg8 = object_match.groups()
+                if re.match(r"\s*object_event\s+", line):
+                    parts = [part.strip() for part in re.sub(r"^\s*object_event\s+", "", line).split(",")]
+                    if len(parts) < 6:
+                        continue
+                    x = _parse_int_token(parts[0])
+                    y = _parse_int_token(parts[1])
+                    if x is None or y is None:
+                        continue
+                    sprite, movement, facing, text_id = parts[2:6]
+                    arg7 = parts[6] if len(parts) > 6 else None
+                    arg8 = _parse_int_token(parts[7]) if len(parts) > 7 else None
                     object_events.append(
                         {
                             "index": len(object_events) + 1,
-                            "x": int(x),
-                            "y": int(y),
+                            "x": x,
+                            "y": y,
                             "sprite": sprite,
                             "movement": movement,
                             "facing": facing,
                             "text_id": text_id,
                             "arg7": arg7,
-                            "arg8": int(arg8) if arg8 is not None else None,
+                            "arg8": arg8,
                         }
                     )
         if map_symbol is not None:
@@ -247,6 +336,587 @@ def _parse_objects(directory: Path) -> dict[str, dict[str, Any]]:
                 "object_events": object_events,
             }
     return objects
+
+
+def _parse_sequential_constants(path: Path) -> tuple[dict[str, int], list[str]]:
+    values: dict[str, int] = {}
+    ordered: list[str] = []
+    current = 0
+    active = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        if not line:
+            continue
+        if line.startswith("const_def"):
+            current = 0
+            active = True
+            continue
+        if not active:
+            continue
+        next_match = re.match(r"const_next\s+([$\w-]+)", line)
+        if next_match:
+            parsed = _parse_int_token(next_match.group(1))
+            if parsed is not None:
+                current = parsed
+            continue
+        const_match = re.match(r"const\s+(\w+)", line)
+        if const_match:
+            symbol = const_match.group(1)
+            values[symbol] = current
+            ordered.append(symbol)
+            current += 1
+    return values, ordered
+
+
+def _parse_tileset_blocksets(path: Path) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    pending_symbols: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        if not line:
+            continue
+        label_match = re.match(r"(\w+)_Block::(?:\s+INCBIN\s+\"([^\"]+)\")?", line)
+        if label_match:
+            label, incbin_path = label_match.groups()
+            pending_symbols.append(_camel_to_symbol(label))
+            if incbin_path is not None:
+                for symbol in pending_symbols:
+                    mapping[symbol] = incbin_path
+                pending_symbols = []
+            continue
+        incbin_match = re.match(r'INCBIN\s+"([^"]+)"', line)
+        if incbin_match and pending_symbols:
+            for symbol in pending_symbols:
+                mapping[symbol] = incbin_match.group(1)
+            pending_symbols = []
+    return mapping
+
+
+def _parse_warp_tile_ids(path: Path, *, tileset_order: list[str]) -> dict[str, list[int]]:
+    pointer_labels: list[str] = []
+    collecting_pointers = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        if not line:
+            continue
+        if line == "WarpTileIDPointers:":
+            collecting_pointers = True
+            continue
+        if collecting_pointers and line.startswith("assert_table_length"):
+            break
+        if collecting_pointers:
+            match = re.match(r"dw\s+(\.\w+)", line)
+            if match:
+                pointer_labels.append(match.group(1))
+
+    label_offsets, bytecode = _assemble_local_bytecode(path)
+    terminator = 0xFF
+    mapping: dict[str, list[int]] = {}
+    for index, tileset_symbol in enumerate(tileset_order):
+        if index >= len(pointer_labels):
+            break
+        label = pointer_labels[index]
+        offset = label_offsets.get(label)
+        if offset is None:
+            mapping[tileset_symbol] = []
+            continue
+        mapping[tileset_symbol] = _read_until_terminator(bytecode, offset, terminator)
+    return mapping
+
+
+def _parse_door_tile_ids(path: Path) -> dict[str, list[int]]:
+    pointer_map: dict[str, list[str]] = defaultdict(list)
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        if not line:
+            continue
+        match = re.match(r"dbw\s+(\w+),\s*(\.\w+)", line)
+        if match:
+            tileset_symbol, label = match.groups()
+            pointer_map[label].append(tileset_symbol)
+
+    label_offsets, bytecode = _assemble_local_bytecode(path)
+    terminator = 0
+    mapping: dict[str, list[int]] = {}
+    for label, symbols in pointer_map.items():
+        offset = label_offsets.get(label)
+        values = [] if offset is None else _read_until_terminator(bytecode, offset, terminator)
+        for symbol in symbols:
+            mapping[symbol] = list(values)
+    return mapping
+
+
+def _parse_special_warps(path: Path, maps: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    dungeon_targets: list[tuple[str, int]] = []
+    dungeon_coordinates: list[tuple[str, int, int]] = []
+    named_warps: list[dict[str, Any]] = []
+    fly_pointer_to_label: list[tuple[str, str]] = []
+    fly_coordinates: dict[str, tuple[str, int, int]] = {}
+    section: str | None = None
+    current_label: str | None = None
+
+    for raw_line in lines:
+        stripped = _strip_comment(raw_line)
+        if not stripped:
+            continue
+        label_match = re.match(r"(\.?\w+):(?:\s+(.*))?", stripped)
+        if label_match:
+            current_label = label_match.group(1)
+            remainder = label_match.group(2) or ""
+            if current_label == "DungeonWarpList":
+                section = "dungeon_targets"
+                continue
+            if current_label == "DungeonWarpData":
+                section = "dungeon_coordinates"
+                continue
+            if current_label == "FlyWarpDataPtr":
+                section = "fly_pointers"
+                continue
+            if current_label.startswith(".") and remainder.startswith("fly_warp "):
+                section = None
+                match = re.match(r"fly_warp\s+(\w+),\s*(\d+),\s*(\d+)", remainder)
+                if match:
+                    map_symbol, x, y = match.groups()
+                    fly_coordinates[current_label] = (map_symbol, int(x), int(y))
+                continue
+            if remainder.startswith("special_warp_spec "):
+                section = None
+                match = re.match(r"special_warp_spec\s+(\w+),\s*(\d+),\s*(\d+),\s*(\w+)", remainder)
+                if match:
+                    map_symbol, x, y, destination_symbol = match.groups()
+                    named_warps.append(
+                        {
+                            "name": current_label,
+                            "map_name": maps.get(map_symbol, {}).get("name"),
+                            "map_symbol": map_symbol,
+                            "x": int(x),
+                            "y": int(y),
+                            "destination_symbol": destination_symbol,
+                        }
+                    )
+                continue
+
+        if section == "dungeon_targets":
+            if stripped == "db -1":
+                section = None
+                continue
+            match = re.match(r"db\s+(\w+),\s*(\d+)", stripped)
+            if match:
+                map_symbol, warp_index = match.groups()
+                dungeon_targets.append((map_symbol, int(warp_index)))
+            continue
+
+        if section == "dungeon_coordinates":
+            match = re.match(r"fly_warp\s+(\w+),\s*(\d+),\s*(\d+)", stripped)
+            if match:
+                map_symbol, x, y = match.groups()
+                dungeon_coordinates.append((map_symbol, int(x), int(y)))
+            continue
+
+        if section == "fly_pointers":
+            match = re.match(r"fly_warp_spec\s+(\w+),\s*(\.\w+)", stripped)
+            if match:
+                fly_pointer_to_label.append(match.groups())
+            continue
+
+    dungeon_warps: list[dict[str, Any]] = []
+    for (map_symbol, warp_index), (coord_symbol, x, y) in zip(dungeon_targets, dungeon_coordinates, strict=False):
+        dungeon_warps.append(
+            {
+                "map_name": maps.get(map_symbol, {}).get("name"),
+                "map_symbol": map_symbol,
+                "warp_index": warp_index,
+                "x": x,
+                "y": y,
+                "coordinate_map_symbol": coord_symbol,
+            }
+        )
+
+    fly_warps: list[dict[str, Any]] = []
+    for map_symbol, label in fly_pointer_to_label:
+        coordinate = fly_coordinates.get(label)
+        if coordinate is None:
+            continue
+        _coordinate_map_symbol, x, y = coordinate
+        fly_warps.append(
+            {
+                "map_name": maps.get(map_symbol, {}).get("name"),
+                "map_symbol": map_symbol,
+                "x": x,
+                "y": y,
+            }
+        )
+
+    return {
+        "dungeon_warps": dungeon_warps,
+        "fly_warps": fly_warps,
+        "named_warps": named_warps,
+    }
+
+
+def _build_map_objects(
+    maps: dict[str, dict[str, Any]],
+    pret_dir: Path,
+    *,
+    generated_at: str,
+    pret_commit: str,
+    sprite_ids: dict[str, int],
+    tileset_ids: dict[str, int],
+    tileset_blocksets: dict[str, str],
+    warp_tile_ids: dict[str, list[int]],
+    door_tile_ids: dict[str, list[int]],
+    special_warps: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    blockset_cache: dict[str, bytes] = {}
+    maps_payload: list[dict[str, Any]] = []
+    total_warps = 0
+    total_signs = 0
+    total_npcs = 0
+    tilesets_payload: list[dict[str, Any]] = []
+
+    for tileset_symbol, tileset_id in sorted(tileset_ids.items(), key=lambda item: item[1]):
+        tilesets_payload.append(
+            {
+                "blockset": tileset_blocksets.get(tileset_symbol),
+                "door_tile_ids": list(door_tile_ids.get(tileset_symbol, [])),
+                "id": tileset_id,
+                "symbol": tileset_symbol,
+                "warp_tile_ids": list(warp_tile_ids.get(tileset_symbol, [])),
+            }
+        )
+
+    for symbol in sorted(maps, key=lambda item: maps[item]["id"]):
+        payload = maps[symbol]
+        warp_entries: list[dict[str, Any]] = []
+        door_ids = set(door_tile_ids.get(payload.get("tileset") or "", []))
+        warp_ids = set(warp_tile_ids.get(payload.get("tileset") or "", []))
+        for warp in payload["warps"]:
+            tile_id = _warp_tile_id_for_coordinate(
+                pret_dir=pret_dir,
+                map_payload=payload,
+                tileset_blocksets=tileset_blocksets,
+                blockset_cache=blockset_cache,
+                x=warp["x"],
+                y=warp["y"],
+            )
+            activation_mode, activation_source = _infer_warp_activation_mode(
+                map_payload=payload,
+                x=warp["x"],
+                y=warp["y"],
+                tile_id=tile_id,
+                door_tile_ids=door_ids,
+                warp_tile_ids=warp_ids,
+            )
+            warp_entries.append(
+                {
+                    "activation_mode": activation_mode,
+                    "activation_source": activation_source,
+                    "destination_map_id": warp.get("resolved_destination_map_id"),
+                    "destination_name": warp.get("resolved_destination_name"),
+                    "destination_symbol": warp.get("resolved_destination_symbol"),
+                    "destination_warp_id": warp["destination_warp_id"],
+                    "index": warp["index"],
+                    "original_destination_symbol": warp["destination_symbol"],
+                    "resolution_method": warp.get("resolution_method"),
+                    "tile_id": tile_id,
+                    "x": warp["x"],
+                    "y": warp["y"],
+                }
+            )
+
+        sign_entries = [
+            {
+                "index": event["index"],
+                "text_id": event["text_id"],
+                "x": event["x"],
+                "y": event["y"],
+            }
+            for event in payload["bg_events"]
+        ]
+        npc_entries = []
+        for event in payload["object_events"]:
+            trainer_class = event.get("arg7") if isinstance(event.get("arg7"), str) and event["arg7"].startswith("OPP_") else None
+            npc_entries.append(
+                {
+                    "facing": event["facing"],
+                    "index": event["index"],
+                    "is_trainer": trainer_class is not None,
+                    "movement": event["movement"],
+                    "sprite_id": sprite_ids.get(event["sprite"]),
+                    "sprite_symbol": event["sprite"],
+                    "text_id": event["text_id"],
+                    "trainer_class": trainer_class,
+                    "trainer_id": event.get("arg8") if trainer_class is not None else None,
+                    "x": event["x"],
+                    "y": event["y"],
+                }
+            )
+
+        total_warps += len(warp_entries)
+        total_signs += len(sign_entries)
+        total_npcs += len(npc_entries)
+        maps_payload.append(
+            {
+                "file": payload["file"],
+                "id": payload["id"],
+                "name": payload["name"],
+                "npcs": npc_entries,
+                "routing_enabled": payload["routing_enabled"],
+                "signs": sign_entries,
+                "slug": payload["slug"],
+                "symbol": payload["symbol"],
+                "tileset": payload["tileset"],
+                "warps": warp_entries,
+            }
+        )
+
+    return {
+        "maps": maps_payload,
+        "meta": {
+            "generated_at": generated_at,
+            "notes": [
+                "Warp activation modes are derived from PRET tileset tile IDs when available.",
+                "Boundary-based activation is retained as a fallback when a warp tile cannot be resolved to a known tile ID.",
+            ],
+            "pret_commit": pret_commit,
+            "pret_repo": "https://github.com/pret/pokered",
+            "stats": {
+                "map_count": len(maps_payload),
+                "npc_count": total_npcs,
+                "sign_count": total_signs,
+                "special_warp_count": sum(len(items) for items in special_warps.values()),
+                "tileset_count": len(tilesets_payload),
+                "warp_count": total_warps,
+            },
+        },
+        "special_warps": special_warps,
+        "tilesets": tilesets_payload,
+    }
+
+
+def _build_type_chart(
+    type_matchup_path: Path,
+    type_constants_path: Path,
+    *,
+    generated_at: str,
+    pret_commit: str,
+) -> dict[str, Any]:
+    type_values, ordered_types = _parse_sequential_constants(type_constants_path)
+    del type_values
+    types = [
+        _normalize_type_symbol(symbol)
+        for symbol in ordered_types
+        if symbol not in {"BIRD"}
+    ]
+    explicit: dict[tuple[str, str], float] = {}
+    multipliers = {
+        "NO_EFFECT": 0.0,
+        "NOT_VERY_EFFECTIVE": 0.5,
+        "SUPER_EFFECTIVE": 2.0,
+    }
+    for raw_line in type_matchup_path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        match = re.match(r"db\s+(\w+),\s*(\w+),\s*(\w+)", line)
+        if not match:
+            continue
+        attacker_symbol, defender_symbol, multiplier_symbol = match.groups()
+        if attacker_symbol == "-1":
+            break
+        multiplier = multipliers.get(multiplier_symbol)
+        if multiplier is None:
+            continue
+        explicit[(_normalize_type_symbol(attacker_symbol), _normalize_type_symbol(defender_symbol))] = multiplier
+
+    matchups: list[dict[str, Any]] = []
+    for attacker in types:
+        for defender in types:
+            matchups.append(
+                {
+                    "attacker": attacker,
+                    "defender": defender,
+                    "multiplier": explicit.get((attacker, defender), 1.0),
+                }
+            )
+
+    return {
+        "matchups": matchups,
+        "meta": {
+            "generated_at": generated_at,
+            "pret_commit": pret_commit,
+            "pret_repo": "https://github.com/pret/pokered",
+            "stats": {
+                "matchup_count": len(matchups),
+                "type_count": len(types),
+            },
+        },
+        "types": types,
+    }
+
+
+def _assemble_local_bytecode(path: Path) -> tuple[dict[str, int], list[int]]:
+    labels: dict[str, int] = {}
+    bytecode: list[int] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = _strip_comment(raw_line)
+        if not line:
+            continue
+        label_match = re.match(r"(\.\w+|\w+):(?:\s+(.*))?", line)
+        if label_match:
+            label, remainder = label_match.groups()
+            labels[label] = len(bytecode)
+            if remainder:
+                bytecode.extend(_emit_data_bytes(remainder))
+            continue
+        bytecode.extend(_emit_data_bytes(line))
+    return labels, bytecode
+
+
+def _emit_data_bytes(line: str) -> list[int]:
+    bytes_out: list[int] = []
+    macro_match = re.match(r"(warp_tiles|door_tiles)\s*(.*)", line)
+    if macro_match:
+        macro_name, args = macro_match.groups()
+        if args:
+            bytes_out.extend(_parse_numeric_arguments(args))
+        bytes_out.append(0xFF if macro_name == "warp_tiles" else 0x00)
+        return bytes_out
+    db_match = re.match(r"db\s+(.+)", line)
+    if db_match:
+        return _parse_numeric_arguments(db_match.group(1))
+    return bytes_out
+
+
+def _parse_numeric_arguments(arg_text: str) -> list[int]:
+    values: list[int] = []
+    for raw_token in arg_text.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        parsed = _parse_int_token(token)
+        if parsed is None:
+            return []
+        values.append(parsed & 0xFF)
+    return values
+
+
+def _read_until_terminator(bytecode: list[int], offset: int, terminator: int) -> list[int]:
+    values: list[int] = []
+    for index in range(offset, len(bytecode)):
+        value = bytecode[index]
+        if value == terminator:
+            break
+        values.append(value)
+    return values
+
+
+def _warp_tile_id_for_coordinate(
+    *,
+    pret_dir: Path,
+    map_payload: dict[str, Any],
+    tileset_blocksets: dict[str, str],
+    blockset_cache: dict[str, bytes],
+    x: int,
+    y: int,
+) -> int | None:
+    map_file = map_payload.get("file")
+    tileset_symbol = map_payload.get("tileset")
+    if not map_file or not tileset_symbol:
+        return None
+    blockset_relative_path = tileset_blocksets.get(tileset_symbol)
+    if blockset_relative_path is None:
+        return None
+    map_path = pret_dir / "maps" / f"{map_file}.blk"
+    if not map_path.exists():
+        return None
+    map_width = map_payload["width"]
+    map_height = map_payload["height"]
+    if x < 0 or y < 0 or x >= map_width * 2 or y >= map_height * 2:
+        return None
+    block_bytes = map_path.read_bytes()
+    block_index = (y // 2) * map_width + (x // 2)
+    if block_index >= len(block_bytes):
+        return None
+    block_id = block_bytes[block_index]
+    blockset_bytes = blockset_cache.get(tileset_symbol)
+    if blockset_bytes is None:
+        blockset_bytes = (pret_dir / blockset_relative_path).read_bytes()
+        blockset_cache[tileset_symbol] = blockset_bytes
+    block_offset = block_id * 16
+    if block_offset + 16 > len(blockset_bytes):
+        return None
+    block = blockset_bytes[block_offset : block_offset + 16]
+    local_x = x % 2
+    local_y = y % 2
+    lower_left_index = ((local_y * 2) + 1) * 4 + (local_x * 2)
+    if lower_left_index >= len(block):
+        return None
+    return int(block[lower_left_index])
+
+
+def _infer_warp_activation_mode(
+    *,
+    map_payload: dict[str, Any],
+    x: int,
+    y: int,
+    tile_id: int | None,
+    door_tile_ids: set[int],
+    warp_tile_ids: set[int],
+) -> tuple[str, str]:
+    if tile_id is not None:
+        if tile_id in door_tile_ids:
+            return "push", "door_tile_id"
+        if tile_id in warp_tile_ids:
+            return "step_on", "warp_tile_id"
+    if _warp_boundary_side(map_payload, x, y) is not None:
+        return "push", "fallback_boundary"
+    return "step_on", "fallback_default"
+
+
+def _warp_boundary_side(map_payload: dict[str, Any], x: int, y: int) -> str | None:
+    max_x = max(0, map_payload["width"] * 2 - 1)
+    max_y = max(0, map_payload["height"] * 2 - 1)
+    if y <= 0:
+        return "north"
+    if x >= max_x:
+        return "east"
+    if y >= max_y:
+        return "south"
+    if x <= 0:
+        return "west"
+    return None
+
+
+def _strip_comment(raw_line: str) -> str:
+    return raw_line.split(";", 1)[0].strip()
+
+
+def _parse_int_token(token: str) -> int | None:
+    value = token.strip()
+    if not value:
+        return None
+    if value.startswith("$"):
+        try:
+            return int(value[1:], 16)
+        except ValueError:
+            return None
+    try:
+        return int(value, 10)
+    except ValueError:
+        return None
+
+
+def _camel_to_symbol(value: str) -> str:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    value = re.sub(r"([A-Za-z])(\d)", r"\1_\2", value)
+    value = re.sub(r"(\d)([A-Za-z])", r"\1_\2", value)
+    return value.upper()
+
+
+def _normalize_type_symbol(symbol: str) -> str:
+    if symbol == "PSYCHIC_TYPE":
+        return "PSYCHIC"
+    return symbol
 
 
 def _parse_name_labels(path: Path) -> dict[str, str]:

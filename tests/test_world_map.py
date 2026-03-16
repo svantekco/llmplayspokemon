@@ -143,6 +143,7 @@ def test_observe_state_prunes_bogus_indoor_connectors_and_keeps_canonical_warp()
     connector = world_map.connectors["Red's House 2F::tile::7:1"]
     assert connector.kind == "warp"
     assert connector.status == ConnectorStatus.SUSPECTED
+    assert connector.activation_mode == "step_on"
     assert connector.source_x == 7
     assert connector.source_y == 1
 
@@ -173,6 +174,7 @@ def test_confirm_transition_uses_tile_connector_for_canonical_edge_warp() -> Non
     assert connector is not None
     assert connector.id == "Red's House 2F::tile::7:1"
     assert connector.kind == "warp"
+    assert connector.activation_mode == "step_on"
     assert connector.status == ConnectorStatus.CONFIRMED
     assert connector.destination_map == "Red's House 1F"
 

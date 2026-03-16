@@ -14,6 +14,7 @@ from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import NavigationSnapshot
 from pokemon_agent.models.state import StructuredGameState
 from pokemon_agent.models.state import WorldCoordinate
+from pokemon_agent.agent.game_knowledge import load_game_knowledge
 from pokemon_agent.agent.navigation import is_real_map_edge
 from pokemon_agent.agent.navigation import visible_boundary_side
 from pokemon_agent.navigation.world_graph import load_world_graph
@@ -43,6 +44,7 @@ OPPOSITE_SIDE = {
     "west": "east",
 }
 _STATIC_WORLD_GRAPH = load_world_graph()
+_GAME_KNOWLEDGE = load_game_knowledge()
 
 
 def observe_state(world_map: WorldMapMemory, state: StructuredGameState) -> None:
@@ -569,8 +571,12 @@ def _transition_connector_spec(
     source_x: int | None,
     source_y: int | None,
 ) -> tuple[str, str | None, str | None]:
-    if source_x is not None and source_y is not None and _STATIC_WORLD_GRAPH.get_warp_at(map_ref, source_x, source_y) is not None:
-        return "warp", None, _connector_activation_mode(map_ref, None, source_x, source_y, "warp")
+    if source_x is not None and source_y is not None:
+        warp = _GAME_KNOWLEDGE.get_warp_at(map_ref, source_x, source_y)
+        if warp is not None:
+            return "warp", None, warp.activation_mode or _connector_activation_mode(map_ref, None, source_x, source_y, "warp")
+        if _STATIC_WORLD_GRAPH.get_warp_at(map_ref, source_x, source_y) is not None:
+            return "warp", None, _connector_activation_mode(map_ref, None, source_x, source_y, "warp")
     kind = _kind_for_transition(side, source_x, source_y)
     return kind, side, _connector_activation_mode(map_ref, side, source_x, source_y, kind)
 
@@ -582,6 +588,10 @@ def _connector_activation_mode(
     source_y: int | None,
     kind: str,
 ) -> str | None:
+    if kind == "warp" and source_x is not None and source_y is not None:
+        warp = _GAME_KNOWLEDGE.get_warp_at(map_ref, source_x, source_y)
+        if warp is not None and warp.activation_mode in {"step_on", "push", "interact"}:
+            return warp.activation_mode
     if kind == "boundary":
         return None
     if kind == "door":

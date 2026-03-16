@@ -576,6 +576,10 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Implemented Phase 3 with a shared `Navigator`, a real `OverworldController`, dispatcher wiring for `OVERWORLD`, navigator-backed blocked-tile tracking in `engine.py`, and direct `world_graph` usage in place of `map_connections.py`.
 - 2026-03-16: Added navigator/overworld regression coverage and updated engine expectations for deterministic overworld turns, controller-owned connector entry, and reduced overworld LLM/executor usage.
 - 2026-03-16: Verified the phase-3 navigation slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_engine.py tests/test_navigator.py tests/test_overworld_controller.py tests/test_mode_dispatcher.py tests/test_navigation.py tests/test_world_map.py tests/test_executor.py -q -s` (77 passed).
+- 2026-03-16: Implemented Phase 4 by extending `scripts/import_pret_world_graph.py` to clone PRET into a temporary checkout when needed, import map object data, infer warp activation from ROM tileset/blockset data, parse special-warps metadata, and emit `generated/map_objects.json` plus `generated/type_chart.json`.
+- 2026-03-16: Added `agent/game_knowledge.py`, wired world-map connector activation through ROM-derived warp metadata, and moved `BattleController` type effectiveness lookups onto the shared generated type chart.
+- 2026-03-16: Verified the phase-4 slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_game_knowledge.py tests/test_world_map.py tests/test_battle_controller.py tests/test_world_graph.py tests/test_engine.py tests/test_navigator.py tests/test_overworld_controller.py tests/test_mode_dispatcher.py tests/test_navigation.py tests/test_executor.py -q -s` (98 passed).
+- 2026-03-16: A full `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest -q -s` run after phase 4 still only shows the pre-existing unrelated failures in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`; the phase-4 slice itself passes.
 
 ## Decision log
 
@@ -586,6 +590,8 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Kept `Executor` as a legacy task adapter for residual task-based paths, but removed it from the normal overworld planning path so navigation decisions now come from `OverworldController` first.
 - 2026-03-16: Added a narrow deterministic utility-action hook to `OverworldController` for `PRESS_START`-style overworld actions (for example required HM prep) instead of routing those cases back through the candidate planner.
 - 2026-03-16: Anchored push-style connector execution on the known approach tile when connector discovery mutates noisy source coordinates, preserving correct door/boundary traversal without restoring executor ownership.
+- 2026-03-16: Derived warp activation from PRET map blocksets plus tileset door/warp tile tables, with boundary-based fallback retained only when the ROM tables do not classify the warp tile.
+- 2026-03-16: Kept the new PRET fetch behavior inside `scripts/import_pret_world_graph.py` so phase-4 data regeneration remains one command and always cleans up its temporary checkout afterward.
 
 ## Discoveries / surprises log
 
@@ -594,6 +600,9 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: The broader suite still has unrelated red tests in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`. Those failures were present outside the phase-2 controller slice and were left out of scope for this milestone.
 - 2026-03-16: `observe_state()` can enrich confirmed connectors with inaccurate source coordinates on mocked maps; using the known approach tile as the push anchor avoids spurious reroutes while keeping successful connector confirmation intact.
 - 2026-03-16: A full `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest -q -s` run after phase 3 still shows unrelated failures in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`; the phase-3 navigation slice itself passes.
+- 2026-03-16: PRET’s warp activation tables operate on the lower-left walk-tile graphic inside a blockset quadrant, so reliable push-vs-step-on inference requires combining map `.blk` data with tileset `.bst` blocksets rather than reading warp coordinates alone.
+- 2026-03-16: Some indoor exit warps (for example `REDS_HOUSE_1F` to `LAST_MAP`) do not resolve via explicit door tile tables, so the importer keeps a documented boundary fallback for those cases instead of pretending the ROM data fully classifies every warp tile.
+- 2026-03-16: The full suite’s remaining reds after phase 4 are unchanged from earlier milestones and still live in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`, so phase-4 verification stayed focused on ROM-data consumers plus the nearby controller/navigation slice.
 
 ## Appendix: file-by-file change map
 

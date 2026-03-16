@@ -28,6 +28,16 @@ class _FakeBattleLLM:
         return CompletionResponse(content=json.dumps(payload), model="fake")
 
 
+class _FakeKnowledge:
+    def __init__(self, overrides: dict[tuple[str, str], float] | None = None) -> None:
+        self._overrides = overrides or {}
+
+    def type_effectiveness(self, attack_type: str | None, defend_type: str | None) -> float:
+        if attack_type is None or defend_type is None:
+            return 1.0
+        return self._overrides.get((attack_type, defend_type), 1.0)
+
+
 def _battle_state(
     *,
     kind: str = "WILD",
@@ -220,3 +230,34 @@ def test_battle_controller_moves_toward_fight_from_bag_cursor() -> None:
 
     assert result.action is not None
     assert result.action.action == ActionType.MOVE_LEFT
+
+
+def test_battle_controller_uses_game_knowledge_for_type_chart() -> None:
+    knowledge = _FakeKnowledge({("WATER", "GRASS"): 5.0, ("NORMAL", "GRASS"): 1.0})
+    controller = BattleController(knowledge=knowledge)
+    state = _battle_state(
+        kind="TRAINER",
+        enemy_species="Bulbasaur",
+        player_species="Squirtle",
+        battle_menu_position=0,
+        moves=[
+            MoveInfo(move_id=1, name="Tackle", pp=35, power=80, move_type="NORMAL"),
+            MoveInfo(move_id=2, name="Water Gun", pp=25, power=40, move_type="WATER"),
+        ],
+        party=[
+            PartyMember(name="Squirtle", level=12, hp=35, max_hp=35),
+            PartyMember(name="Pidgey", level=10, hp=28, max_hp=28),
+        ],
+    )
+
+    first = controller.step(state, TurnContext(turn_index=1))
+    follow_up_state = state.model_copy(deep=True)
+    follow_up_state.battle_state = follow_up_state.battle_state.model_copy(
+        update={"battle_menu_position": 1, "move_cursor_position": 1}
+    )
+    second = controller.step(follow_up_state, TurnContext(turn_index=2))
+
+    assert first.action is not None
+    assert first.action.action == ActionType.PRESS_A
+    assert second.action is not None
+    assert second.action.action == ActionType.MOVE_DOWN
