@@ -10,14 +10,13 @@ from pathlib import Path
 from typing import Any
 from typing import TYPE_CHECKING
 
-from pokemon_agent.agent.battle_manager import BattleManager
+from pokemon_agent.agent.controllers.battle import BattleController
+from pokemon_agent.agent.controllers.cutscene import CutsceneController
+from pokemon_agent.agent.controllers.dialogue import DialogueController
+from pokemon_agent.agent.controllers.menu import MenuController
 from pokemon_agent.agent.controllers.protocol import NavigationTarget
 from pokemon_agent.agent.controllers.protocol import TurnContext
-from pokemon_agent.agent.controllers.stubs import StubBattleController
-from pokemon_agent.agent.controllers.stubs import StubCutsceneController
-from pokemon_agent.agent.controllers.stubs import StubMenuController
 from pokemon_agent.agent.controllers.stubs import StubOverworldController
-from pokemon_agent.agent.controllers.stubs import StubTextController
 from pokemon_agent.agent.controllers.stubs import StubUnknownController
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.executor import Executor
@@ -219,7 +218,6 @@ class ClosedLoopRunner:
         self.validator = validator
         self.llm_client = llm_client
         self.context_manager = context_manager or ContextManager()
-        self.battle_manager = BattleManager()
         self.telemetry = RunTelemetry()
         self.completed_turns = 0
         self._candidate_runtime: dict[str, CandidateRuntime] = {}
@@ -258,13 +256,16 @@ class ClosedLoopRunner:
         self._activity_callback(phase, detail)
 
     def _build_mode_dispatcher(self) -> ModeDispatcher:
+        battle_complete = None
+        if self.llm_client is not None:
+            battle_complete = lambda messages, purpose: self._complete_with_window_pump(messages, purpose=purpose)
         return ModeDispatcher(
             {
                 GameMode.OVERWORLD: StubOverworldController(self._plan_overworld_mode),
-                GameMode.MENU: StubMenuController(self._plan_menu_mode),
-                GameMode.TEXT: StubTextController(self._plan_text_mode),
-                GameMode.BATTLE: StubBattleController(self._plan_battle_mode),
-                GameMode.CUTSCENE: StubCutsceneController(self._plan_cutscene_mode),
+                GameMode.MENU: MenuController(menu_manager=self.menu_manager),
+                GameMode.TEXT: DialogueController(),
+                GameMode.BATTLE: BattleController(battle_complete),
+                GameMode.CUTSCENE: CutsceneController(),
                 GameMode.UNKNOWN: StubUnknownController(self._plan_unknown_mode),
             }
         )
@@ -521,7 +522,7 @@ class ClosedLoopRunner:
         self._report_activity("Refreshing objectives", state.map_name)
         observe_state(self.memory.memory.long_term.world_map, state)
         self._ensure_objective_plan(state)
-        return self.dispatcher.dispatch(state, self._build_turn_context(state))
+        return self._with_objective_planner_metadata(self.dispatcher.dispatch(state, self._build_turn_context(state)))
 
     def _reset_objective_planner_metadata(self) -> None:
         self._objective_plan_messages = []
@@ -542,25 +543,8 @@ class ClosedLoopRunner:
         candidates = self._build_candidate_steps(state)
         return self._plan_candidates(state, candidates)
 
-    def _plan_cutscene_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
-        return self._plan_overworld_mode(state, context)
-
     def _plan_unknown_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
         return self._plan_overworld_mode(state, context)
-
-    def _plan_text_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
-        return self._plan_interrupt_action(state)
-
-    def _plan_menu_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
-        return self._plan_interrupt_action(state)
-
-    def _plan_battle_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
-        return self._plan_interrupt_action(state)
-
-    def _plan_interrupt_action(self, state: StructuredGameState) -> PlanningResult:
-        self._report_activity("Handling interrupt state", self.dispatcher.effective_mode(state).value)
-        candidates = self._build_candidate_steps(state)
-        return self._plan_candidates(state, candidates)
 
     def _plan_candidates(
         self,
@@ -1144,65 +1128,6 @@ class ClosedLoopRunner:
         objective_id = self._objective_id_for_goal(navigation_goal, short_objective_id)
         candidates: list[CandidateNextStep] = []
 
-        if state.text_box_open:
-            deterministic_choice = self._deterministic_yes_no_candidate(state, objective_id)
-            if deterministic_choice is not None:
-                return [deterministic_choice]
-            dialogue_text = state.metadata.get("dialogue_text")
-            yes_no_prompt = bool(state.metadata.get("yes_no_prompt"))
-            if yes_no_prompt:
-                why = "A yes/no prompt is open and requires an explicit choice."
-                if isinstance(dialogue_text, str) and dialogue_text.strip():
-                    why = f"Dialogue asks for a yes/no choice: {dialogue_text.splitlines()[0][:80]}"
-                select_yes = CandidateNextStep(
-                    id="select_yes",
-                    type="SELECT_YES",
-                    why=why,
-                    priority=90,
-                    expected_success_signal="Prompt closes or dialogue changes after choosing yes",
-                    objective_id=objective_id,
-                )
-                self._candidate_runtime[select_yes.id] = CandidateRuntime(
-                    action=self._yes_no_action(choice="YES", current_cursor=state.metadata.get("cursor")),
-                )
-                select_no = CandidateNextStep(
-                    id="select_no",
-                    type="SELECT_NO",
-                    why=why,
-                    priority=90,
-                    expected_success_signal="Prompt closes or dialogue changes after choosing no",
-                    objective_id=objective_id,
-                )
-                self._candidate_runtime[select_no.id] = CandidateRuntime(
-                    action=self._yes_no_action(choice="NO", current_cursor=state.metadata.get("cursor")),
-                )
-                return [select_yes, select_no]
-            why = "Text is already open."
-            if isinstance(dialogue_text, str) and dialogue_text.strip():
-                why = f"Dialogue is open: {dialogue_text.splitlines()[0][:80]}"
-            candidate = CandidateNextStep(
-                id="advance_text",
-                type="ADVANCE_TEXT_UNTIL_CHANGE",
-                why=why,
-                priority=100,
-                expected_success_signal="Dialogue changes or the text box closes",
-                objective_id=objective_id,
-            )
-            self._candidate_runtime[candidate.id] = CandidateRuntime(
-                action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="advance text"),
-            )
-            return [candidate]
-        if state.menu_open:
-            menu_candidates = self.menu_manager.build_candidates(state, objective_id)
-            self._candidate_runtime.update(self.menu_manager.runtime_map())
-            menu_candidates = self._dedupe_candidates(menu_candidates)
-            menu_candidates.sort(key=lambda item: (-item.priority, item.id))
-            return self._trim_candidate_runtime(menu_candidates[:4])
-        if state.battle_state:
-            battle_candidates = self.battle_manager.build_candidates(state, objective_id)
-            self._candidate_runtime.update(self.battle_manager.runtime_map())
-            return self._trim_candidate_runtime(battle_candidates)
-
         candidates.extend(self.menu_manager.build_candidates(state, objective_id))
         self._candidate_runtime.update(self.menu_manager.runtime_map())
 
@@ -1238,55 +1163,6 @@ class ClosedLoopRunner:
         if goal is None or not goal.objective_kind:
             return fallback
         return f"local_{goal.objective_kind}"
-
-    def _deterministic_yes_no_candidate(
-        self,
-        state: StructuredGameState,
-        objective_id: str,
-    ) -> CandidateNextStep | None:
-        if not bool(state.metadata.get("yes_no_prompt")):
-            return None
-        dialogue = str(state.metadata.get("dialogue_text") or "").lower()
-        if not dialogue:
-            return None
-        choose_yes = any(keyword in dialogue for keyword in ("heal", "take", "want", "accept", "board", "teach", "use", "buy", "give"))
-        choose_no = any(keyword in dialogue for keyword in ("save", "quit", "cancel", "stop"))
-        if choose_yes == choose_no:
-            return None
-        candidate_id = "select_yes" if choose_yes else "select_no"
-        candidate = CandidateNextStep(
-            id=candidate_id,
-            type="SELECT_YES" if choose_yes else "SELECT_NO",
-            why="Deterministic yes/no rule matched the visible prompt.",
-            priority=100,
-            expected_success_signal="Prompt closes or dialogue changes",
-            objective_id=objective_id,
-            advances_target=True,
-        )
-        if choose_yes:
-            self._candidate_runtime[candidate.id] = CandidateRuntime(
-                action=self._yes_no_action(choice="YES", current_cursor=state.metadata.get("cursor"), reason="deterministic yes"),
-            )
-        else:
-            self._candidate_runtime[candidate.id] = CandidateRuntime(
-                action=self._yes_no_action(choice="NO", current_cursor=state.metadata.get("cursor"), reason="deterministic no"),
-            )
-        return candidate
-
-    def _yes_no_action(
-        self,
-        *,
-        choice: str,
-        current_cursor: object,
-        reason: str = "choose prompt option",
-    ) -> ActionDecision:
-        cursor = str(current_cursor or "YES").upper()
-        target = choice.upper()
-        if target == cursor:
-            return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
-        if target == "YES":
-            return ActionDecision(action=ActionType.MOVE_UP, repeat=1, reason=reason)
-        return ActionDecision(action=ActionType.MOVE_DOWN, repeat=1, reason=reason)
 
     def _build_progression_candidates(
         self,
@@ -2450,8 +2326,6 @@ class ClosedLoopRunner:
         state: StructuredGameState,
         reason: str,
     ) -> CandidateRuntime | None:
-        if state.battle_state is not None:
-            self.battle_manager.record_choice(candidate)
         runtime = self._candidate_runtime_for(candidate)
         if runtime.action is not None:
             action = runtime.action.model_copy(deep=True)

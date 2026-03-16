@@ -972,8 +972,8 @@ def test_runner_replans_followup_dialogue_without_llm():
 
     assert llm.calls == 1
     assert first.llm_attempted is True
-    assert first.planner_source == "auto_candidate"
-    assert second.planner_source == "auto_candidate"
+    assert first.planner_source == "dialogue_controller"
+    assert second.planner_source == "dialogue_controller"
     assert second.action.action == ActionType.PRESS_A
 
 
@@ -1013,7 +1013,7 @@ def test_runner_auto_selects_when_one_candidate_dominates():
 
     assert llm.calls == 1
     assert result.llm_attempted is True
-    assert result.planner_source == "auto_candidate"
+    assert result.planner_source == "menu_controller"
     assert result.action.action == ActionType.MOVE_DOWN
 
 
@@ -1098,13 +1098,13 @@ def test_runner_opens_menu_proactively_for_required_hm(monkeypatch) -> None:
     assert result.action.action == ActionType.PRESS_START
 
 
-def test_runner_uses_menu_manager_when_start_menu_is_open() -> None:
+def test_runner_uses_menu_controller_when_start_menu_is_open() -> None:
     emulator = _StartMenuMock()
     runner = _build_runner(emulator)
 
     result = runner.run_turn(1)
 
-    assert result.planner_source == "auto_candidate"
+    assert result.planner_source == "menu_controller"
     assert result.action.action == ActionType.MOVE_DOWN
 
 
@@ -1121,7 +1121,7 @@ def test_runner_prefers_local_recovery_over_press_start_when_stuck_in_overworld(
     assert result.action.action == ActionType.PRESS_A
 
 
-def test_runner_uses_llm_for_yes_no_text_prompt():
+def test_runner_resolves_yes_no_text_with_dialogue_controller():
     emulator = _YesNoPromptMock()
     llm = _ChooseCandidateLLM(index=1)
     runner = _build_runner(emulator, llm_client=llm)
@@ -1131,8 +1131,8 @@ def test_runner_uses_llm_for_yes_no_text_prompt():
 
     assert llm.calls >= 2
     assert first.llm_attempted is True
-    assert first.planner_source in {"llm", "auto_candidate"}
-    assert first.action.action in {ActionType.MOVE_DOWN, ActionType.PRESS_A}
+    assert first.planner_source == "dialogue_controller"
+    assert first.action.action == ActionType.PRESS_A
     assert second.planner_source in {"auto_candidate", "fallback", "llm"}
     assert emulator.state.metadata["selected"] in {"YES", "NO"}
 
@@ -1146,7 +1146,7 @@ def test_runner_skips_llm_for_plain_dialogue_text():
 
     assert llm.calls == 1
     assert result.llm_attempted is True
-    assert result.planner_source == "auto_candidate"
+    assert result.planner_source == "dialogue_controller"
     assert result.action.action == ActionType.PRESS_A
 
 

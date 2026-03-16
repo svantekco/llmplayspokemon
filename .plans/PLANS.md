@@ -568,15 +568,24 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 
 ## Progress log
 
-*(initialized empty — update during implementation)*
+- 2026-03-16: Implemented Phase 2 controller replacements for `TEXT`, `MENU`, `BATTLE`, and `CUTSCENE`.
+- 2026-03-16: Wired the mode dispatcher to use real deterministic controllers for non-overworld modes while keeping overworld/unknown on the existing stub-to-engine path.
+- 2026-03-16: Removed `engine.py` candidate-building branches for text, menu, and battle so the legacy candidate pipeline is now overworld-only.
+- 2026-03-16: Added controller-focused regression coverage for dialogue, menu, cutscene, battle, and updated engine expectations for the new planner sources.
+- 2026-03-16: Verified the phase-2-focused slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_mode_dispatcher.py tests/test_dialogue_controller.py tests/test_menu_controller.py tests/test_cutscene_controller.py tests/test_battle_controller.py tests/test_engine.py -q -s` (69 passed).
 
 ## Decision log
 
-*(initialized empty — update during implementation)*
+- 2026-03-16: Kept `MenuManager` as a deterministic helper under `MenuController` instead of rewriting menu intent detection in one pass. This preserves existing HM/start-menu heuristics while removing the LLM from menu turns.
+- 2026-03-16: Added battle strategy caching in `BattleController` keyed to the current opposing Pokemon (`kind/species/level`) so per-turn battle execution stays deterministic and LLM usage is capped to strategy refresh points.
+- 2026-03-16: Treated trivial wild encounters as heuristic-only in `BattleController`; they now skip battle-strategy LLM calls entirely and use deterministic run/attack behavior.
+- 2026-03-16: Moved objective-planner metadata attachment up to the dispatcher path in `engine.py` so deterministic controllers still surface objective-planner telemetry when they do not make their own LLM call.
 
 ## Discoveries / surprises log
 
-*(initialized empty — update during implementation)*
+- 2026-03-16: Battle submenu tracking must be updated after computing the next action, not before; pre-setting the submenu caused main-menu coordinates to be misread as bag/fight cursor positions.
+- 2026-03-16: Pytest capture is unstable in this environment unless `TMPDIR=/tmp` is set and stdout capture is disabled (`-s`), so verification commands for this milestone were run that way.
+- 2026-03-16: The broader suite still has unrelated red tests in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`. Those failures were present outside the phase-2 controller slice and were left out of scope for this milestone.
 
 ## Appendix: file-by-file change map
 

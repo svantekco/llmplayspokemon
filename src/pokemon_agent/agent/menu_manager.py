@@ -54,6 +54,10 @@ class MenuManager:
         self._last_menu_type: str | None = None
         self._runtime: dict[str, CandidateRuntime] = {}
 
+    def reset(self) -> None:
+        self._last_menu_type = None
+        self._runtime = {}
+
     def build_candidates(
         self,
         state: StructuredGameState,
