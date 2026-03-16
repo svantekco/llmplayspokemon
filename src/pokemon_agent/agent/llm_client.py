@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -27,15 +28,32 @@ class CompletionResponse:
     usage: LLMUsage | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RequestStatus:
+    phase: str
+    detail: str | None = None
+
+
 class OpenRouterClient:
     def __init__(self, config: OpenRouterConfig) -> None:
         self.config = config
         self._last_request_started_at: float | None = None
+        self._request_status: RequestStatus | None = None
+        self._request_status_lock = threading.Lock()
+
+    def snapshot_request_status(self) -> RequestStatus | None:
+        with self._request_status_lock:
+            return self._request_status
+
+    def clear_request_status(self) -> None:
+        with self._request_status_lock:
+            self._request_status = None
 
     def complete(self, messages: list[dict]) -> CompletionResponse:
         if not self.config.api_key:
             raise RuntimeError("OPENROUTER_API_KEY is missing")
 
+        self._set_request_status("Preparing request", f"{len(messages)} message(s)")
         payload = {
             "model": self.config.model,
             "messages": messages,
@@ -48,9 +66,11 @@ class OpenRouterClient:
         }
         url = f"{self.config.base_url}/chat/completions"
         last_error: Exception | None = None
-        for _ in range(self.config.max_retries + 1):
+        total_attempts = self.config.max_retries + 1
+        for attempt_index in range(total_attempts):
             try:
                 self._wait_for_min_interval()
+                self._set_request_status("Sending request", self.config.model)
                 data = self._post_json(url, payload, headers)
                 content = data["choices"][0]["message"]["content"]
                 usage_data = data.get("usage") or {}
@@ -59,6 +79,7 @@ class OpenRouterClient:
                     completion_tokens=usage_data.get("completion_tokens"),
                     total_tokens=usage_data.get("total_tokens"),
                 )
+                self._set_request_status("Received response", data.get("model") or self.config.model)
                 if isinstance(content, list):
                     text_parts = [part.get("text", "") for part in content if isinstance(part, dict)]
                     return CompletionResponse(
@@ -69,6 +90,14 @@ class OpenRouterClient:
                 return CompletionResponse(content=str(content).strip(), model=data.get("model"), usage=usage)
             except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
                 last_error = exc
+                if attempt_index + 1 < total_attempts:
+                    next_attempt = attempt_index + 2
+                    self._set_request_status(
+                        "Retrying after error",
+                        f"{type(exc).__name__} (attempt {next_attempt}/{total_attempts})",
+                    )
+                else:
+                    self._set_request_status("Request failed", type(exc).__name__)
         raise RuntimeError(f"OpenRouter completion failed: {last_error}") from last_error
 
     def _wait_for_min_interval(self) -> None:
@@ -80,9 +109,14 @@ class OpenRouterClient:
             elapsed = now - self._last_request_started_at
             remaining = self.config.min_request_interval_seconds - elapsed
             if remaining > 0:
+                self._set_request_status("Waiting for rate limit", f"{remaining:.1f}s")
                 time.sleep(remaining)
                 now += remaining
         self._last_request_started_at = now
+
+    def _set_request_status(self, phase: str, detail: str | None = None) -> None:
+        with self._request_status_lock:
+            self._request_status = RequestStatus(phase=phase, detail=detail)
 
     def _post_json(self, url: str, payload: dict, headers: dict) -> dict:
         if httpx is not None:

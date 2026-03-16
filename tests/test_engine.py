@@ -549,6 +549,24 @@ class _BadLLM:
         return CompletionResponse(content="not json", model="fake")
 
 
+def test_runner_reports_activity_updates_during_turn():
+    emulator = MockEmulatorAdapter()
+    _setup_overworld_walk(emulator)
+    runner = _build_runner(emulator)
+    activity_log: list[tuple[str, str | None]] = []
+    runner.set_activity_callback(lambda phase, detail: activity_log.append((phase, detail)))
+
+    result = runner.run_turn(1)
+
+    phases = [phase for phase, _ in activity_log]
+    assert result.turn_index == 1
+    assert "Planning turn" in phases
+    assert "Reading emulator state" in phases
+    assert "Evaluating candidates" in phases
+    assert "Executing action" in phases
+    assert phases[-1] == "Turn complete"
+
+
 def _build_runner(emulator, llm_client=None):
     return ClosedLoopRunner(
         emulator=emulator,
@@ -931,8 +949,15 @@ def test_runner_auto_selects_when_one_candidate_dominates():
     assert result.action.action == ActionType.MOVE_DOWN
 
 
-def test_runner_uses_llm_for_opening_get_starter_objective():
+def test_runner_waits_until_reds_house_2f_before_forcing_opening_llm():
     emulator = MockEmulatorAdapter()
+    runner = _build_runner(emulator, llm_client=_ChooseCandidateLLM())
+
+    assert runner._should_force_opening_objective_llm(emulator.get_structured_state()) is False
+
+
+def test_runner_uses_llm_for_first_controllable_reds_house_2f_turn():
+    emulator = _HouseConnectorMock()
     llm = _CaptureMilestoneLLM()
     runner = _build_runner(emulator, llm_client=llm)
 
@@ -945,13 +970,15 @@ def test_runner_uses_llm_for_opening_get_starter_objective():
     assert llm.current_milestone["id"] == "get_starter"
     assert llm.current_milestone["target_map"] == "Oak's Lab"
     assert "Professor Oak" in llm.current_milestone["description"]
+    assert result.before.map_name == "Red's House 2F"
 
 
-def test_runner_uses_llm_immediately_after_bootstrap_even_with_prior_llm_calls():
-    emulator = MockEmulatorAdapter()
+def test_runner_uses_llm_immediately_after_bootstrap_when_player_reaches_reds_house_2f():
+    emulator = _HouseConnectorMock()
     llm = _CaptureMilestoneLLM()
     runner = _build_runner(emulator, llm_client=llm)
     runner.telemetry.llm_calls = 4
+    runner.telemetry.turns = 12
     runner.context_manager.action_traces.append(
         ActionTrace(
             turn_index=1,
@@ -1660,6 +1687,60 @@ def test_engine_reroutes_after_failed_first_step_with_temporary_blocker() -> Non
     second = runner.executor.step(state)
     assert second.action is not None
     assert second.action.action == ActionType.MOVE_RIGHT
+
+
+def test_engine_static_explicit_stair_warp_is_not_treated_as_boundary_push() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    connector = runner._static_connector_by_id("static:REDS_HOUSE_1F:7:1")
+
+    assert connector is not None
+    assert connector.activation_mode == "step_on"
+    assert connector.approach_x is None
+    assert connector.approach_y is None
+    assert connector.transition_action is None
+
+    navigation = build_navigation_snapshot_from_tiles(
+        width=8,
+        height=8,
+        player_x=3,
+        player_y=6,
+        blocked_tiles=[],
+        collision_hash="open-room",
+    )
+    state = StructuredGameState(
+        map_name="Red's House 2F",
+        map_id=0x26,
+        x=3,
+        y=6,
+        facing="LEFT",
+        mode=GameMode.OVERWORLD,
+        step=100,
+        navigation=navigation,
+    )
+    task = Task(
+        kind=TaskKind.ENTER_CONNECTOR,
+        connector_id="static:REDS_HOUSE_1F:7:1",
+        target_x=7,
+        target_y=1,
+        reason="walk to stairs",
+    )
+
+    first = runner.executor.begin(task, state)
+
+    assert first.status == ExecutorStatus.STEPPING
+    assert first.action is not None
+    assert first.blocked_reason is None
+
+
+def test_engine_static_last_map_exit_stays_boundary_push() -> None:
+    runner = _build_runner(MockEmulatorAdapter())
+    connector = runner._static_connector_by_id("static:PALLET_TOWN:2:7")
+
+    assert connector is not None
+    assert connector.activation_mode == "push"
+    assert connector.approach_x == 2
+    assert connector.approach_y == 7
+    assert connector.transition_action == ActionType.MOVE_DOWN
 
 
 def test_engine_planner_transition_routing_respects_executor_blocked_tiles() -> None:

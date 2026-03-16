@@ -251,6 +251,7 @@ def run_args(args: argparse.Namespace) -> None:
             target_turns=turns,
             checkpoint_dir=args.checkpoint_dir,
         )
+        runner.set_activity_callback(dashboard.set_activity)
     def _request_stop() -> None:
         if dashboard is not None:
             dashboard.request_stop()
@@ -290,9 +291,16 @@ def run_args(args: argparse.Namespace) -> None:
             else:
                 _print_turn(result, args.log_mode)
             if overlay_writer is not None:
+                if dashboard is not None:
+                    dashboard.set_activity("Rendering debug overlay", f"Turn #{turn_index}")
                 overlay_writer.write_turn(result, runner.summary())
             if args.checkpoint_dir:
+                if dashboard is not None:
+                    checkpoint_label = Path(args.checkpoint_dir).name or args.checkpoint_dir
+                    dashboard.set_activity("Saving checkpoint", checkpoint_label)
                 runner.save_checkpoint(args.checkpoint_dir)
+            if dashboard is not None:
+                dashboard.set_activity("Waiting for next turn", f"Ready for turn #{turn_index + 1}")
             turn_index += 1
             if interrupt_controller.shutdown_requested:
                 interrupted = True

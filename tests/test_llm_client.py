@@ -95,3 +95,33 @@ def test_openrouter_client_uses_urllib_when_httpx_missing(monkeypatch):
     assert response.model == "fake-model"
     assert response.usage is not None
     assert response.usage.total_tokens == 15
+
+
+def test_openrouter_client_tracks_request_status(monkeypatch):
+    snapshots = []
+    tracked_client = None
+
+    class _ObservedClient(_FakeClient):
+        def post(self, url: str, json: dict, headers: dict) -> _FakeResponse:
+            assert tracked_client is not None
+            snapshots.append(tracked_client.snapshot_request_status())
+            return super().post(url, json, headers)
+
+    monkeypatch.setattr(llm_client_module, "httpx", types.SimpleNamespace(Client=_ObservedClient))
+
+    tracked_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key="test-key",
+            min_request_interval_seconds=0.0,
+            max_retries=0,
+        )
+    )
+
+    response = tracked_client.complete([{"role": "user", "content": "hello"}])
+
+    assert response.model == "fake-model"
+    assert snapshots
+    assert snapshots[0] is not None
+    assert snapshots[0].phase == "Sending request"
+    assert tracked_client.snapshot_request_status() is not None
+    assert tracked_client.snapshot_request_status().phase == "Received response"

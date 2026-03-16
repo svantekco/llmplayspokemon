@@ -14,7 +14,7 @@ from pokemon_agent.emulator.mock import MockEmulatorAdapter
 from pokemon_agent.models.action import ActionDecision, ActionType
 from pokemon_agent.models.events import EventRecord, EventType
 from pokemon_agent.models.state import GameMode, InventoryItem, NavigationSnapshot, PartyMember, StructuredGameState, WorldCoordinate
-from pokemon_agent.ui.terminal_dashboard import TerminalDashboard
+from pokemon_agent.ui.terminal_dashboard import ActivityRecord, TerminalDashboard
 
 
 def test_dashboard_renders_state_turns_and_llm_details():
@@ -99,6 +99,15 @@ def test_dashboard_renders_state_turns_and_llm_details():
         "pathfinding_next_hop_kind": "boundary",
     }
     dashboard.status = "Running"
+    dashboard.set_activity(
+        "Waiting for LLM response",
+        "turn planner | model openai/gpt-5-mini",
+        refresh=False,
+    )
+    dashboard.activity_history = [
+        ActivityRecord(phase="Building planner prompt", note="3 option(s)", duration_seconds=0.4),
+        ActivityRecord(phase="Preparing LLM request", note="turn planner", duration_seconds=0.2),
+    ]
 
     console.print(dashboard.render())
     rendered = console.export_text()
@@ -117,6 +126,8 @@ def test_dashboard_renders_state_turns_and_llm_details():
     assert "Step onto the north exit tile." in rendered
     assert "Leave Pallet Town and head toward Route 1." in rendered
     assert "Reach Viridian City and continue the opening route." in rendered
+    assert "Waiting for LLM response" in rendered
+    assert "Building planner prompt" in rendered
     assert "Planner Payload" not in rendered
 
 
@@ -202,6 +213,44 @@ def test_dashboard_shows_fallback_note_when_no_llm_call():
 
     assert "No network call was made" in rendered
     assert "auto" in rendered or "skip" in rendered
+
+
+def test_dashboard_renders_current_activity_panel_details():
+    console = Console(record=True, width=140, height=80)
+    dashboard = TerminalDashboard(
+        planner="llm",
+        continuous=False,
+        target_turns=3,
+        console=console,
+    )
+    dashboard.status = "Running"
+    dashboard.summary = {
+        "turns": 1,
+        "fallback_turns": 0,
+        "executor_turns": 0,
+        "auto_selected_turns": 1,
+        "prompt_chars": 120,
+        "approx_prompt_tokens": 30,
+        "llm_prompt_tokens": 20,
+        "llm_completion_tokens": 10,
+        "llm_total_tokens": 30,
+        "llm_calls": 1,
+        "turns_per_call": 1.0,
+        "objective_switch_rate": 0.0,
+    }
+    dashboard.activity_phase = "Saving checkpoint"
+    dashboard.activity_note = "session_001"
+    dashboard.activity_history = [
+        ActivityRecord(phase="Turn complete", note="#1 movement_success", duration_seconds=0.3),
+        ActivityRecord(phase="Rendering debug overlay", note="Turn #1", duration_seconds=0.1),
+    ]
+
+    console.print(dashboard.render())
+    rendered = console.export_text()
+
+    assert "Saving checkpoint" in rendered
+    assert "session_001" in rendered
+    assert "Rendering debug overlay" in rendered
 
 
 def _build_runner(emulator: MockEmulatorAdapter):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from rich import box
@@ -16,6 +18,13 @@ from rich.text import Text
 from pokemon_agent.agent.engine import TurnResult
 from pokemon_agent.emulator.screen_renderer import build_ascii_map
 from pokemon_agent.models.state import StructuredGameState
+
+
+@dataclass(slots=True)
+class ActivityRecord:
+    phase: str
+    note: str | None
+    duration_seconds: float
 
 
 class TerminalDashboard:
@@ -42,8 +51,15 @@ class TerminalDashboard:
         self.status_note: str | None = None
         self.resume_path: str | None = None
         self.resume_turns = 0
+        self.activity_phase = "Initializing"
+        self.activity_note: str | None = "Booting dashboard"
+        self.activity_history: list[ActivityRecord] = []
+        self._activity_started_at = time.monotonic()
         self._live: Live | None = None
         self._live_enabled = bool(self.console.is_terminal and not getattr(self.console, "is_dumb_terminal", False))
+
+    def __rich__(self) -> Layout:
+        return self.render()
 
     def record_resume(self, resume_path: str, completed_turns: int) -> None:
         self.resume_path = resume_path
@@ -53,9 +69,13 @@ class TerminalDashboard:
         self.current_state = initial_state
         self.summary = summary or {}
         self.status = "Running"
+        self.activity_phase = "Waiting for next turn"
+        self.activity_note = "Ready to plan the first turn"
+        self.activity_history = []
+        self._activity_started_at = time.monotonic()
         if self._live_enabled and self._live is None:
             self._live = Live(
-                self.render(),
+                self,
                 console=self.console,
                 refresh_per_second=4,
                 transient=False,
@@ -71,11 +91,15 @@ class TerminalDashboard:
         self.turn_history = self.turn_history[-self.history_limit :]
         self.summary = summary
         self.status = "Running"
-        if self._live is not None:
-            self._refresh()
+        self.set_activity("Turn complete", f"#{result.turn_index} {result.progress.classification}")
 
     def finish(self, interrupted: bool = False) -> None:
         self.status = "Interrupted" if interrupted else "Stopped"
+        self.set_activity(
+            "Interrupted" if interrupted else "Stopped",
+            "Run halted before the next turn." if interrupted else "Run finished cleanly.",
+            refresh=False,
+        )
         if self._live is not None:
             self._refresh()
             self._live.stop()
@@ -86,20 +110,40 @@ class TerminalDashboard:
     def request_stop(self) -> None:
         self.status = "Stopping"
         self.status_note = "Press Ctrl+C again to save immediately and exit."
-        if self._live is not None:
+        self.set_activity("Stop requested", "Waiting for the current turn to finish.")
+
+    def set_activity(self, phase: str, note: str | None = None, *, refresh: bool = True) -> None:
+        now = time.monotonic()
+        phase_changed = phase != self.activity_phase
+        note_changed = note != self.activity_note
+        if phase_changed:
+            elapsed = max(0.0, now - self._activity_started_at)
+            if self.activity_phase:
+                self.activity_history.append(
+                    ActivityRecord(
+                        phase=self.activity_phase,
+                        note=self.activity_note,
+                        duration_seconds=elapsed,
+                    )
+                )
+                self.activity_history = self.activity_history[-4:]
+            self.activity_phase = phase
+            self._activity_started_at = now
+        self.activity_note = note
+        if refresh and (phase_changed or note_changed):
             self._refresh()
 
     def render(self) -> Layout:
         layout = Layout(name="root")
         layout.split_column(
-            Layout(name="top", size=16),
+            Layout(name="top", size=18),
             Layout(name="turns", ratio=1, minimum_size=6),
             Layout(name="llm", ratio=2, minimum_size=12),
         )
         layout["top"].split_row(
             Layout(name="state"),
             Layout(name="pathfinding_route", size=34),
-            Layout(name="status", size=44),
+            Layout(name="status", size=48),
         )
         layout["state"].update(self._render_current_state())
         layout["pathfinding_route"].update(self._render_pathfinding_route())
@@ -109,11 +153,10 @@ class TerminalDashboard:
         return layout
 
     def _refresh(self) -> None:
-        renderable = self.render()
         if self._live is not None:
-            self._live.update(renderable, refresh=True)
+            self._live.update(self, refresh=True)
             return
-        self.console.print(renderable)
+        self.console.print(self.render())
 
     def _render_current_state(self) -> Panel:
         if self.current_state is None:
@@ -182,25 +225,47 @@ class TerminalDashboard:
         table.add_row("Status", self.status)
         if self.status_note:
             table.add_row("Note", self.status_note)
+        table.add_row("Phase", self.activity_phase)
+        if self.activity_note:
+            table.add_row("Detail", self._truncate_inline(self.activity_note, 90))
+        table.add_row("Phase For", self._format_duration(max(0.0, time.monotonic() - self._activity_started_at)))
         table.add_row("Planner", self.planner)
         table.add_row("Turns", turn_progress)
-        table.add_row("Fallback", str(self.summary.get("fallback_turns", 0)))
-        table.add_row("Executor", str(self.summary.get("executor_turns", 0)))
-        table.add_row("Auto Select", str(self.summary.get("auto_selected_turns", 0)))
+        table.add_row(
+            "Planner Mix",
+            (
+                f"fb {self.summary.get('fallback_turns', 0)} | "
+                f"exec {self.summary.get('executor_turns', 0)} | "
+                f"auto {self.summary.get('auto_selected_turns', 0)}"
+            ),
+        )
         prompt_chars = self.summary.get("prompt_chars", 0)
         prompt_tokens = self.summary.get("approx_prompt_tokens", 0)
         table.add_row("Prompt", f"{prompt_chars} chars | ~{prompt_tokens} tokens")
         llm_prompt = self.summary.get("llm_prompt_tokens", 0)
         llm_completion = self.summary.get("llm_completion_tokens", 0)
         llm_total = self.summary.get("llm_total_tokens", 0)
-        table.add_row("LLM Tokens", f"in {llm_prompt} | out {llm_completion} | total {llm_total}")
-        table.add_row("LLM Calls", str(self.summary.get("llm_calls", 0)))
-        table.add_row("Turns/Call", str(self.summary.get("turns_per_call", "n/a")))
-        table.add_row("Obj Switch", str(self.summary.get("objective_switch_rate", 0.0)))
+        table.add_row(
+            "LLM",
+            (
+                f"calls {self.summary.get('llm_calls', 0)} | "
+                f"in {llm_prompt} | out {llm_completion} | total {llm_total}"
+            ),
+        )
+        table.add_row(
+            "Rates",
+            (
+                f"turns/call {self.summary.get('turns_per_call', 'n/a')} | "
+                f"obj switch {self.summary.get('objective_switch_rate', 0.0)}"
+            ),
+        )
         if self.resume_path:
             table.add_row("Resumed", f"{self.resume_turns} turns from {self._tail_path(self.resume_path)}")
         if self.checkpoint_dir:
             table.add_row("Session", self._tail_path(self.checkpoint_dir))
+        recent_activity = self._render_recent_activity()
+        if recent_activity is not None:
+            table.add_row("Recent", recent_activity)
         if self.latest_turn is not None:
             table.add_row(
                 "Last Turn",
@@ -244,6 +309,17 @@ class TerminalDashboard:
             )
         subtitle = f"showing last {len(self.turn_history)} turn(s)"
         return Panel(table, title="Turn History", subtitle=subtitle, border_style="green")
+
+    def _render_recent_activity(self) -> Text | None:
+        if not self.activity_history:
+            return None
+        lines = []
+        for item in self.activity_history[-2:]:
+            line = f"{item.phase} ({self._format_duration(item.duration_seconds)})"
+            if item.note:
+                line = f"{line}: {self._truncate_inline(item.note, 44)}"
+            lines.append(line)
+        return Text("\n".join(lines), style="dim")
 
     def _render_llm_calls(self) -> Panel:
         if self.latest_turn is None:
@@ -336,6 +412,15 @@ class TerminalDashboard:
         path_obj = Path(path)
         tail = path_obj.parts[-parts:]
         return str(Path(*tail))
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 10:
+            return f"{seconds:.1f}s"
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes, remainder = divmod(int(seconds), 60)
+        return f"{minutes}m {remainder:02d}s"
 
     @staticmethod
     def _truncate_inline(value: str, limit: int) -> str:

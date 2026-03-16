@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import concurrent.futures
 import copy
 import json
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING
 from pokemon_agent.agent.battle_manager import BattleManager
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.executor import Executor
-from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRouterClient
+from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRouterClient, RequestStatus
 from pokemon_agent.agent.menu_manager import MenuManager
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.navigation import advance_position
@@ -247,6 +248,7 @@ class ClosedLoopRunner:
         self._interaction_cooldown: int = 20
         self._temporary_blocked_tiles: dict[tuple[str | int, int, int], int] = {}
         self._temporary_blocked_ttl: int = 6
+        self._activity_callback: Callable[[str, str | None], None] | None = None
 
     _OPPOSITE_DIRECTION: dict[str, str] = {
         "north": "south",
@@ -255,9 +257,19 @@ class ClosedLoopRunner:
         "west": "east",
     }
 
+    def set_activity_callback(self, callback: Callable[[str, str | None], None] | None) -> None:
+        self._activity_callback = callback
+
+    def _report_activity(self, phase: str, detail: str | None = None) -> None:
+        if self._activity_callback is None:
+            return
+        self._activity_callback(phase, detail)
+
     def run_turn(self, turn_index: int) -> TurnResult:
+        self._report_activity("Planning turn", f"Turn #{turn_index}")
         self._prune_temporary_blocked_tiles(turn_index)
         before, planning = self._resolve_turn_plan()
+        self._report_activity("Capturing frame", f"Turn #{turn_index}")
         screen_image = self.emulator.capture_screen_image()
         navigation_goal_snapshot = copy.deepcopy(self.memory.memory.long_term.navigation_goal)
         objective_plan_snapshot = copy.deepcopy(self.memory.memory.long_term.objective_plan)
@@ -266,12 +278,15 @@ class ClosedLoopRunner:
         if planning.action is None:
             raise RuntimeError("Planning did not yield an executable action")
         action = self.validator.validate(planning.action, before)
+        self._report_activity("Executing action", f"{action.action.value} x{action.repeat}")
         self.emulator.set_live_path_overlay(before, planning.suggested_path)
         try:
             self.emulator.execute_action(action)
         finally:
             self.emulator.clear_live_path_overlay()
+        self._report_activity("Reading new state", f"Turn #{turn_index}")
         after = self.emulator.get_structured_state()
+        self._report_activity("Summarizing turn", f"{before.map_name} -> {after.map_name}")
         progress_result = self.progress.compare(before, after)
         stuck_state = self.stuck.update(after, action, progress_result.classification, progress_result)
         # Track entry direction on map change, and clear interaction cooldown on new map.
@@ -351,6 +366,7 @@ class ClosedLoopRunner:
         )
         self.telemetry.register_turn(turn_result)
         self.completed_turns = max(self.completed_turns, turn_index)
+        self._report_activity("Turn complete", f"Turn #{turn_index} {progress_result.classification}")
         return turn_result
 
     def run(self, turns: int) -> list[TurnResult]:
@@ -359,11 +375,13 @@ class ClosedLoopRunner:
     def _resolve_turn_plan(self) -> tuple[StructuredGameState, PlanningResult]:
         blocked_reasons: list[str] = []
         latest_state: StructuredGameState | None = None
-        for _ in range(8):
+        for attempt_index in range(8):
+            self._report_activity("Reading emulator state", f"Planning attempt {attempt_index + 1}/8")
             state = self.emulator.get_structured_state()
             latest_state = state
             if self.executor.is_active():
                 task_snapshot = self.executor.current_task()
+                self._report_activity("Continuing executor task", self._describe_task(task_snapshot))
                 step = self.executor.step(state)
                 if step.status == ExecutorStatus.STEPPING:
                     return state, PlanningResult(
@@ -398,6 +416,7 @@ class ClosedLoopRunner:
                 planning.planner_source = "fallback"
                 return live_state, planning
 
+            self._report_activity("Starting executor task", self._describe_task(planning.task))
             step = self.executor.begin(planning.task, live_state, follow_up_task=planning.follow_up_task)
             planning.executor_task = planning.task.model_copy(deep=True)
             if step.status == ExecutorStatus.STEPPING:
@@ -419,6 +438,7 @@ class ClosedLoopRunner:
         fallback_state = latest_state or self.emulator.get_structured_state()
         blocked_reason = blocked_reasons[-1] if blocked_reasons else "planner retry budget exhausted"
         fallback_reason = f"planner retry exhaustion: {blocked_reason}"
+        self._report_activity("Using fallback planner", fallback_reason)
         fallback = self.validator.fallback(fallback_state, self.stuck.state, fallback_reason)
         result = PlanningResult(
             action=self.validator.validate(fallback, fallback_state),
@@ -435,15 +455,19 @@ class ClosedLoopRunner:
         self._objective_plan_llm_attempted = False
         self._objective_plan_llm_model = None
         if state.is_bootstrap():
+            self._report_activity("Handling bootstrap", state.bootstrap_phase() or "deterministic startup")
             self.executor.abort()
             self.memory.memory.long_term.objective_plan = None
             action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
             return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
 
+        self._report_activity("Refreshing objectives", state.map_name)
         observe_state(self.memory.memory.long_term.world_map, state)
         self._ensure_objective_plan(state)
         if state.text_box_open or state.menu_open or state.battle_state is not None:
+            self._report_activity("Handling interrupt state", state.mode.value)
             return self._plan_interrupt_action(state)
+        self._report_activity("Building candidates", state.map_name)
         candidates = self._build_candidate_steps(state)
         return self._plan_candidates(state, candidates)
 
@@ -456,6 +480,7 @@ class ClosedLoopRunner:
         state: StructuredGameState,
         candidates: list[CandidateNextStep],
     ) -> PlanningResult:
+        self._report_activity("Evaluating candidates", f"{len(candidates)} option(s)")
         if not candidates:
             fallback = self.validator.fallback(state, self.stuck.state, "fallback without usable candidates")
             result = PlanningResult(action=self.validator.validate(fallback, state), used_fallback=True, planner_source="fallback")
@@ -465,6 +490,7 @@ class ClosedLoopRunner:
         recommended = candidates[0]
         force_opening_objective_llm = self._should_force_opening_objective_llm(state)
         if self._should_auto_select(candidates) and not force_opening_objective_llm:
+            self._report_activity("Auto-selecting candidate", recommended.id)
             compiled = self._compile_candidate(recommended, state, self._short_reason(recommended))
             if compiled is not None:
                 return self._with_objective_planner_metadata(
@@ -484,10 +510,12 @@ class ClosedLoopRunner:
             candidate_next_steps=candidates,
             candidate_runtime=self._candidate_runtime,
         )
+        self._report_activity("Building planner prompt", f"{len(candidates)} option(s)")
         messages = build_messages(snapshot)
         prompt_metrics = measure_prompt(messages, snapshot)
 
         if self.llm_client is None:
+            self._report_activity("Using fallback planner", "LLM disabled")
             result = self._fallback_from_candidates(
                 state,
                 recommended,
@@ -500,7 +528,7 @@ class ClosedLoopRunner:
             return self._with_objective_planner_metadata(result)
 
         try:
-            raw_response = self._complete_with_window_pump(messages)
+            raw_response = self._complete_with_window_pump(messages, purpose="turn planner")
             decision = self._parse_planner_decision(raw_response.content)
             chosen = self._resolve_candidate(decision, candidates) or recommended
             live_state = self.emulator.get_structured_state()
@@ -561,6 +589,7 @@ class ClosedLoopRunner:
         reason = self._objective_plan_replan_reason(state)
         if reason is None:
             return
+        self._report_activity("Refreshing objective plan", reason)
         milestone = self._current_milestone_for_state(state)
         existing_plan = self.memory.memory.long_term.objective_plan
         if (
@@ -584,7 +613,7 @@ class ClosedLoopRunner:
             self._objective_plan_messages = messages
             self._objective_plan_prompt_metrics = measure_prompt(messages, snapshot)
             self._objective_plan_llm_attempted = True
-            response = self._complete_with_window_pump(messages)
+            response = self._complete_with_window_pump(messages, purpose="objective planner")
             self._objective_plan_llm_usage = response.usage
             self._objective_plan_llm_model = response.model
             plan = self._parse_objective_plan(response.content)
@@ -791,18 +820,74 @@ class ClosedLoopRunner:
             candidates=list(candidates or [recommended]),
         )
 
-    def _complete_with_window_pump(self, messages: list[dict]) -> CompletionResponse:
+    def _complete_with_window_pump(self, messages: list[dict], *, purpose: str) -> CompletionResponse:
         emulator = self.emulator
         assert self.llm_client is not None
+        self._clear_llm_request_status()
+        self._report_activity("Preparing LLM request", f"{purpose} ({len(messages)} message(s))")
         emulator.begin_planning_wait()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(self.llm_client.complete, messages)
+                last_status: tuple[str, str | None] | None = None
                 while not future.done():
                     emulator.pump_planning_wait()
+                    request_status = self._snapshot_llm_request_status()
+                    status = self._format_llm_activity(request_status, purpose)
+                    if status != last_status:
+                        self._report_activity(*status)
+                        last_status = status
+                request_status = self._snapshot_llm_request_status()
+                status = self._format_llm_activity(request_status, purpose)
+                if status != last_status:
+                    self._report_activity(*status)
+                if future.exception() is None:
+                    self._report_activity("Parsing LLM response", purpose)
                 return future.result()
         finally:
+            self._clear_llm_request_status()
             emulator.end_planning_wait()
+
+    @staticmethod
+    def _describe_task(task: Task | None) -> str | None:
+        if task is None:
+            return None
+        if task.reason:
+            return f"{task.kind.value}: {task.reason}"
+        return task.kind.value
+
+    def _clear_llm_request_status(self) -> None:
+        if self.llm_client is None:
+            return
+        clear = getattr(self.llm_client, "clear_request_status", None)
+        if callable(clear):
+            clear()
+
+    def _snapshot_llm_request_status(self) -> RequestStatus | None:
+        if self.llm_client is None:
+            return None
+        snapshot = getattr(self.llm_client, "snapshot_request_status", None)
+        if not callable(snapshot):
+            return None
+        return snapshot()
+
+    @staticmethod
+    def _format_llm_activity(status: RequestStatus | None, purpose: str) -> tuple[str, str | None]:
+        if status is None:
+            return ("Waiting for LLM response", purpose)
+        if status.phase == "Preparing request":
+            return ("Preparing LLM request", f"{purpose} | {status.detail}")
+        if status.phase == "Waiting for rate limit":
+            return ("Waiting for LLM rate limit", f"{purpose} | {status.detail}")
+        if status.phase == "Sending request":
+            return ("Waiting for LLM response", f"{purpose} | model {status.detail}")
+        if status.phase == "Received response":
+            return ("Parsing LLM response", f"{purpose} | {status.detail}")
+        if status.phase == "Retrying after error":
+            return ("Retrying LLM request", f"{purpose} | {status.detail}")
+        if status.phase == "Request failed":
+            return ("LLM request failed", f"{purpose} | {status.detail}")
+        return (status.phase, status.detail)
 
     def save_checkpoint(self, directory: str | Path) -> Path:
         checkpoint_dir = Path(directory)
@@ -1785,11 +1870,11 @@ class ClosedLoopRunner:
             return None
         # When the warp tile itself is walkable (e.g. a door mat or stair
         # landing), we can navigate directly onto it — stepping on it triggers
-        # the warp.  We still check cardinal-approach tiles first so the engine
-        # keeps the correct exit direction for oscillating door mats (MOVE_DOWN
-        # preferred), but if none of those work we fall back to direct
-        # navigation onto the warp tile itself.
+        # the warp. South-edge exits benefit from preferring a downward entry,
+        # but interior staircases often sit on east/west room boundaries, so
+        # keep those free to use the shortest adjacent approach instead.
         source_is_walkable = nav_grid.is_walkable(source_x, source_y)
+        prefer_downward_entry = bool(source_is_walkable and source_y >= state.navigation.max_y)
         best: tuple[tuple[int, int, str], tuple[int, int, ActionType, int]] | None = None
         for move_action, dx, dy in (
             (ActionType.MOVE_UP, 0, -1),
@@ -1805,9 +1890,8 @@ class ClosedLoopRunner:
             if route is None:
                 continue
             distance = len(route)
-            # Penalise non-south approaches for walkable warps (doors).
             direction_penalty = 0
-            if source_is_walkable and move_action != ActionType.MOVE_DOWN:
+            if prefer_downward_entry and move_action != ActionType.MOVE_DOWN:
                 direction_penalty = 100
             payload = (approach_x, approach_y, move_action, distance)
             rank = (distance + direction_penalty, direction_penalty, move_action.value)
@@ -2256,12 +2340,22 @@ class ClosedLoopRunner:
         )
         if milestone.id != "get_starter":
             return False
-        return self.telemetry.llm_calls == 0 or self._just_exited_bootstrap()
+        if not map_matches(state.map_name, "Red's House 2F"):
+            return False
+        if self._just_exited_bootstrap():
+            return True
+        return self.telemetry.turns == 0 and not self._has_seen_known_location("Red's House 2F")
 
     def _just_exited_bootstrap(self) -> bool:
         if not self.context_manager.action_traces:
             return False
         return self.context_manager.action_traces[-1].planner_source == "bootstrap"
+
+    def _has_seen_known_location(self, target_map_name: str) -> bool:
+        return any(
+            map_matches(known_map_name, target_map_name)
+            for known_map_name in self.memory.memory.long_term.known_locations.values()
+        )
 
     def _compile_candidate(
         self,
@@ -2434,6 +2528,12 @@ class ClosedLoopRunner:
     def _static_warp_boundary_side(self, edge: WorldGraphEdge) -> str | None:
         if edge.x is None or edge.y is None:
             return None
+        # Only preserve boundary-push semantics for "return to LAST_MAP"-style
+        # exits. Explicit warps can legitimately sit on a room edge (stairs,
+        # ladders), and treating them as boundary pushes makes the executor aim
+        # for the unreachable warp tile instead of its approach tile.
+        if not self._static_warp_uses_boundary_push(edge):
+            return None
         graph_map = self.static_world_graph.get_map_by_id(edge.source_symbol)
         if graph_map is None:
             return None
@@ -2448,6 +2548,9 @@ class ClosedLoopRunner:
         if edge.x <= 0:
             return "west"
         return None
+
+    def _static_warp_uses_boundary_push(self, edge: WorldGraphEdge) -> bool:
+        return edge.original_destination_symbol == "LAST_MAP" or edge.resolution_method == "last_map_proximity"
 
     def _static_connector_id(self, edge: WorldGraphEdge) -> str:
         return f"static:{edge.destination_symbol}:{edge.x}:{edge.y}"

@@ -433,6 +433,11 @@ class Executor:
     ) -> tuple[int, int, ActionType] | None:
         best: tuple[tuple[int, int, str], tuple[int, int, ActionType]] | None = None
         source_is_walkable = self._nav_grid.is_walkable(source_x, source_y)
+        prefer_downward_entry = bool(
+            source_is_walkable
+            and state.navigation is not None
+            and source_y >= state.navigation.max_y
+        )
         for action, dx, dy in (
             (ActionType.MOVE_UP, 0, -1),
             (ActionType.MOVE_RIGHT, 1, 0),
@@ -447,7 +452,7 @@ class Executor:
             if route is None:
                 continue
             direction_penalty = 0
-            if source_is_walkable and action != ActionType.MOVE_DOWN:
+            if prefer_downward_entry and action != ActionType.MOVE_DOWN:
                 direction_penalty = 100
             rank = (len(route) + direction_penalty, direction_penalty, action.value)
             if best is None or rank < best[0]:
