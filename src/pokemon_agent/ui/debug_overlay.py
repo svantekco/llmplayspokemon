@@ -274,11 +274,11 @@ class DebugOverlayWriter:
             )
             if goal.final_target_map_name and goal.final_target_map_name != goal.target_map_name:
                 lines.append(f"Final Target: {goal.final_target_map_name}")
-        if turn.objective_plan is not None:
+        if turn.objective is not None:
             lines.extend(
                 [
-                    f"Short Goal: {turn.objective_plan.human_plan.short_term_goal}",
-                    f"Strategy: {turn.objective_plan.human_plan.current_strategy}",
+                    f"Objective: {turn.objective.goal}",
+                    f"Strategy: {turn.objective.strategy}",
                 ]
             )
         for line in lines:

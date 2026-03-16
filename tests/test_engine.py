@@ -439,49 +439,13 @@ def _objective_plan_payload(payload: dict) -> dict:
     context = payload["context"]
     current_map = context.get("current_map", {}).get("name")
     current_milestone = context.get("current_milestone", {})
-    mode = context.get("mode")
-    if mode == "text":
-        internal_plan = {
-            "plan_type": "advance_dialogue",
-            "target_map_name": current_map,
-            "success_signal": "Dialogue changes or closes",
-            "stop_when": "text_box_open",
-            "confidence": 0.9,
-            "notes": "Text mode objective plan.",
-        }
-    elif mode == "menu":
-        internal_plan = {
-            "plan_type": "resolve_menu",
-            "target_map_name": current_map,
-            "success_signal": "Menu closes",
-            "confidence": 0.9,
-            "notes": "Menu mode objective plan.",
-        }
-    elif mode == "battle":
-        internal_plan = {
-            "plan_type": "battle_default",
-            "target_map_name": current_map,
-            "success_signal": "Battle ends or state changes",
-            "confidence": 0.9,
-            "notes": "Battle mode objective plan.",
-        }
-    else:
-        target_map = current_milestone.get("target_map") or current_map
-        internal_plan = {
-            "plan_type": "go_to_map",
-            "target_map_name": target_map,
-            "success_signal": f"Arrive at {target_map}",
-            "confidence": 0.9,
-            "notes": "Compiled by engine via connector table.",
-        }
+    target_map = current_milestone.get("target_map") or current_map
     return {
-        "human_plan": {
-            "short_term_goal": f"Move toward {internal_plan.get('target_map_name') or current_map}",
-            "mid_term_goal": current_milestone.get("next_hint") or f"Travel toward {internal_plan.get('target_map_name') or current_map}",
-            "long_term_goal": current_milestone.get("description") or f"Reach {internal_plan.get('target_map_name') or current_map}",
-            "current_strategy": "Keep navigation symbolic and let the engine choose the exact route.",
-        },
-        "internal_plan": internal_plan,
+        "goal": f"Move toward {target_map or current_map}",
+        "target_map": target_map,
+        "strategy": "Keep navigation symbolic and let the engine choose the exact route.",
+        "milestone_id": current_milestone.get("id"),
+        "confidence": 0.9,
     }
 
 
@@ -495,7 +459,7 @@ class _SlowCandidateLLM:
         from pokemon_agent.agent.llm_client import CompletionResponse
 
         payload = json.loads(messages[-1]["content"])
-        if "human_plan" in payload.get("response_schema", {}):
+        if "goal" in payload.get("response_schema", {}):
             return CompletionResponse(content=json.dumps(_objective_plan_payload(payload)), model="fake")
         candidate_id = payload["context"]["candidate_next_steps"][0]["id"]
         return CompletionResponse(content=json.dumps({"candidate_id": candidate_id, "reason": "test"}), model="fake")
@@ -511,7 +475,7 @@ class _ChooseCandidateLLM:
         from pokemon_agent.agent.llm_client import CompletionResponse
 
         payload = json.loads(messages[-1]["content"])
-        if "human_plan" in payload.get("response_schema", {}):
+        if "goal" in payload.get("response_schema", {}):
             return CompletionResponse(content=json.dumps(_objective_plan_payload(payload)), model="fake")
         candidates = payload["context"]["candidate_next_steps"]
         candidate_id = candidates[min(self.index, len(candidates) - 1)]["id"]
@@ -530,10 +494,10 @@ class _CaptureMilestoneLLM:
 
         payload = json.loads(messages[-1]["content"])
         self.current_milestone = payload["context"]["current_milestone"]
-        if "human_plan" in payload.get("response_schema", {}):
+        if "goal" in payload.get("response_schema", {}):
             self.objective_calls += 1
             objective_payload = _objective_plan_payload(payload)
-            objective_payload["human_plan"]["long_term_goal"] = self.current_milestone["description"]
+            objective_payload["goal"] = self.current_milestone["description"]
             return CompletionResponse(content=json.dumps(objective_payload), model="fake")
         candidate_id = payload["context"]["candidate_next_steps"][0]["id"]
         return CompletionResponse(content=json.dumps({"candidate_id": candidate_id, "reason": "inspect milestone"}), model="fake")
@@ -918,7 +882,7 @@ def test_runner_passes_current_ascii_map_in_llm_payload():
 
             payload = json.loads(messages[-1]["content"])
             self.visual_map = payload["context"]["overworld_context"]["visual_map"]
-            if "human_plan" in payload.get("response_schema", {}):
+            if "goal" in payload.get("response_schema", {}):
                 return CompletionResponse(content=json.dumps(_objective_plan_payload(payload)), model="fake")
             self.visual_map = payload["context"]["overworld_context"]["visual_map"]
             candidate_id = payload["context"]["candidate_next_steps"][0]["id"]
@@ -957,7 +921,7 @@ def test_runner_uses_live_state_after_planning_wait():
 
     result = runner.run_turn(1)
 
-    assert result.before.x == 6
+    assert result.before.x == 5
     assert result.after.x is not None
     assert result.after.x != result.before.x or result.after.y != result.before.y
     assert result.progress.classification == "movement_success"
@@ -1128,7 +1092,7 @@ def test_runner_resolves_yes_no_text_with_dialogue_controller():
     first = runner.run_turn(1)
     second = runner.run_turn(2)
 
-    assert llm.calls >= 2
+    assert llm.calls == 1
     assert first.llm_attempted is True
     assert first.planner_source == "dialogue_controller"
     assert first.action.action == ActionType.PRESS_A

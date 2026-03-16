@@ -31,6 +31,7 @@ from pokemon_agent.agent.navigation import NavigationGrid
 from pokemon_agent.agent.navigation import is_real_map_edge
 from pokemon_agent.agent.planning_types import PlanningResult
 from pokemon_agent.agent.navigation import visible_boundary_side
+from pokemon_agent.agent.objective_manager import ObjectiveManager
 from pokemon_agent.agent.progress import ProgressDetector, ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckDetector, StuckState
 from pokemon_agent.agent.validator import ActionValidator
@@ -54,14 +55,11 @@ from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.memory import NavigationGoal
 from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import CandidateRuntime
-from pokemon_agent.models.planner import HumanObjectivePlan
-from pokemon_agent.models.planner import InternalObjectivePlan
 from pokemon_agent.models.planner import Objective
 from pokemon_agent.models.planner import ObjectiveHorizon
-from pokemon_agent.models.planner import ObjectivePlanEnvelope
-from pokemon_agent.models.planner import ObjectivePlanStatus
 from pokemon_agent.models.planner import ObjectiveTarget
 from pokemon_agent.models.planner import PlannerDecision
+from pokemon_agent.models.planner import StrategicObjective
 from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import NavigationSnapshot
 from pokemon_agent.models.state import StructuredGameState
@@ -126,7 +124,7 @@ class TurnResult:
     candidate_id: str | None = None
     candidates: list[CandidateNextStep] = field(default_factory=list)
     navigation_goal: NavigationGoal | None = None
-    objective_plan: ObjectivePlanEnvelope | None = None
+    objective: StrategicObjective | None = None
     executor_task: Task | None = None
     suggested_path: list[tuple[int, int]] = field(default_factory=list)
     screen_image: PILImage | None = None
@@ -228,17 +226,19 @@ class ClosedLoopRunner:
         self._candidate_runtime: dict[str, CandidateRuntime] = {}
         self.menu_manager = MenuManager()
         self.static_world_graph = load_world_graph()
+        self.objective_manager = ObjectiveManager(
+            self.llm_client,
+            self.context_manager,
+            world_graph=self.static_world_graph,
+            completion_fn=self._complete_with_window_pump,
+        )
+        self.objective_manager.restore_state(self.memory.memory.long_term.objective)
         self._rebuild_overworld_stack()
         # Keep the legacy executor available as a compatibility adapter for any
         # remaining task-based plans outside the overworld controller path.
         self.executor = Executor(self._connector_by_id)
         self._last_entry_direction: str | None = None
         self._previous_map_name: str | None = None
-        self._objective_plan_messages: list[dict[str, str]] = []
-        self._objective_plan_prompt_metrics: dict[str, Any] | None = None
-        self._objective_plan_llm_usage: LLMUsage | None = None
-        self._objective_plan_llm_attempted = False
-        self._objective_plan_llm_model: str | None = None
         # Tracks (map_id, player_x, player_y) → turn_index of last text-box interaction.
         # Used to suppress re-interacting with the same sign/object within a cooldown window.
         self._interacted_tiles: dict[tuple[str | int, int, int], int] = {}
@@ -304,7 +304,7 @@ class ClosedLoopRunner:
                 previous_action = None
         return TurnContext(
             objective=objective,
-            navigation_target=self._build_navigation_target(objective),
+            navigation_target=self._build_navigation_target(),
             stuck_score=self.stuck.state.score,
             turn_index=self.completed_turns + 1,
             previous_action=previous_action,
@@ -319,25 +319,27 @@ class ClosedLoopRunner:
                     return objective
         return objectives[0] if objectives else None
 
-    def _build_navigation_target(self, objective: Objective | None) -> NavigationTarget | None:
+    def _build_navigation_target(self) -> NavigationTarget | None:
+        objective_target = self.objective_manager.navigation_target()
         goal = self.memory.memory.long_term.navigation_goal
-        target = objective.target if objective is not None else None
-        map_name = None
-        x = None
-        y = None
-        landmark_id = None
-        reason_parts: list[str] = []
-        if target is not None:
-            map_name = target.map_name
-            x = target.x
-            y = target.y
-            if target.detail:
-                reason_parts.append(target.detail)
         if goal is not None:
+            map_name = goal.target_map_name
+            x = None
+            y = None
+            landmark_id = goal.target_landmark_id
+            reason_parts: list[str] = []
             map_name = map_name or goal.target_map_name
             landmark_id = goal.target_landmark_id
             if goal.objective_kind:
-                reason_parts.insert(0, goal.objective_kind)
+                reason_parts.append(goal.objective_kind)
+            if objective_target is not None and objective_target.reason:
+                reason_parts.append(objective_target.reason)
+        else:
+            map_name = None if objective_target is None else objective_target.map_name
+            x = None if objective_target is None else objective_target.x
+            y = None if objective_target is None else objective_target.y
+            landmark_id = None if objective_target is None else objective_target.landmark_id
+            reason_parts = [] if objective_target is None else [objective_target.reason]
         if map_name is None and x is None and y is None and landmark_id is None:
             return None
         return NavigationTarget(
@@ -374,12 +376,12 @@ class ClosedLoopRunner:
 
     def run_turn(self, turn_index: int) -> TurnResult:
         self._report_activity("Planning turn", f"Turn #{turn_index}")
+        self.objective_manager.reset_turn_metadata()
         self._prune_temporary_blocked_tiles(turn_index)
         before, planning = self._resolve_turn_plan()
         self._report_activity("Capturing frame", f"Turn #{turn_index}")
         screen_image = self.emulator.capture_screen_image()
         navigation_goal_snapshot = copy.deepcopy(self.memory.memory.long_term.navigation_goal)
-        objective_plan_snapshot = copy.deepcopy(self.memory.memory.long_term.objective_plan)
         executor_task_snapshot = copy.deepcopy(planning.executor_task)
         active_connector_snapshot = (
             copy.deepcopy(self.overworld_controller.active_connector())
@@ -429,6 +431,19 @@ class ClosedLoopRunner:
             key = (before.map_id, before.x, before.y)
             self._interacted_tiles[key] = turn_index
         self._update_navigation_goal_after_turn(after, progress_result, planning)
+        if planning.planner_source == "bootstrap" or after.is_bootstrap():
+            self.objective_manager.mark_completed()
+            self.memory.memory.long_term.objective = None
+        elif self.objective_manager.should_replan(after, stuck_score=stuck_state.score, turn_index=turn_index):
+            objective = self.objective_manager.replan(
+                after,
+                self.memory.memory,
+                stuck_score=stuck_state.score,
+                turn_index=turn_index,
+            )
+            self.memory.memory.long_term.objective = objective
+        else:
+            self.memory.memory.long_term.objective = self.objective_manager.current_objective()
         events = self.memory.update_from_transition(
             before,
             after,
@@ -448,6 +463,13 @@ class ClosedLoopRunner:
             llm_attempted=planning.llm_attempted,
             planner_source=planning.planner_source,
         )
+        objective_metadata = self.objective_manager.last_metadata()
+        if not planning.llm_attempted and objective_metadata.llm_attempted:
+            planning.llm_attempted = True
+            planning.messages = list(objective_metadata.messages)
+            planning.prompt_metrics = objective_metadata.prompt_metrics
+            planning.llm_usage = objective_metadata.llm_usage
+            planning.llm_model = objective_metadata.llm_model
         turn_result = TurnResult(
             turn_index=turn_index,
             before=before,
@@ -468,7 +490,7 @@ class ClosedLoopRunner:
             candidate_id=planning.candidate_id,
             candidates=copy.deepcopy(planning.candidates),
             navigation_goal=navigation_goal_snapshot,
-            objective_plan=objective_plan_snapshot,
+            objective=copy.deepcopy(self.memory.memory.long_term.objective),
             executor_task=executor_task_snapshot,
             suggested_path=copy.deepcopy(planning.suggested_path),
             screen_image=screen_image,
@@ -555,30 +577,22 @@ class ClosedLoopRunner:
             used_fallback=True,
             planner_source="fallback",
         )
-        return fallback_state, self._with_objective_planner_metadata(result)
+        return fallback_state, result
 
     def _plan_action(self, state: StructuredGameState) -> PlanningResult:
-        self._reset_objective_planner_metadata()
         if state.is_bootstrap():
             return self._plan_bootstrap_action(state)
 
         self._report_activity("Refreshing objectives", state.map_name)
         observe_state(self.memory.memory.long_term.world_map, state)
-        self._ensure_objective_plan(state)
         self._sync_navigation_goal(state)
-        return self._with_objective_planner_metadata(self.dispatcher.dispatch(state, self._build_turn_context(state)))
-
-    def _reset_objective_planner_metadata(self) -> None:
-        self._objective_plan_messages = []
-        self._objective_plan_prompt_metrics = None
-        self._objective_plan_llm_usage = None
-        self._objective_plan_llm_attempted = False
-        self._objective_plan_llm_model = None
+        return self.dispatcher.dispatch(state, self._build_turn_context(state))
 
     def _plan_bootstrap_action(self, state: StructuredGameState) -> PlanningResult:
         self._report_activity("Handling bootstrap", state.bootstrap_phase() or "deterministic startup")
         self.executor.abort()
-        self.memory.memory.long_term.objective_plan = None
+        self.objective_manager.mark_completed()
+        self.memory.memory.long_term.objective = None
         action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
         return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
 
@@ -600,7 +614,7 @@ class ClosedLoopRunner:
             fallback = self.validator.fallback(state, self.stuck.state, "fallback without usable candidates")
             result = PlanningResult(action=self.validator.validate(fallback, state), used_fallback=True, planner_source="fallback")
             self._clear_navigation_confirmation(state.map_name)
-            return self._with_objective_planner_metadata(result)
+            return result
 
         recommended = candidates[0]
         force_opening_objective_llm = self._should_force_opening_objective_llm(state)
@@ -608,14 +622,12 @@ class ClosedLoopRunner:
             self._report_activity("Auto-selecting candidate", recommended.id)
             compiled = self._compile_candidate(recommended, state, self._short_reason(recommended))
             if compiled is not None:
-                return self._with_objective_planner_metadata(
-                    self._planning_result_from_runtime(
-                        compiled,
-                        planner_source="auto_candidate",
-                        objective_id=recommended.objective_id,
-                        candidate_id=recommended.id,
-                        candidates=list(candidates),
-                    )
+                return self._planning_result_from_runtime(
+                    compiled,
+                    planner_source="auto_candidate",
+                    objective_id=recommended.objective_id,
+                    candidate_id=recommended.id,
+                    candidates=list(candidates),
                 )
 
         snapshot = self.context_manager.build_snapshot(
@@ -640,7 +652,7 @@ class ClosedLoopRunner:
                 reason="deterministic fallback planner",
             )
             self._clear_navigation_confirmation(state.map_name)
-            return self._with_objective_planner_metadata(result)
+            return result
 
         try:
             raw_response = self._complete_with_window_pump(messages, purpose="turn planner")
@@ -662,7 +674,7 @@ class ClosedLoopRunner:
                     reason="fallback after invalid planner choice",
                 )
                 self._clear_navigation_confirmation(state.map_name)
-                return self._with_objective_planner_metadata(result)
+                return result
             result = self._planning_result_from_runtime(
                 compiled,
                 raw_response=raw_response.content,
@@ -677,7 +689,7 @@ class ClosedLoopRunner:
                 candidates=list(candidates),
             )
             self._clear_navigation_confirmation(state.map_name)
-            return self._with_objective_planner_metadata(result)
+            return result
         except Exception as exc:
             result = self._fallback_from_candidates(
                 self.emulator.get_structured_state(),
@@ -690,7 +702,7 @@ class ClosedLoopRunner:
                 reason=f"fallback after llm error: {type(exc).__name__}",
             )
             self._clear_navigation_confirmation(state.map_name)
-            return self._with_objective_planner_metadata(result)
+            return result
 
     def _current_milestone_for_state(self, state: StructuredGameState):
         return get_current_milestone(
@@ -700,201 +712,20 @@ class ClosedLoopRunner:
             badges=state.badges,
         )
 
-    def _ensure_objective_plan(self, state: StructuredGameState) -> None:
-        reason = self._objective_plan_replan_reason(state)
-        if reason is None:
-            return
-        self._report_activity("Refreshing objective plan", reason)
-        milestone = self._current_milestone_for_state(state)
-        existing_plan = self.memory.memory.long_term.objective_plan
-        if (
-            existing_plan is not None
-            and existing_plan.internal_plan.plan_type == "recover"
-            and reason in {"plan_complete", "recover_context_changed"}
-        ):
-            self.memory.memory.long_term.objective_plan = self._default_objective_plan(state, milestone, reason)
-            return
-        if self.llm_client is None:
-            self.memory.memory.long_term.objective_plan = None
-            return
-        try:
-            snapshot = self.context_manager.build_objective_snapshot(
-                state,
-                self.memory.memory,
-                self.stuck.state,
-                replan_reason=reason,
-            )
-            messages = build_messages(snapshot)
-            self._objective_plan_messages = messages
-            self._objective_plan_prompt_metrics = measure_prompt(messages, snapshot)
-            self._objective_plan_llm_attempted = True
-            response = self._complete_with_window_pump(messages, purpose="objective planner")
-            self._objective_plan_llm_usage = response.usage
-            self._objective_plan_llm_model = response.model
-            plan = self._parse_objective_plan(response.content)
-            plan = self._normalize_objective_plan(plan, state, milestone, reason)
-            if not self._objective_plan_is_compilable(state, plan.internal_plan):
-                raise ValueError("objective plan was not compilable")
-            self.memory.memory.long_term.objective_plan = plan
-        except Exception:
-            self.memory.memory.long_term.objective_plan = None
-
-    def _with_objective_planner_metadata(self, result: PlanningResult) -> PlanningResult:
-        if result.llm_attempted or not self._objective_plan_llm_attempted:
-            return result
-        result.llm_attempted = True
-        result.messages = list(self._objective_plan_messages)
-        result.prompt_metrics = self._objective_plan_prompt_metrics
-        result.llm_usage = self._objective_plan_llm_usage
-        result.llm_model = self._objective_plan_llm_model
-        return result
-
-    def _normalize_objective_plan(
-        self,
-        plan: ObjectivePlanEnvelope,
-        state: StructuredGameState,
-        milestone,
-        reason: str,
-    ) -> ObjectivePlanEnvelope:
-        defaults = self._default_objective_plan(state, milestone, reason)
-        human = plan.human_plan
-        if not human.short_term_goal.strip():
-            human.short_term_goal = defaults.human_plan.short_term_goal
-        if not human.mid_term_goal.strip():
-            human.mid_term_goal = defaults.human_plan.mid_term_goal
-        if not human.long_term_goal.strip():
-            human.long_term_goal = defaults.human_plan.long_term_goal
-        if not human.current_strategy.strip():
-            human.current_strategy = defaults.human_plan.current_strategy
-
-        internal = plan.internal_plan
-        if not internal.plan_type:
-            internal.plan_type = defaults.internal_plan.plan_type
-        landmark = self.static_world_graph.get_landmark(internal.target_landmark_id)
-        if internal.target_map_name is None and landmark is not None:
-            internal.target_map_name = landmark.map_name
-        if internal.plan_type in {"go_to_map", "go_to_landmark", "interact_story_npc"} and internal.target_map_name is None:
-            internal.target_map_name = defaults.internal_plan.target_map_name
-        plan.status = ObjectivePlanStatus.ACTIVE
-        plan.generated_at_step = state.step
-        plan.valid_for_milestone_id = milestone.id
-        plan.valid_for_map_name = state.map_name
-        plan.replan_reason = reason
-        return plan
-
-    def _default_objective_plan(self, state: StructuredGameState, milestone, reason: str) -> ObjectivePlanEnvelope:
-        if state.battle_state is not None:
-            plan_type = "battle_default"
-            target_map_name = state.map_name
-        elif state.menu_open:
-            plan_type = "resolve_menu"
-            target_map_name = state.map_name
-        elif state.text_box_open:
-            plan_type = "advance_dialogue"
-            target_map_name = state.map_name
-        else:
-            target_map_name = self._current_story_target(state, milestone) or milestone.target_map_name
-            if self._should_story_interact_here(state, milestone, target_map_name):
-                plan_type = "interact_story_npc"
-            elif self._story_landmark_for_milestone(milestone) is not None and map_matches(target_map_name, milestone.target_map_name):
-                plan_type = "go_to_landmark"
-            else:
-                plan_type = "go_to_map"
-        landmark = self._story_landmark_for_milestone(milestone) if plan_type == "go_to_landmark" else None
-        return ObjectivePlanEnvelope(
-            human_plan=HumanObjectivePlan(
-                short_term_goal=(
-                    "Advance the current dialogue and watch for walkthrough-relevant cues"
-                    if state.text_box_open
-                    else "Resolve the current menu and return to the story route"
-                    if state.menu_open
-                    else f"Finish the current battle so progress toward {milestone.target_map_name} can continue"
-                    if state.battle_state is not None
-                    else self.memory._short_term_goal(state, milestone)
-                ),
-                mid_term_goal=self.memory._mid_term_goal(state, milestone),
-                long_term_goal=milestone.description,
-                current_strategy=self.memory._current_strategy(state, milestone),
-            ),
-            internal_plan=InternalObjectivePlan(
-                plan_type=plan_type,
-                target_map_name=target_map_name,
-                target_landmark_id=None if landmark is None else landmark.id,
-                target_landmark_type=None if landmark is None else landmark.type,
-                target_npc_hint="story_npc" if plan_type == "interact_story_npc" else None,
-                success_signal=milestone.description,
-                stop_when="text_box_open" if plan_type == "interact_story_npc" else None,
-                confidence=0.5,
-                notes=reason,
-            ),
-            generated_at_step=state.step,
-            valid_for_milestone_id=milestone.id,
-            valid_for_map_name=state.map_name,
-            replan_reason=reason,
+    def _ensure_objective_plan(self, state: StructuredGameState) -> StrategicObjective | None:
+        turn_index = max(1, self.completed_turns + 1)
+        if not self.objective_manager.should_replan(state, stuck_score=self.stuck.state.score, turn_index=turn_index):
+            objective = self.objective_manager.current_objective()
+            self.memory.memory.long_term.objective = objective
+            return objective
+        objective = self.objective_manager.replan(
+            state,
+            self.memory.memory,
+            stuck_score=self.stuck.state.score,
+            turn_index=turn_index,
         )
-
-    def _objective_plan_replan_reason(self, state: StructuredGameState) -> str | None:
-        plan = self.memory.memory.long_term.objective_plan
-        milestone = self._current_milestone_for_state(state)
-        if plan is None:
-            return "missing_plan"
-        if plan.status != ObjectivePlanStatus.ACTIVE:
-            return "inactive_plan"
-        if plan.valid_for_milestone_id and plan.valid_for_milestone_id != milestone.id:
-            return "milestone_changed"
-        if state.battle_state is not None and plan.internal_plan.plan_type != "battle_default":
-            return "battle_mode_changed"
-        if state.menu_open and plan.internal_plan.plan_type != "resolve_menu":
-            return "menu_mode_changed"
-        if state.text_box_open and plan.internal_plan.plan_type != "advance_dialogue":
-            return "text_mode_changed"
-        if self.stuck.state.score >= self.stuck.threshold and plan.internal_plan.plan_type != "recover":
-            return "stuck_recovery"
-        if self._objective_plan_complete(state, plan.internal_plan):
-            return "plan_complete"
-        if (
-            plan.internal_plan.plan_type == "recover"
-            and plan.valid_for_map_name
-            and not map_matches(state.map_name, plan.valid_for_map_name)
-        ):
-            return "recover_context_changed"
-        if not self._objective_plan_is_compilable(state, plan.internal_plan):
-            return "plan_uncompilable"
-        return None
-
-    def _objective_plan_complete(self, state: StructuredGameState, plan: InternalObjectivePlan) -> bool:
-        if plan.plan_type == "recover" and plan.target_map_name:
-            return map_matches(state.map_name, plan.target_map_name)
-        if plan.plan_type == "go_to_map" and plan.target_map_name:
-            return map_matches(state.map_name, plan.target_map_name)
-        if plan.plan_type == "go_to_landmark":
-            if plan.target_landmark_id:
-                landmark = self.static_world_graph.get_landmark(plan.target_landmark_id)
-                if landmark is not None:
-                    return map_matches(state.map_name, landmark.map_name)
-            return bool(plan.target_map_name and map_matches(state.map_name, plan.target_map_name))
-        if plan.plan_type == "interact_story_npc":
-            return state.text_box_open
-        if plan.plan_type == "advance_dialogue":
-            return not state.text_box_open
-        if plan.plan_type == "resolve_menu":
-            return not state.menu_open
-        if plan.plan_type == "battle_default":
-            return state.battle_state is None
-        return False
-
-    def _objective_plan_is_compilable(self, state: StructuredGameState, plan: InternalObjectivePlan) -> bool:
-        if plan.plan_type in {"advance_dialogue", "resolve_menu", "battle_default", "recover"}:
-            return True
-        if plan.plan_type == "interact_story_npc":
-            return bool(plan.target_map_name or state.map_name)
-        if plan.plan_type == "go_to_map":
-            return bool(plan.target_map_name)
-        if plan.plan_type == "go_to_landmark":
-            if plan.target_landmark_id is not None:
-                return self.static_world_graph.get_landmark(plan.target_landmark_id) is not None
-            return bool(plan.target_map_name)
-        return False
+        self.memory.memory.long_term.objective = objective
+        return objective
 
     def _fallback_from_candidates(
         self,
@@ -1030,13 +861,14 @@ class ClosedLoopRunner:
             "executor_state": self.executor.export_state(),
             "navigator_state": self.navigator.export_state(),
             "overworld_state": self.overworld_controller.export_state(),
-            "objective_plan": (
-                self.memory.memory.long_term.objective_plan.model_dump(mode="json")
-                if self.memory.memory.long_term.objective_plan is not None
+            "objective": (
+                self.memory.memory.long_term.objective.model_dump(mode="json")
+                if self.memory.memory.long_term.objective is not None
                 else None
             ),
             "last_entry_direction": self._last_entry_direction,
         }
+        payload["objective_plan"] = payload["objective"]
         metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return metadata_path
 
@@ -1084,10 +916,13 @@ class ClosedLoopRunner:
         self.executor.restore_state(payload.get("executor_state"))
         self.navigator.restore_state(payload.get("navigator_state"))
         self.overworld_controller.restore_state(payload.get("overworld_state"))
-        objective_payload = payload.get("objective_plan")
-        self.memory.memory.long_term.objective_plan = (
-            ObjectivePlanEnvelope.model_validate(objective_payload) if objective_payload else None
-        )
+        objective_payload = payload.get("objective", payload.get("objective_plan"))
+        if objective_payload:
+            legacy_objective = StrategicObjective.from_legacy_payload(objective_payload) if isinstance(objective_payload, dict) else None
+            self.memory.memory.long_term.objective = (
+                legacy_objective if legacy_objective is not None else StrategicObjective.model_validate(objective_payload)
+            )
+        self.objective_manager.restore_state(self.memory.memory.long_term.objective)
         self._last_entry_direction = payload.get("last_entry_direction")
         return payload
 
@@ -1095,14 +930,14 @@ class ClosedLoopRunner:
         summary = self.telemetry.to_dict()
         summary.update(world_map_stats(self.memory.memory.long_term.world_map))
         goals = self.memory.memory.goals
-        objective_plan = self.memory.memory.long_term.objective_plan
-        if objective_plan is not None:
+        objective = self.memory.memory.long_term.objective
+        if objective is not None:
             summary.update(
                 {
-                    "short_term_goal": objective_plan.human_plan.short_term_goal,
-                    "mid_term_goal": objective_plan.human_plan.mid_term_goal,
-                    "long_term_goal": objective_plan.human_plan.long_term_goal,
-                    "current_strategy": objective_plan.human_plan.current_strategy,
+                    "short_term_goal": objective.goal,
+                    "mid_term_goal": goals.mid_term_goal,
+                    "long_term_goal": goals.long_term_goal,
+                    "current_strategy": objective.strategy,
                 }
             )
         else:
@@ -1157,9 +992,8 @@ class ClosedLoopRunner:
             raise ValueError("Model response did not contain a JSON object")
         return text[start : end + 1]
 
-    def _parse_objective_plan(self, raw_text: str) -> ObjectivePlanEnvelope:
-        payload = json.loads(self._extract_json(raw_text))
-        return ObjectivePlanEnvelope.model_validate(payload)
+    def _parse_objective_plan(self, raw_text: str) -> StrategicObjective:
+        return self.objective_manager._parse_objective(raw_text)
 
     def _resolve_candidate(
         self,
@@ -3056,9 +2890,9 @@ class ClosedLoopRunner:
             current_map_name=state.map_name,
             badges=state.badges,
         )
-        objective_plan = self.memory.memory.long_term.objective_plan
-        if objective_plan is not None:
-            compiled_goal = self._sync_navigation_goal_from_objective_plan(state, milestone, objective_plan.internal_plan)
+        objective = self.memory.memory.long_term.objective
+        if objective is not None:
+            compiled_goal = self._sync_navigation_goal_from_objective(state, milestone, objective)
             if compiled_goal is not None:
                 return compiled_goal
         goal = self.memory.memory.long_term.navigation_goal
@@ -3136,34 +2970,27 @@ class ClosedLoopRunner:
             goal.objective_kind = "enter_selected_connector"
         return goal
 
-    def _sync_navigation_goal_from_objective_plan(
+    def _sync_navigation_goal_from_objective(
         self,
         state: StructuredGameState,
         milestone,
-        plan: InternalObjectivePlan,
+        objective: StrategicObjective,
     ) -> NavigationGoal | None:
-        if not self._objective_plan_is_compilable(state, plan):
-            return None
-        if plan.plan_type not in {"go_to_map", "go_to_landmark", "interact_story_npc"}:
-            self.memory.memory.long_term.navigation_goal = None
-            return None
-
-        final_target_landmark = self.static_world_graph.get_landmark(plan.target_landmark_id)
-        final_target_map_name = plan.target_map_name or (
+        final_target_landmark = self.static_world_graph.get_landmark(objective.target_landmark)
+        final_target_map_name = objective.target_map or (
             final_target_landmark.map_name if final_target_landmark is not None else milestone.target_map_name
         )
-        # If a go_to_* plan has already reached its local/intermediate map, do
-        # not let that stale target mask the next story hop for another turn.
         if (
-            plan.plan_type in {"go_to_map", "go_to_landmark"}
-            and final_target_map_name
+            final_target_map_name is not None
             and map_matches(state.map_name, final_target_map_name)
             and not map_matches(state.map_name, milestone.target_map_name)
         ):
+            self.objective_manager.mark_completed()
+            self.memory.memory.long_term.objective = None
             self.memory.memory.long_term.navigation_goal = None
             return None
         target_map_name = final_target_map_name
-        if plan.plan_type in {"go_to_map", "go_to_landmark"} and not map_matches(state.map_name, final_target_map_name):
+        if final_target_map_name and not map_matches(state.map_name, final_target_map_name):
             target_map_name = self._capped_route_target(state.map_name, final_target_map_name) or final_target_map_name
         target_landmark = final_target_landmark if map_matches(target_map_name, final_target_map_name) else None
         goal = self.memory.memory.long_term.navigation_goal
@@ -3175,16 +3002,14 @@ class ClosedLoopRunner:
         next_hop_kind = None
         next_hop_side = None
 
-        if plan.plan_type == "interact_story_npc":
-            objective_kind = "talk_to_required_npc"
-        elif hop is not None:
+        if hop is not None:
             next_map_name = hop.to_map
             next_hop_kind = "warp" if hop.direction == "warp" else "boundary"
             next_hop_side = None if hop.direction == "warp" else hop.direction
             objective_kind = "reach_boundary_side" if next_hop_kind == "boundary" else "explore_for_matching_connector"
             if next_hop_kind == "warp" and next_map_name is not None:
                 target_landmark = self._landmark_for_destination_on_current_map(state.map_name, next_map_name) or target_landmark
-        elif plan.plan_type == "go_to_landmark" and target_landmark is not None and map_matches(state.map_name, target_map_name):
+        elif objective.target_landmark and target_landmark is not None and map_matches(state.map_name, target_map_name):
             objective_kind = "reach_landmark"
         elif map_matches(state.map_name, target_map_name) and self._should_story_interact_here(state, milestone, target_map_name):
             objective_kind = "talk_to_required_npc"

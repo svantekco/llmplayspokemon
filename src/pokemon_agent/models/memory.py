@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from .action import ActionType
 from .events import EventRecord
 from .planner import Objective
 from .planner import ObjectivePlanEnvelope
+from .planner import StrategicObjective
 from .state import WorldCoordinate
 
 
@@ -87,7 +88,38 @@ class LongTermKnowledge(BaseModel):
     heuristics: list[str] = Field(default_factory=list)
     world_map: WorldMapMemory = Field(default_factory=WorldMapMemory)
     navigation_goal: NavigationGoal | None = None
-    objective_plan: ObjectivePlanEnvelope | None = None
+    objective: StrategicObjective | None = Field(
+        default=None,
+        validation_alias=AliasChoices("objective", "objective_plan"),
+    )
+
+    @field_validator("objective", mode="before")
+    @classmethod
+    def _coerce_objective(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, StrategicObjective):
+            return value
+        if isinstance(value, ObjectivePlanEnvelope):
+            return value.to_strategic_objective()
+        if isinstance(value, dict):
+            legacy = StrategicObjective.from_legacy_payload(value)
+            if legacy is not None:
+                return legacy
+        return value
+
+    @property
+    def objective_plan(self) -> ObjectivePlanEnvelope | None:
+        if self.objective is None:
+            return None
+        return ObjectivePlanEnvelope.from_strategic_objective(self.objective)
+
+    @objective_plan.setter
+    def objective_plan(self, value: StrategicObjective | ObjectivePlanEnvelope | None) -> None:
+        if isinstance(value, ObjectivePlanEnvelope):
+            self.objective = value.to_strategic_objective()
+            return
+        self.objective = value
 
 
 class MemoryState(BaseModel):

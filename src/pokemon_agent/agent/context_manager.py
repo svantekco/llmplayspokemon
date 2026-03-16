@@ -15,7 +15,7 @@ from pokemon_agent.models.events import EventRecord
 from pokemon_agent.models.memory import MemoryState
 from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import CandidateRuntime
-from pokemon_agent.models.planner import ObjectivePlanEnvelope
+from pokemon_agent.models.planner import StrategicObjective
 from pokemon_agent.models.state import GameMode
 from pokemon_agent.models.state import StructuredGameState
 from pokemon_agent.navigation.world_graph import load_world_graph
@@ -24,23 +24,12 @@ RESPONSE_SCHEMA = {
     "candidate_id": "<exact id from candidate_next_steps>",
 }
 OBJECTIVE_RESPONSE_SCHEMA = {
-    "human_plan": {
-        "short_term_goal": "<string>",
-        "mid_term_goal": "<string>",
-        "long_term_goal": "<string>",
-        "current_strategy": "<string>",
-    },
-    "internal_plan": {
-        "plan_type": "<go_to_map|go_to_landmark|interact_story_npc|advance_dialogue|resolve_menu|battle_default|recover>",
-        "target_map_name": "<string|null>",
-        "target_landmark_id": "<string|null>",
-        "target_landmark_type": "<string|null>",
-        "target_npc_hint": "<string|null>",
-        "success_signal": "<string|null>",
-        "stop_when": "<string|null>",
-        "confidence": "<float|null>",
-        "notes": "<string|null>",
-    },
+    "goal": "<string>",
+    "target_map": "<string|null>",
+    "target_landmark": "<string|null>",
+    "strategy": "<string>",
+    "milestone_id": "<string|null>",
+    "confidence": "<float|null>",
 }
 PLANNER_SYSTEM_PROMPT = (
     "You control a Pokémon Red agent. Select exactly one id from candidate_next_steps. "
@@ -50,11 +39,10 @@ PLANNER_SYSTEM_PROMPT = (
 )
 OBJECTIVE_PLANNER_SYSTEM_PROMPT = (
     "You are the objective planner for a Pokémon Red agent. "
-    "Return a human_plan plus an internal_plan. "
-    "The internal_plan must stay symbolic: choose objective type, target map, landmark, or NPC hint only. "
-    "Do not return buttons, tile routes, connector ids, or exact movement sequences as authority. "
-    "Prefer plans the engine can compile deterministically from the connector table and world graph. "
-    "If dialogue or menus are already open, return the matching non-navigation plan type. "
+    "Return one symbolic strategic objective. "
+    "Use only high-level goal text, a target map, and optionally a known landmark id. "
+    "Do not return buttons, tile routes, connector ids, or exact movement sequences. "
+    "Prefer plans the engine can execute deterministically from the world graph and current milestone. "
     "Return exactly one JSON object matching response_schema. No markdown."
 )
 
@@ -173,9 +161,9 @@ class ContextManager:
         objective_context["planner_kind"] = "objective"
         if replan_reason:
             objective_context["replan_reason"] = replan_reason
-        objective_plan = self._serialize_objective_plan(memory_state.long_term.objective_plan)
-        if objective_plan is not None:
-            objective_context["current_objective_plan"] = objective_plan
+        objective = self._serialize_objective(memory_state.long_term.objective)
+        if objective is not None:
+            objective_context["current_objective"] = objective
         return self._finalize_snapshot(objective_context, OBJECTIVE_PLANNER_SYSTEM_PROMPT, OBJECTIVE_RESPONSE_SCHEMA)
 
     def record_turn(
@@ -611,7 +599,7 @@ class ContextManager:
         return payload
 
     @staticmethod
-    def _serialize_objective_plan(plan: ObjectivePlanEnvelope | None) -> dict[str, Any] | None:
+    def _serialize_objective(plan: StrategicObjective | None) -> dict[str, Any] | None:
         if plan is None:
             return None
         return plan.model_dump(mode="json", exclude_none=True)

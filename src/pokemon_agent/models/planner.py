@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -27,6 +28,61 @@ class Objective(BaseModel):
     id: str
     horizon: ObjectiveHorizon
     target: ObjectiveTarget | None = None
+
+
+class StrategicObjective(BaseModel):
+    goal: str
+    target_map: str | None = None
+    target_landmark: str | None = None
+    target_landmark_type: str | None = None
+    strategy: str
+    milestone_id: str | None = None
+    confidence: float = 0.8
+    generated_at_step: int = 0
+    generated_at_map: str | None = None
+
+    @classmethod
+    def from_legacy_payload(cls, payload: dict[str, Any]) -> "StrategicObjective | None":
+        if "human_plan" not in payload or "internal_plan" not in payload:
+            return None
+        human_plan = payload.get("human_plan") or {}
+        internal_plan = payload.get("internal_plan") or {}
+        plan_type = str(internal_plan.get("plan_type") or "").strip().lower()
+        if plan_type in {"recover", "advance_dialogue", "resolve_menu", "battle_default"}:
+            return None
+        goal = (
+            str(human_plan.get("short_term_goal") or "").strip()
+            or str(human_plan.get("mid_term_goal") or "").strip()
+            or str(human_plan.get("long_term_goal") or "").strip()
+        )
+        strategy = (
+            str(human_plan.get("current_strategy") or "").strip()
+            or str(internal_plan.get("notes") or "").strip()
+            or goal
+        )
+        if not goal or not strategy:
+            return None
+        confidence = internal_plan.get("confidence")
+        try:
+            normalized_confidence = float(confidence) if confidence is not None else 0.8
+        except (TypeError, ValueError):
+            normalized_confidence = 0.8
+        generated_at_step = payload.get("generated_at_step")
+        try:
+            normalized_step = int(generated_at_step) if generated_at_step is not None else 0
+        except (TypeError, ValueError):
+            normalized_step = 0
+        return cls(
+            goal=goal,
+            target_map=internal_plan.get("target_map_name"),
+            target_landmark=internal_plan.get("target_landmark_id"),
+            target_landmark_type=internal_plan.get("target_landmark_type"),
+            strategy=strategy,
+            milestone_id=payload.get("valid_for_milestone_id"),
+            confidence=normalized_confidence,
+            generated_at_step=normalized_step,
+            generated_at_map=payload.get("valid_for_map_name"),
+        )
 
 
 class ObjectivePlanStatus(str, Enum):
@@ -62,6 +118,32 @@ class ObjectivePlanEnvelope(BaseModel):
     valid_for_milestone_id: str | None = None
     valid_for_map_name: str | None = None
     replan_reason: str | None = None
+
+    def to_strategic_objective(self) -> StrategicObjective | None:
+        return StrategicObjective.from_legacy_payload(self.model_dump(mode="json", exclude_none=True))
+
+    @classmethod
+    def from_strategic_objective(cls, objective: StrategicObjective) -> "ObjectivePlanEnvelope":
+        plan_type = "go_to_landmark" if objective.target_landmark else "go_to_map"
+        return cls(
+            human_plan=HumanObjectivePlan(
+                short_term_goal=objective.goal,
+                mid_term_goal=objective.goal,
+                long_term_goal=objective.goal,
+                current_strategy=objective.strategy,
+            ),
+            internal_plan=InternalObjectivePlan(
+                plan_type=plan_type,
+                target_map_name=objective.target_map,
+                target_landmark_id=objective.target_landmark,
+                target_landmark_type=objective.target_landmark_type,
+                confidence=objective.confidence,
+                notes=objective.strategy,
+            ),
+            generated_at_step=objective.generated_at_step,
+            valid_for_map_name=objective.generated_at_map,
+            valid_for_milestone_id=objective.milestone_id,
+        )
 
 
 @dataclass(slots=True)

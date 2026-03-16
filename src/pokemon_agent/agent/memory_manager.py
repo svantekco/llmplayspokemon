@@ -157,9 +157,9 @@ class MemoryManager:
                     if self.memory.long_term.navigation_goal is not None
                     else None
                 ),
-                "objective_plan": (
-                    self.memory.long_term.objective_plan.model_dump(mode="json")
-                    if self.memory.long_term.objective_plan is not None
+                "objective": (
+                    self.memory.long_term.objective.model_dump(mode="json")
+                    if self.memory.long_term.objective is not None
                     else None
                 ),
             },
@@ -184,7 +184,7 @@ class MemoryManager:
         goals = self.memory.goals
         old_snapshot = goals.model_dump()
         current_milestone = self._current_milestone(state)
-        objective_plan = self.memory.long_term.objective_plan
+        objective = self.memory.long_term.objective
 
         if state.is_bootstrap():
             phase = state.bootstrap_phase()
@@ -206,11 +206,9 @@ class MemoryManager:
             goals.short_term_goal = self._short_term_goal(state, current_milestone)
             goals.current_strategy = self._current_strategy(state, current_milestone)
             goals.success_conditions = self._milestone_success_conditions(current_milestone, progress)
-            if objective_plan is not None:
-                goals.long_term_goal = objective_plan.human_plan.long_term_goal
-                goals.mid_term_goal = objective_plan.human_plan.mid_term_goal
-                goals.short_term_goal = objective_plan.human_plan.short_term_goal
-                goals.current_strategy = objective_plan.human_plan.current_strategy
+            if objective is not None:
+                goals.short_term_goal = objective.goal
+                goals.current_strategy = objective.strategy
 
         if stuck_state and stuck_state.score >= 4 and stuck_state.recovery_hint:
             goals.current_strategy = stuck_state.recovery_hint
