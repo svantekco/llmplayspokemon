@@ -57,21 +57,13 @@ class ActionValidator:
         stuck_state: StuckState | None = None,
         reason: str = "deterministic startup bootstrap",
     ) -> ActionDecision:
-        recent_failed = set(stuck_state.recent_failed_actions[-3:] if stuck_state else [])
+        del stuck_state
         phase = state.bootstrap_phase()
 
         if phase == "title_menu" or phase == "intro_cutscene" or state.text_box_open:
             return ActionDecision(action=ActionType.PRESS_A, repeat=1, reason=reason)
 
-        if phase == "title_screen":
-            primary = ActionType.PRESS_START
-            secondary = ActionType.PRESS_A
-        else:
-            primary = ActionType.PRESS_START
-            secondary = ActionType.PRESS_A
-
-        action = primary if primary.value not in recent_failed else secondary
-        return ActionDecision(action=action, repeat=1, reason=reason)
+        return ActionDecision(action=ActionType.PRESS_START, repeat=1, reason=reason)
 
     def _extract_json(self, raw_text: str) -> str:
         text = raw_text.strip()

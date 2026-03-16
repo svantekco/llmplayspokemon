@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.models.action import ActionDecision
 from pokemon_agent.models.state import StructuredGameState
@@ -10,14 +10,8 @@ from pokemon_agent.models.state import StructuredGameState
 @dataclass(slots=True)
 class StuckState:
     score: int = 0
-    recent_signatures: deque = field(default_factory=lambda: deque(maxlen=8))
-    recent_failed_actions: list[str] = field(default_factory=list)
-    loop_signature: str | None = None
-    recovery_hint: str | None = None
-    repeated_state_count: int = 0
     steps_since_progress: int = 0
     oscillating: bool = False
-    recent_maps: deque = field(default_factory=lambda: deque(maxlen=6))
     map_oscillating: bool = False
 
 
@@ -26,103 +20,60 @@ class StuckDetector:
         self.state = StuckState()
         self.threshold = threshold
         self._last_mode: str | None = None
+        self._recent_signatures: deque[tuple] = deque(maxlen=4)
+        self._recent_maps: deque[str] = deque(maxlen=4)
 
     def update(self, game_state: StructuredGameState, action: ActionDecision, progress_classification: str, progress_result: ProgressResult | None = None) -> StuckState:
-        # Reset stuck score on game-mode transitions (e.g. CUTSCENE → OVERWORLD).
-        # Cutscene turns produce many no_effect results that are expected
-        # behaviour; carrying that score into OVERWORLD would incorrectly
-        # trigger recovery logic for dozens of turns.
+        del action
         current_mode = game_state.mode.value if game_state.mode else None
         if self._last_mode is not None and current_mode != self._last_mode:
             self.state.score = 0
             self.state.steps_since_progress = 0
-            self.state.recent_failed_actions.clear()
             self.state.oscillating = False
-            self.state.repeated_state_count = 0
+            self.state.map_oscillating = False
+            self._recent_signatures.clear()
+            self._recent_maps.clear()
         self._last_mode = current_mode
 
-        signature = game_state.state_signature()
-        self.state.recent_signatures.append(signature)
+        self._recent_signatures.append(game_state.state_signature())
         if game_state.map_name:
-            self.state.recent_maps.append(game_state.map_name)
-        self.state.map_oscillating = self._is_map_oscillating()
+            self._recent_maps.append(game_state.map_name)
 
-        # Repeated dialogue (same sign read again) is treated as no_effect for scoring.
         repeated_dialogue = progress_result is not None and progress_result.repeated_dialogue
         effective_classification = "no_effect" if repeated_dialogue else progress_classification
 
-        progress_made = effective_classification in {
-            "major_progress",
-            "movement_success",
-            "interaction_success",
-        }
-
         if effective_classification == "no_effect":
             self.state.score += 1
-            self.state.recent_failed_actions.append(action.action.value)
-            self.state.recent_failed_actions = self.state.recent_failed_actions[-5:]
             self.state.steps_since_progress += 1
         elif effective_classification == "regression":
             self.state.score += 2
             self.state.steps_since_progress += 1
         else:
             self.state.score = max(0, self.state.score - (2 if effective_classification == "major_progress" else 1))
-            if progress_made:
-                self.state.steps_since_progress = 0
+            self.state.steps_since_progress = 0
 
-        self.state.repeated_state_count = sum(1 for item in self.state.recent_signatures if item == signature)
         self.state.oscillating = self._is_oscillating()
-        if self.state.repeated_state_count >= 3 or self.state.oscillating or self.state.map_oscillating or self.state.steps_since_progress >= 6:
+        self.state.map_oscillating = self._is_map_oscillating()
+        if self.state.oscillating or self.state.map_oscillating or self.state.steps_since_progress >= 6:
             self.state.score = max(self.state.score, self.threshold)
-
-        if len(self.state.recent_signatures) >= 4:
-            last_four = list(self.state.recent_signatures)[-4:]
-            self.state.loop_signature = " -> ".join(
-                f"{item[1]}({item[2]},{item[3]})/{item[5]}" for item in last_four
-            )
-        else:
-            self.state.loop_signature = None
-
-        self.state.recovery_hint = self._build_recovery_hint(game_state, action, progress_classification)
+        if len(self._recent_signatures) >= 3 and len(set(self._recent_signatures)) == 1:
+            self.state.score = max(self.state.score, self.threshold)
         return self.state
 
     def restore(self, state: StuckState) -> None:
         self.state = state
+        self._recent_signatures.clear()
+        self._recent_maps.clear()
 
     def _is_oscillating(self) -> bool:
-        if len(self.state.recent_signatures) < 4:
+        if len(self._recent_signatures) < 4:
             return False
-        a, b, c, d = list(self.state.recent_signatures)[-4:]
+        a, b, c, d = list(self._recent_signatures)
         return a == c and b == d and a != b
 
     def _is_map_oscillating(self) -> bool:
-        """Detect A→B→A→B bouncing between maps."""
-        maps = list(self.state.recent_maps)
+        maps = list(self._recent_maps)
         if len(maps) < 4:
             return False
         a, b, c, d = maps[-4], maps[-3], maps[-2], maps[-1]
         return a == c and b == d and a != b
-
-    def _build_recovery_hint(
-        self,
-        game_state: StructuredGameState,
-        action: ActionDecision,
-        progress_classification: str,
-    ) -> str | None:
-        if game_state.text_box_open:
-            return "Text is open; prefer PRESS_A to advance dialogue."
-        if game_state.menu_open:
-            return "A menu is open; use PRESS_B to back out or a single direction to navigate."
-        if game_state.battle_state:
-            return "Battle is active; keep inputs single-step and prefer PRESS_A unless the menu changes."
-        if progress_classification == "no_effect" and action.action.value.startswith("MOVE_"):
-            return "Movement had no effect; try a different direction or interact with PRESS_A."
-        if self.state.map_oscillating:
-            maps = list(self.state.recent_maps)
-            pair = f"{maps[-2]} ↔ {maps[-1]}" if len(maps) >= 2 else "two maps"
-            return f"Bouncing between {pair}; choose a different exit or interact with something before leaving."
-        if self.state.oscillating:
-            return "You are oscillating between states; stop repeating the same pattern."
-        if self.state.score >= self.threshold:
-            return "Stuck score is high; prefer a recovery action over repeating the last failed input."
-        return None

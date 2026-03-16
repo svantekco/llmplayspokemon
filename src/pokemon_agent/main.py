@@ -180,8 +180,6 @@ def _print_turn(result, log_mode: str) -> None:
             summary["llm_tokens"] = result.llm_usage.total_tokens
         if result.events:
             summary["events"] = [event.summary for event in result.events]
-        if result.stuck_state.recovery_hint:
-            summary["recovery_hint"] = result.stuck_state.recovery_hint
         if result.llm_attempted and result.used_fallback and result.raw_model_response:
             summary["llm_error"] = result.raw_model_response
         print(summary)
@@ -207,8 +205,6 @@ def _print_turn(result, log_mode: str) -> None:
     print("  after ", result.after.prompt_summary())
     if result.events:
         print("  events", [event.model_dump() for event in result.events])
-    if result.stuck_state.recovery_hint:
-        print("  recovery_hint", result.stuck_state.recovery_hint)
 
 
 def run_args(args: argparse.Namespace) -> None:

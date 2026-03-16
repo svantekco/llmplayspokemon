@@ -1075,12 +1075,12 @@ def test_runner_prefers_local_recovery_over_press_start_when_stuck_in_overworld(
     emulator = _StuckOverworldNoNavigationMock()
     runner = _build_runner(emulator)
     runner.stuck.state.score = 44
-    runner.stuck.state.recent_failed_actions = ["PRESS_A", "PRESS_A", "PRESS_A", "PRESS_A", "PRESS_B"]
-    runner.stuck.state.recovery_hint = "Try a local recovery action before reopening the menu."
+    runner.stuck.state.steps_since_progress = 9
+    runner.recovery_controller.record_outcome("no_effect")
 
     result = runner.run_turn(1)
 
-    assert result.planner_source == "overworld_controller"
+    assert result.planner_source == "recovery_controller"
     assert result.action.action == ActionType.PRESS_A
 
 
@@ -1208,7 +1208,7 @@ def test_engine_prefers_visible_warp_progress_over_stuck_recovery() -> None:
         valid_for_map_name="Red's House 2F",
     )
     runner.stuck.state.score = runner.stuck.threshold + 5
-    runner.stuck.state.recovery_hint = "High stuck score"
+    runner.stuck.state.steps_since_progress = runner.stuck.threshold + 5
 
     collision_area = _collision_from_logical_grid(
         [

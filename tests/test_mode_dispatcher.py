@@ -31,6 +31,21 @@ class _FakeController:
         self.reset_calls += 1
 
 
+class _FakeRecoveryController:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.reset_calls = 0
+        self.result: PlanningResult | None = None
+
+    def step(self, state: StructuredGameState, context: TurnContext) -> PlanningResult | None:
+        del state, context
+        self.calls += 1
+        return self.result
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
 def _state(
     *,
     mode: GameMode = GameMode.OVERWORLD,
@@ -96,6 +111,22 @@ def test_mode_dispatcher_requires_exhaustive_controller_registration():
         assert "UNKNOWN" in str(exc)
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("expected ModeDispatcher to reject missing controller registrations")
+
+
+def test_mode_dispatcher_uses_recovery_override_before_mode_controller():
+    controllers = _controllers()
+    recovery = _FakeRecoveryController()
+    recovery.result = PlanningResult(
+        action=ActionDecision(action=ActionType.PRESS_A, repeat=1, reason="recovery action"),
+        planner_source="recovery_controller",
+    )
+    dispatcher = ModeDispatcher(controllers, recovery_controller=recovery)
+
+    result = dispatcher.dispatch(_state(mode=GameMode.OVERWORLD), TurnContext(turn_index=4, stuck_score=6))
+
+    assert result.planner_source == "recovery_controller"
+    assert recovery.calls == 1
+    assert len(controllers[GameMode.OVERWORLD].step_calls) == 0
 
 
 def test_stub_controllers_follow_protocol_and_are_distinct_instances():

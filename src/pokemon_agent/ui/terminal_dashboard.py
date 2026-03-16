@@ -278,8 +278,6 @@ class TerminalDashboard:
             )
             if self.latest_turn.action.reason:
                 table.add_row("Reason", self._truncate_inline(self.latest_turn.action.reason, 90))
-            if self.latest_turn.stuck_state.recovery_hint:
-                table.add_row("Hint", self._truncate_inline(self.latest_turn.stuck_state.recovery_hint, 90))
         return Panel(table, title="Run Status", border_style="magenta")
 
     def _render_turns(self) -> Panel:

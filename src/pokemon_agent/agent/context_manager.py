@@ -249,33 +249,6 @@ class ContextManager:
         context.update(self._build_mode_context(state, memory_state))
         if candidate_next_steps:
             context["candidate_next_steps"] = [self._serialize_candidate(item) for item in candidate_next_steps[:4]]
-        stuck_warning = self._build_stuck_warning(stuck_state)
-        if stuck_warning is not None:
-            if candidate_next_steps and stuck_state is not None:
-                failed_actions = set(stuck_state.recent_failed_actions[-3:])
-                goal = memory_state.long_term.navigation_goal
-                failed_ids = list(goal.failed_candidate_ids) if goal is not None else []
-                failed_ids = [
-                    *failed_ids,
-                    *[
-                        cand.id for cand in candidate_next_steps
-                    if candidate_runtime is not None
-                    and cand.id in candidate_runtime
-                    and (action := candidate_runtime[cand.id].action) is not None
-                    and action.action.value in failed_actions
-                    ],
-                ]
-                # When oscillating/high stuck score, also flag interactable candidates so the
-                # LLM avoids re-selecting them (same sign re-read pattern).
-                if stuck_state.score >= 2 and (stuck_state.oscillating or stuck_state.score >= 3):
-                    interactable_ids = [
-                        cand.id for cand in candidate_next_steps
-                        if cand.type == "MOVE_ADJACENT_TO_INTERACTABLE"
-                    ]
-                    failed_ids = list(dict.fromkeys(failed_ids + interactable_ids))
-                if failed_ids:
-                    stuck_warning["failed_candidate_ids"] = failed_ids
-            context["stuck_warning"] = stuck_warning
         last_outcome = self._build_last_outcome()
         if last_outcome is not None:
             context["last_candidate_result"] = last_outcome
@@ -604,16 +577,6 @@ class ContextManager:
             return None
         return plan.model_dump(mode="json", exclude_none=True)
 
-    def _build_stuck_warning(self, stuck_state: StuckState | None) -> dict[str, Any] | None:
-        if stuck_state is None or stuck_state.score < 2:
-            return None
-        return {
-            "stuck_score": stuck_state.score,
-            "recent_failed_actions": stuck_state.recent_failed_actions,
-            "loop_signature": stuck_state.loop_signature,
-            "recovery_hint": stuck_state.recovery_hint,
-        }
-
     def _prune_to_budget(self, payload: dict[str, Any], dropped_sections: list[str], system_prompt: str) -> None:
         context = payload["context"]
         if self._within_budget(payload, system_prompt):
@@ -658,15 +621,7 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        # 5. Reduce stuck_warning (drop loop_signature, failed_candidate_ids)
-        if "stuck_warning" in context:
-            context["stuck_warning"].pop("loop_signature", None)
-            context["stuck_warning"].pop("failed_candidate_ids", None)
-            dropped_sections.append("stuck_warning_reduced")
-        if self._within_budget(payload, system_prompt):
-            return
-
-        # 6. Reduce candidate list to 3
+        # 5. Reduce candidate list to 3
         candidates = context.get("candidate_next_steps")
         if isinstance(candidates, list) and len(candidates) > 3:
             context["candidate_next_steps"] = candidates[:3]
@@ -674,7 +629,7 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        # 7. Drop candidate why fields (near-last — most actionable data)
+        # 6. Drop candidate why fields (near-last — most actionable data)
         candidates = context.get("candidate_next_steps")
         if isinstance(candidates, list):
             reduced_any = False
@@ -687,7 +642,7 @@ class ContextManager:
         if self._within_budget(payload, system_prompt):
             return
 
-        # 8. Last resort: reduce to single candidate
+        # 7. Last resort: reduce to single candidate
         candidates = context.get("candidate_next_steps")
         if isinstance(candidates, list) and len(candidates) > 1:
             context["candidate_next_steps"] = candidates[:1]

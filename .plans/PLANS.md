@@ -583,6 +583,10 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Implemented Phase 5 with a new `ObjectiveManager`, a flat strategic objective model, checkpoint/memory migration onto the new objective shape, simplified objective prompt building, and engine-side replanning moved out of the old `_ensure_objective_plan()` block.
 - 2026-03-16: Added objective-manager-focused regression coverage and updated prompt/engine expectations for the post-action replanning flow plus compatibility shims around legacy `ObjectivePlanEnvelope` inputs.
 - 2026-03-16: Verified the phase-5 slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_objective_manager.py tests/test_prompt_builder.py tests/test_world_graph.py tests/test_engine.py -q -s` (68 passed).
+- 2026-03-16: Implemented Phase 6 with a new `RecoveryController`, dispatcher-level recovery overrides for stuck overworld turns, objective-manager-backed escalation for tier-4 recovery, and checkpoint persistence for recovery controller state.
+- 2026-03-16: Simplified `StuckState` down to score/progress/oscillation fields, removed prompt-time stuck hint injection from `ContextManager`, and deleted the remaining recovery-hint plumbing from memory/UI surfaces.
+- 2026-03-16: Added focused recovery regression coverage for tiered recovery behavior, dispatcher override ordering, prompt payload removal of `stuck_warning`, and updated engine expectations for recovery-owned stuck turns.
+- 2026-03-16: Verified the phase-6 slice with `PYTHONPATH=src TMPDIR=/tmp python3 -m pytest tests/test_recovery_controller.py tests/test_mode_dispatcher.py tests/test_engine.py tests/test_stuck_detector.py tests/test_validator.py tests/test_context_manager_recovery.py tests/test_objective_manager.py tests/test_terminal_dashboard.py tests/test_debug_overlay.py -q -s` (81 passed).
 
 ## Decision log
 
@@ -597,6 +601,8 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Kept the new PRET fetch behavior inside `scripts/import_pret_world_graph.py` so phase-4 data regeneration remains one command and always cleans up its temporary checkout afterward.
 - 2026-03-16: Kept a narrow compatibility layer for legacy `ObjectivePlanEnvelope` reads/writes while making `StrategicObjective` the new source of truth, which lets Phase 5 land without forcing every old caller or checkpoint fixture to migrate in one change.
 - 2026-03-16: Replanning now happens after action execution rather than before planning, but turn telemetry still surfaces objective-planner metadata when the dispatcher path itself did not make an LLM call.
+- 2026-03-16: Recovery escalation reuses `ObjectiveManager.replan(..., forced_reason="stuck_escalation")` and then immediately re-enters deterministic overworld planning, so the LLM remains in the objective layer rather than becoming a per-turn recovery action picker.
+- 2026-03-16: Recovery intentionally yields while `OverworldController` is in the middle of connector handling so controller-level door/warp retries happen before broader stuck recovery tiers take over.
 
 ## Discoveries / surprises log
 
@@ -609,6 +615,8 @@ This eliminates LLM calls for the two most frequent non-overworld modes and can 
 - 2026-03-16: Some indoor exit warps (for example `REDS_HOUSE_1F` to `LAST_MAP`) do not resolve via explicit door tile tables, so the importer keeps a documented boundary fallback for those cases instead of pretending the ROM data fully classifies every warp tile.
 - 2026-03-16: The full suite’s remaining reds after phase 4 are unchanged from earlier milestones and still live in `tests/test_context_manager.py`, `tests/test_menu_manager.py`, and `tests/test_walkthrough.py`, so phase-4 verification stayed focused on ROM-data consumers plus the nearby controller/navigation slice.
 - 2026-03-16: Moving objective replanning to the post-action phase changes a few historical engine expectations around bootstrap/live-state timing, so the Phase 5 regression slice now asserts the new sequencing rather than the old pre-action objective-planner behavior.
+- 2026-03-16: Letting recovery trigger purely off the accumulated stuck score caused successful turns to jump straight back into high-tier recovery on the next miss, so the controller now also tracks consecutive failed recovery turns to de-escalate cleanly after real progress.
+- 2026-03-16: Connector-entry retries are effectively a controller-local recovery tier of their own; allowing the new recovery controller to preempt them caused a regression in repeated push-door tests until recovery was taught to stand down while a connector is active.
 
 ## Appendix: file-by-file change map
 

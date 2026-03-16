@@ -96,9 +96,10 @@ class ObjectiveManager:
         *,
         stuck_score: int,
         turn_index: int,
+        forced_reason: str | None = None,
     ) -> StrategicObjective:
         milestone = self.current_milestone(state)
-        reason = self.replan_reason(state, stuck_score=stuck_score, turn_index=turn_index) or "plan_completed"
+        reason = forced_reason or self.replan_reason(state, stuck_score=stuck_score, turn_index=turn_index) or "plan_completed"
         if self._llm is None or self._complete is None:
             objective = self._fallback_objective(state, milestone)
             self._set_current(

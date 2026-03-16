@@ -210,12 +210,6 @@ class MemoryManager:
                 goals.short_term_goal = objective.goal
                 goals.current_strategy = objective.strategy
 
-        if stuck_state and stuck_state.score >= 4 and stuck_state.recovery_hint:
-            goals.current_strategy = stuck_state.recovery_hint
-            if stuck_state.recovery_hint not in self.memory.long_term.heuristics:
-                self.memory.long_term.heuristics.append(stuck_state.recovery_hint)
-                self.memory.long_term.heuristics = self.memory.long_term.heuristics[-10:]
-
         goals.active_objectives = self._build_objective_stack(state, progress, stuck_state, current_milestone)
 
         if goals.model_dump() != old_snapshot:

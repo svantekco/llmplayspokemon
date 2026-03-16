@@ -17,6 +17,7 @@ from pokemon_agent.agent.controllers.menu import MenuController
 from pokemon_agent.agent.controllers.overworld import OverworldController
 from pokemon_agent.agent.controllers.protocol import NavigationTarget
 from pokemon_agent.agent.controllers.protocol import TurnContext
+from pokemon_agent.agent.controllers.recovery import RecoveryController
 from pokemon_agent.agent.controllers.stubs import StubUnknownController
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.executor import Executor
@@ -273,7 +274,8 @@ class ClosedLoopRunner:
                 GameMode.BATTLE: BattleController(battle_complete),
                 GameMode.CUTSCENE: CutsceneController(),
                 GameMode.UNKNOWN: StubUnknownController(self._plan_unknown_mode),
-            }
+            },
+            recovery_controller=self.recovery_controller,
         )
 
     def _rebuild_overworld_stack(self) -> None:
@@ -285,6 +287,13 @@ class ClosedLoopRunner:
             goal_getter=lambda: self.memory.memory.long_term.navigation_goal,
             landmark_for_destination=self._landmark_for_destination_on_current_map,
             utility_action_getter=self._deterministic_overworld_utility_action,
+        )
+        self.recovery_controller = RecoveryController(
+            self.navigator,
+            stuck_state_getter=lambda: self.stuck.state,
+            threshold=self.stuck.threshold,
+            escalation_callback=self._plan_recovery_escalation,
+            active_connector_getter=self.overworld_controller.active_connector,
         )
 
     def _build_turn_context(self, state: StructuredGameState) -> TurnContext:
@@ -402,6 +411,7 @@ class ClosedLoopRunner:
         self._report_activity("Summarizing turn", f"{before.map_name} -> {after.map_name}")
         progress_result = self.progress.compare(before, after)
         stuck_state = self.stuck.update(after, action, progress_result.classification, progress_result)
+        self.recovery_controller.record_outcome(progress_result.classification)
         # Track entry direction on map change, and clear interaction cooldown on new map.
         if before.map_id != after.map_id or before.map_name != after.map_name:
             self._previous_map_name = before.map_name
@@ -410,6 +420,7 @@ class ClosedLoopRunner:
             self._interacted_tiles.clear()
             self._clear_temporary_blocked_tiles(before)
             self._clear_temporary_blocked_tiles(after)
+            self.recovery_controller.reset()
             self.overworld_controller.reset()
             self.executor.abort()
         if progress_result.classification == "no_effect":
@@ -595,6 +606,25 @@ class ClosedLoopRunner:
         self.memory.memory.long_term.objective = None
         action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
         return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
+
+    def _plan_recovery_escalation(
+        self,
+        state: StructuredGameState,
+        context: TurnContext,
+    ) -> PlanningResult | None:
+        objective = self.objective_manager.replan(
+            state,
+            self.memory.memory,
+            stuck_score=context.stuck_score,
+            turn_index=context.turn_index,
+            forced_reason="stuck_escalation",
+        )
+        self.memory.memory.long_term.objective = objective
+        self._sync_navigation_goal(state)
+        planning = self.overworld_controller.step(state, self._build_turn_context(state))
+        if planning.action is not None and not planning.action.reason:
+            planning.action.reason = "recovery: reroute after escalating the objective"
+        return planning
 
     def _plan_overworld_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
         self._report_activity("Building candidates", state.map_name)
@@ -846,14 +876,8 @@ class ClosedLoopRunner:
             "memory": self.memory.memory.model_dump(),
             "stuck_state": {
                 "score": self.stuck.state.score,
-                "recent_signatures": list(self.stuck.state.recent_signatures),
-                "recent_failed_actions": self.stuck.state.recent_failed_actions,
-                "loop_signature": self.stuck.state.loop_signature,
-                "recovery_hint": self.stuck.state.recovery_hint,
-                "repeated_state_count": self.stuck.state.repeated_state_count,
                 "steps_since_progress": self.stuck.state.steps_since_progress,
                 "oscillating": self.stuck.state.oscillating,
-                "recent_maps": list(self.stuck.state.recent_maps),
                 "map_oscillating": self.stuck.state.map_oscillating,
             },
             "telemetry": self.telemetry.to_dict(),
@@ -861,6 +885,7 @@ class ClosedLoopRunner:
             "executor_state": self.executor.export_state(),
             "navigator_state": self.navigator.export_state(),
             "overworld_state": self.overworld_controller.export_state(),
+            "recovery_state": self.recovery_controller.export_state(),
             "objective": (
                 self.memory.memory.long_term.objective.model_dump(mode="json")
                 if self.memory.memory.long_term.objective is not None
@@ -883,17 +908,11 @@ class ClosedLoopRunner:
         self.dispatcher = self._build_mode_dispatcher()
         stuck_payload = payload["stuck_state"]
         restored = StuckState(
-            score=stuck_payload["score"],
-            recent_failed_actions=list(stuck_payload["recent_failed_actions"]),
-            loop_signature=stuck_payload["loop_signature"],
-            recovery_hint=stuck_payload["recovery_hint"],
-            repeated_state_count=stuck_payload["repeated_state_count"],
-            steps_since_progress=stuck_payload["steps_since_progress"],
-            oscillating=stuck_payload["oscillating"],
+            score=int(stuck_payload.get("score", 0)),
+            steps_since_progress=int(stuck_payload.get("steps_since_progress", 0)),
+            oscillating=bool(stuck_payload.get("oscillating", False)),
             map_oscillating=stuck_payload.get("map_oscillating", False),
         )
-        restored.recent_signatures.extend(stuck_payload["recent_signatures"])
-        restored.recent_maps.extend(stuck_payload.get("recent_maps", []))
         self.stuck.restore(restored)
         telemetry = payload.get("telemetry", {})
         self.telemetry = RunTelemetry(
@@ -916,6 +935,7 @@ class ClosedLoopRunner:
         self.executor.restore_state(payload.get("executor_state"))
         self.navigator.restore_state(payload.get("navigator_state"))
         self.overworld_controller.restore_state(payload.get("overworld_state"))
+        self.recovery_controller.restore_state(payload.get("recovery_state"))
         objective_payload = payload.get("objective", payload.get("objective_plan"))
         if objective_payload:
             legacy_objective = StrategicObjective.from_legacy_payload(objective_payload) if isinstance(objective_payload, dict) else None
@@ -1851,8 +1871,6 @@ class ClosedLoopRunner:
             adjacent, key=lambda item: (0 if item[3] else 1, item[2], item[0], item[1])
         )[0]
         if neighbor_count != 0 and not is_npc:
-            return None
-        if "PRESS_A" in self.stuck.state.recent_failed_actions[-2:]:
             return None
         if state.map_id is not None and state.x is not None and state.y is not None:
             key = (state.map_id, state.x, state.y)
