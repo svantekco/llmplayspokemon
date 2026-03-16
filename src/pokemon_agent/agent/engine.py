@@ -11,15 +11,25 @@ from typing import Any
 from typing import TYPE_CHECKING
 
 from pokemon_agent.agent.battle_manager import BattleManager
+from pokemon_agent.agent.controllers.protocol import NavigationTarget
+from pokemon_agent.agent.controllers.protocol import TurnContext
+from pokemon_agent.agent.controllers.stubs import StubBattleController
+from pokemon_agent.agent.controllers.stubs import StubCutsceneController
+from pokemon_agent.agent.controllers.stubs import StubMenuController
+from pokemon_agent.agent.controllers.stubs import StubOverworldController
+from pokemon_agent.agent.controllers.stubs import StubTextController
+from pokemon_agent.agent.controllers.stubs import StubUnknownController
 from pokemon_agent.agent.context_manager import ContextManager, build_messages, measure_prompt
 from pokemon_agent.agent.executor import Executor
 from pokemon_agent.agent.llm_client import CompletionResponse, LLMUsage, OpenRouterClient, RequestStatus
 from pokemon_agent.agent.menu_manager import MenuManager
+from pokemon_agent.agent.mode_dispatcher import ModeDispatcher
 from pokemon_agent.agent.memory_manager import MemoryManager
 from pokemon_agent.agent.navigation import advance_position
 from pokemon_agent.agent.navigation import find_path
 from pokemon_agent.agent.navigation import NavigationGrid
 from pokemon_agent.agent.navigation import is_real_map_edge
+from pokemon_agent.agent.planning_types import PlanningResult
 from pokemon_agent.agent.navigation import visible_boundary_side
 from pokemon_agent.agent.progress import ProgressDetector, ProgressResult
 from pokemon_agent.agent.stuck_detector import StuckDetector, StuckState
@@ -49,6 +59,7 @@ from pokemon_agent.models.planner import CandidateNextStep
 from pokemon_agent.models.planner import CandidateRuntime
 from pokemon_agent.models.planner import HumanObjectivePlan
 from pokemon_agent.models.planner import InternalObjectivePlan
+from pokemon_agent.models.planner import Objective
 from pokemon_agent.models.planner import ObjectiveHorizon
 from pokemon_agent.models.planner import ObjectivePlanEnvelope
 from pokemon_agent.models.planner import ObjectivePlanStatus
@@ -115,26 +126,6 @@ class TurnResult:
     executor_task: Task | None = None
     suggested_path: list[tuple[int, int]] = field(default_factory=list)
     screen_image: PILImage | None = None
-
-
-@dataclass(slots=True)
-class PlanningResult:
-    action: ActionDecision | None = None
-    task: Task | None = None
-    follow_up_task: Task | None = None
-    raw_response: str | None = None
-    used_fallback: bool = False
-    planner_source: str = "fallback"
-    messages: list[dict] = field(default_factory=list)
-    prompt_metrics: dict[str, Any] | None = None
-    llm_usage: LLMUsage | None = None
-    llm_attempted: bool = False
-    llm_model: str | None = None
-    objective_id: str | None = None
-    candidate_id: str | None = None
-    candidates: list[CandidateNextStep] = field(default_factory=list)
-    executor_task: Task | None = None
-    suggested_path: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -249,6 +240,7 @@ class ClosedLoopRunner:
         self._temporary_blocked_tiles: dict[tuple[str | int, int, int], int] = {}
         self._temporary_blocked_ttl: int = 6
         self._activity_callback: Callable[[str, str | None], None] | None = None
+        self.dispatcher = self._build_mode_dispatcher()
 
     _OPPOSITE_DIRECTION: dict[str, str] = {
         "north": "south",
@@ -264,6 +256,79 @@ class ClosedLoopRunner:
         if self._activity_callback is None:
             return
         self._activity_callback(phase, detail)
+
+    def _build_mode_dispatcher(self) -> ModeDispatcher:
+        return ModeDispatcher(
+            {
+                GameMode.OVERWORLD: StubOverworldController(self._plan_overworld_mode),
+                GameMode.MENU: StubMenuController(self._plan_menu_mode),
+                GameMode.TEXT: StubTextController(self._plan_text_mode),
+                GameMode.BATTLE: StubBattleController(self._plan_battle_mode),
+                GameMode.CUTSCENE: StubCutsceneController(self._plan_cutscene_mode),
+                GameMode.UNKNOWN: StubUnknownController(self._plan_unknown_mode),
+            }
+        )
+
+    def _build_turn_context(self, state: StructuredGameState) -> TurnContext:
+        objective = self._current_turn_objective()
+        previous_action: ActionDecision | None = None
+        previous_progress: str | None = None
+        if self.context_manager.action_traces:
+            trace = self.context_manager.action_traces[-1]
+            previous_progress = trace.progress_classification
+            try:
+                previous_action = ActionDecision(
+                    action=ActionType(trace.action),
+                    repeat=trace.repeat,
+                    reason=trace.reason,
+                )
+            except ValueError:
+                previous_action = None
+        return TurnContext(
+            objective=objective,
+            navigation_target=self._build_navigation_target(objective),
+            stuck_score=self.stuck.state.score,
+            turn_index=self.completed_turns + 1,
+            previous_action=previous_action,
+            previous_progress=previous_progress,
+        )
+
+    def _current_turn_objective(self) -> Objective | None:
+        objectives = self.memory.memory.goals.active_objectives
+        for horizon in (ObjectiveHorizon.SHORT_TERM, ObjectiveHorizon.MID_TERM, ObjectiveHorizon.LONG_TERM):
+            for objective in objectives:
+                if objective.horizon == horizon:
+                    return objective
+        return objectives[0] if objectives else None
+
+    def _build_navigation_target(self, objective: Objective | None) -> NavigationTarget | None:
+        goal = self.memory.memory.long_term.navigation_goal
+        target = objective.target if objective is not None else None
+        map_name = None
+        x = None
+        y = None
+        landmark_id = None
+        reason_parts: list[str] = []
+        if target is not None:
+            map_name = target.map_name
+            x = target.x
+            y = target.y
+            if target.detail:
+                reason_parts.append(target.detail)
+        if goal is not None:
+            map_name = map_name or goal.target_map_name
+            landmark_id = goal.target_landmark_id
+            if goal.objective_kind:
+                reason_parts.insert(0, goal.objective_kind)
+        if map_name is None and x is None and y is None and landmark_id is None:
+            return None
+        return NavigationTarget(
+            map_name=map_name,
+            x=x,
+            y=y,
+            landmark_id=landmark_id,
+            reason="; ".join(part for part in reason_parts if part),
+        )
 
     def run_turn(self, turn_index: int) -> TurnResult:
         self._report_activity("Planning turn", f"Turn #{turn_index}")
@@ -391,7 +456,7 @@ class ClosedLoopRunner:
                         suggested_path=list(step.suggested_path),
                     )
                 if step.status == ExecutorStatus.INTERRUPTED:
-                    planning = self._plan_interrupt_action(state)
+                    planning = self._plan_action(state)
                     planning.executor_task = task_snapshot
                     if planning.action is not None:
                         return state, planning
@@ -424,7 +489,7 @@ class ClosedLoopRunner:
                 planning.suggested_path = list(step.suggested_path)
                 return live_state, planning
             if step.status == ExecutorStatus.INTERRUPTED:
-                interrupt_planning = self._plan_interrupt_action(live_state)
+                interrupt_planning = self._plan_action(live_state)
                 interrupt_planning.executor_task = planning.executor_task
                 if interrupt_planning.action is not None:
                     return live_state, interrupt_planning
@@ -449,29 +514,51 @@ class ClosedLoopRunner:
         return fallback_state, self._with_objective_planner_metadata(result)
 
     def _plan_action(self, state: StructuredGameState) -> PlanningResult:
+        self._reset_objective_planner_metadata()
+        if state.is_bootstrap():
+            return self._plan_bootstrap_action(state)
+
+        self._report_activity("Refreshing objectives", state.map_name)
+        observe_state(self.memory.memory.long_term.world_map, state)
+        self._ensure_objective_plan(state)
+        return self.dispatcher.dispatch(state, self._build_turn_context(state))
+
+    def _reset_objective_planner_metadata(self) -> None:
         self._objective_plan_messages = []
         self._objective_plan_prompt_metrics = None
         self._objective_plan_llm_usage = None
         self._objective_plan_llm_attempted = False
         self._objective_plan_llm_model = None
-        if state.is_bootstrap():
-            self._report_activity("Handling bootstrap", state.bootstrap_phase() or "deterministic startup")
-            self.executor.abort()
-            self.memory.memory.long_term.objective_plan = None
-            action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
-            return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
 
-        self._report_activity("Refreshing objectives", state.map_name)
-        observe_state(self.memory.memory.long_term.world_map, state)
-        self._ensure_objective_plan(state)
-        if state.text_box_open or state.menu_open or state.battle_state is not None:
-            self._report_activity("Handling interrupt state", state.mode.value)
-            return self._plan_interrupt_action(state)
+    def _plan_bootstrap_action(self, state: StructuredGameState) -> PlanningResult:
+        self._report_activity("Handling bootstrap", state.bootstrap_phase() or "deterministic startup")
+        self.executor.abort()
+        self.memory.memory.long_term.objective_plan = None
+        action = self.validator.bootstrap(state, self.stuck.state, "deterministic startup bootstrap")
+        return PlanningResult(action=self.validator.validate(action, state), planner_source="bootstrap")
+
+    def _plan_overworld_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
         self._report_activity("Building candidates", state.map_name)
         candidates = self._build_candidate_steps(state)
         return self._plan_candidates(state, candidates)
 
+    def _plan_cutscene_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
+        return self._plan_overworld_mode(state, context)
+
+    def _plan_unknown_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
+        return self._plan_overworld_mode(state, context)
+
+    def _plan_text_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
+        return self._plan_interrupt_action(state)
+
+    def _plan_menu_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
+        return self._plan_interrupt_action(state)
+
+    def _plan_battle_mode(self, state: StructuredGameState, context: TurnContext) -> PlanningResult:
+        return self._plan_interrupt_action(state)
+
     def _plan_interrupt_action(self, state: StructuredGameState) -> PlanningResult:
+        self._report_activity("Handling interrupt state", self.dispatcher.effective_mode(state).value)
         candidates = self._build_candidate_steps(state)
         return self._plan_candidates(state, candidates)
 

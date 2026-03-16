@@ -7,11 +7,11 @@ import pytest
 from PIL import Image
 
 from pokemon_agent.agent.engine import ClosedLoopRunner
-from pokemon_agent.agent.engine import PlanningResult
 from pokemon_agent.agent.context_manager import ActionTrace
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_collision
 from pokemon_agent.agent.navigation import build_navigation_snapshot_from_tiles
 from pokemon_agent.agent.memory_manager import MemoryManager
+from pokemon_agent.agent.planning_types import PlanningResult
 from pokemon_agent.agent.progress import ProgressResult
 from pokemon_agent.agent.progress import ProgressDetector
 from pokemon_agent.agent.stuck_detector import StuckDetector
@@ -576,6 +576,74 @@ def _build_runner(emulator, llm_client=None):
         validator=ActionValidator(max_repeat=4),
         llm_client=llm_client,
     )
+
+
+def test_plan_action_dispatches_via_mode_dispatcher():
+    emulator = MockEmulatorAdapter()
+    runner = _build_runner(emulator)
+    captured = {}
+    expected = PlanningResult(
+        action=ActionDecision(action=ActionType.MOVE_UP, repeat=1, reason="dispatcher action"),
+        planner_source="dispatcher",
+    )
+
+    def fake_dispatch(state, context):
+        captured["state"] = state.model_copy(deep=True)
+        captured["context"] = context
+        return expected
+
+    runner.dispatcher.dispatch = fake_dispatch
+
+    planning = runner._plan_action(emulator.get_structured_state())
+
+    assert planning is expected
+    assert captured["state"].map_name == emulator.state.map_name
+    assert captured["context"].turn_index == 1
+    assert captured["context"].stuck_score == 0
+    assert captured["context"].previous_action is None
+    assert captured["context"].previous_progress is None
+
+
+def test_plan_action_bypasses_dispatcher_during_bootstrap():
+    emulator = _BootstrapMock()
+    runner = _build_runner(emulator)
+
+    def fail_dispatch(_state, _context):
+        raise AssertionError("bootstrap planning should bypass the mode dispatcher")
+
+    runner.dispatcher.dispatch = fail_dispatch
+
+    planning = runner._plan_action(emulator.get_structured_state())
+
+    assert planning.planner_source == "bootstrap"
+    assert planning.action is not None
+    assert planning.action.action == ActionType.PRESS_START
+
+
+def test_resolve_turn_plan_keeps_active_executor_path_outside_dispatcher():
+    emulator = MockEmulatorAdapter()
+    runner = _build_runner(emulator)
+    task = Task(kind=TaskKind.NAVIGATE_TO, target_x=5, target_y=4, reason="continue cached task")
+    runner.executor.is_active = lambda: True
+    runner.executor.current_task = lambda: task
+    runner.executor.step = lambda _state: StepResult(
+        status=ExecutorStatus.STEPPING,
+        action=ActionDecision(action=ActionType.MOVE_UP, repeat=1, reason="executor step"),
+        suggested_path=[(5, 4)],
+    )
+
+    def fail_dispatch(_state, _context):
+        raise AssertionError("dispatcher should not run while the executor is still stepping")
+
+    runner.dispatcher.dispatch = fail_dispatch
+
+    before, planning = runner._resolve_turn_plan()
+
+    assert before.map_name == emulator.state.map_name
+    assert planning.planner_source == "executor"
+    assert planning.action is not None
+    assert planning.action.action == ActionType.MOVE_UP
+    assert planning.suggested_path == [(5, 4)]
 
 
 def _setup_overworld_walk(emulator: MockEmulatorAdapter) -> None:
